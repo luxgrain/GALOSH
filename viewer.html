@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Comparison Viewer</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #111; color: #ddd; font-family: monospace; font-size: 12px;
+       display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
+
+.toolbar { display: flex; align-items: center; gap: 5px; padding: 4px 8px;
+           background: #1a1a1a; border-bottom: 1px solid #282828; flex-shrink: 0; flex-wrap: wrap; }
+.sep { width: 1px; height: 18px; background: #333; margin: 0 2px; flex-shrink: 0; }
+
+button { background: #272727; color: #bbb; border: 1px solid #3a3a3a; padding: 3px 9px;
+         cursor: pointer; border-radius: 3px; font-size: 11px; font-family: monospace; white-space: nowrap; }
+button:hover { background: #333; }
+button.active { background: #173a58; border-color: #2470a0; color: #fff; }
+
+select { background: #1e1e1e; color: #ccc; border: 1px solid #363636; padding: 2px 4px;
+         border-radius: 3px; font-size: 11px; font-family: monospace; }
+
+.vcfg { display: flex; align-items: center; gap: 3px; padding: 2px 5px;
+        border: 1px solid #262626; border-radius: 3px; background: #161616; }
+.vnum { font-size: 10px; font-weight: bold; padding: 1px 4px; border-radius: 2px; flex-shrink: 0; }
+
+/* sidebar */
+#sidebar { width: 170px; background: #161616; border-right: 1px solid #252525;
+           display: flex; flex-direction: column; flex-shrink: 0; }
+#sb-hdr { padding: 5px 8px; background: #1a1a1a; border-bottom: 1px solid #252525;
+          font-size: 11px; display: flex; justify-content: space-between; color: #666; }
+#sb-hdr b { color: #999; }
+#src-list { flex: 1; overflow-y: auto; }
+.si { padding: 4px 8px; cursor: pointer; border-bottom: 1px solid #1a1a1a; }
+.si:hover { background: #1e1e1e; }
+.si.on { background: #0d2538; border-left: 3px solid #2470a0; padding-left: 5px; }
+.si-id { font-size: 10px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.si-sc { font-size: 10px; color: #555; margin-top: 1px; }
+.si.on .si-sc { color: #777; }
+#load-area { padding: 6px; border-top: 1px solid #252525; display: flex; flex-direction: column; gap: 3px; }
+
+/* canvas */
+#cwrap { flex: 1; position: relative; overflow: hidden; background: #080808; }
+#cv { position: absolute; top: 0; left: 0; cursor: grab; }
+
+#drop-msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+#drop-msg.off { display: none; }
+.dbox { border: 2px dashed #2a2a2a; border-radius: 8px; padding: 28px 36px;
+        text-align: center; color: #3a3a3a; line-height: 2.2; }
+.dbox b { color: #555; }
+
+#main { display: flex; flex: 1; overflow: hidden; }
+
+/* overlays */
+#score-ov { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.82);
+            border: 1px solid #252525; padding: 6px 10px; border-radius: 4px;
+            font-size: 11px; line-height: 2; pointer-events: none; }
+#score-ov.off { display: none; }
+#zoom-info { position: absolute; top: 5px; right: 8px; background: rgba(0,0,0,0.55);
+             padding: 2px 7px; border-radius: 3px; font-size: 10px; color: #555; pointer-events: none; }
+
+#src-list::-webkit-scrollbar { width: 4px; }
+#src-list::-webkit-scrollbar-thumb { background: #2a2a2a; }
+</style>
+</head>
+<body>
+
+<!-- toolbar row 1: mode + utils -->
+<div class="toolbar">
+  <span style="color:#555;font-size:11px">Mode:</span>
+  <button id="b2"  class="active" onclick="setMode('2split')"  title="1">2-Split</button>
+  <button id="b4"  onclick="setMode('4split')"  title="2">4-Split</button>
+  <button id="bov" onclick="setMode('overlay')" title="3">Overlay</button>
+  <div class="sep"></div>
+  <button onclick="resetTr()" title="D / dbl-click">Reset Zoom</button>
+  <button onclick="document.getElementById('fj').click()">Load Scores JSON</button>
+  <input id="fj" type="file" accept=".json" style="display:none" onchange="loadJSON(this.files[0])">
+  <div class="sep"></div>
+  <span id="score-status" style="color:#444;font-size:10px">No scores loaded</span>
+  <div class="sep"></div>
+  <span style="color:#333;font-size:10px">Drag=pan · Scroll=zoom · ←→=scene · Space=overlay · D=reset</span>
+</div>
+
+<!-- toolbar row 2: per-view slot selectors -->
+<div class="toolbar" id="vbar">
+  <span style="color:#444;font-size:11px">Views: (load folder to configure)</span>
+</div>
+
+<div id="main">
+  <div id="sidebar">
+    <div id="sb-hdr"><b>Scenes</b> <span id="sc-count">0</span></div>
+    <div id="src-list"></div>
+    <div id="load-area">
+      <button onclick="document.getElementById('ff').click()" style="width:100%">📂 Open Folder</button>
+      <input id="ff" type="file" webkitdirectory style="display:none" onchange="loadFolder(this.files)">
+    </div>
+  </div>
+
+  <div id="cwrap">
+    <canvas id="cv"></canvas>
+    <div id="drop-msg">
+      <div class="dbox">
+        <b>Open Folder</b> to load images<br>
+        or drag &amp; drop a folder here<br>
+        <span style="font-size:10px;color:#2a2a2a">
+          Subfolders = methods &nbsp;|&nbsp; __gt__ __noisy__ = special
+        </span>
+      </div>
+    </div>
+    <div id="score-ov" class="off"></div>
+    <div id="zoom-info">100%</div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────
+const S = {
+  mode: '2split',
+  tr: { scale: 1, x: 0, y: 0 },
+  splitX: 0.5,
+
+  // all loaded scenes; each: { id, urls:{slotName→objectURL}, scores:{} }
+  sources: [],
+  curSrc: -1,       // current scene index (global for all views)
+
+  // dynamic slot list discovered from folder (e.g. ['gt','noisy','nafnet','galosh_gpu',...])
+  slots: [],
+
+  // 4 views: each has a slot name + cached ImageBitmap
+  views: [
+    { slot: 'noisy', img: null, loading: false },
+    { slot: '',      img: null, loading: false },
+    { slot: '',      img: null, loading: false },
+    { slot: 'gt',    img: null, loading: false },
+  ],
+
+  // overlay
+  ovIdx: 0,
+
+  // drag state
+  dragType: null,    // null | 'pan' | 'divider'
+  dragDist: 0,       // total movement to distinguish click vs drag
+  mx: 0, my: 0,
+
+  dirty: true,
+};
+
+// colour per view (not per slot — slots are dynamic)
+const VCOL = ['#42a5f5','#66bb6a','#ffa726','#ce93d8'];
+// Special slot colours
+function slotCol(slot) {
+  if (slot === 'gt' || slot === 'gt2') return '#66bb6a';
+  if (slot === 'noisy') return '#ef5350';
+  // cycle through a palette for methods
+  const palette = ['#42a5f5','#ffa726','#ce93d8','#80cbc4','#ffcc80','#ef9a9a','#b0bec5','#ffe082'];
+  const idx = S.slots.indexOf(slot);
+  return palette[Math.max(idx - 2, 0) % palette.length];
+}
+
+// image cache: `${srcIdx}:${slot}` → ImageBitmap|null
+const IC = {};
+
+// stored scoreMap from last loadJSON call: tag → {method → {psnr,...}}
+let _scoreMap = null;
+
+// ─────────────────────────────────────────────────────────────────
+// Canvas
+// ─────────────────────────────────────────────────────────────────
+const cwrap = document.getElementById('cwrap');
+const cv    = document.getElementById('cv');
+const ctx   = cv.getContext('2d');
+
+function resize() { cv.width = cwrap.clientWidth; cv.height = cwrap.clientHeight; S.dirty = true; }
+window.addEventListener('resize', resize);
+resize();
+
+// ─────────────────────────────────────────────────────────────────
+// Image loading
+// ─────────────────────────────────────────────────────────────────
+async function getImg(srcIdx, slot) {
+  const key = `${srcIdx}:${slot}`;
+  if (key in IC) return IC[key];
+  IC[key] = null; // mark as loading
+  const url = S.sources[srcIdx]?.urls[slot];
+  if (!url) return null;
+  try {
+    const bmp = await createImageBitmap(await (await fetch(url)).blob());
+    IC[key] = bmp;
+  } catch {}
+  S.dirty = true;
+  return IC[key];
+}
+
+function loadView(vi) {
+  const v = S.views[vi];
+  if (S.curSrc < 0 || !v.slot) { v.img = null; S.dirty = true; return; }
+  const key = `${S.curSrc}:${v.slot}`;
+  if (key in IC) { v.img = IC[key]; S.dirty = true; return; }
+  if (v.loading) return;
+  v.loading = true;
+  getImg(S.curSrc, v.slot).then(bmp => { v.img = bmp; v.loading = false; S.dirty = true; });
+}
+
+function setViewSlot(vi, slot) {
+  S.views[vi].slot = slot;
+  S.views[vi].img  = null;
+  loadView(vi);
+}
+
+function switchScene(idx) {
+  if (idx < 0 || idx >= S.sources.length) return;
+  S.curSrc = idx;
+  S.views.forEach(v => { v.img = null; });
+  for (let i = 0; i < 4; i++) loadView(i);
+
+  document.querySelectorAll('.si').forEach((el, i) => {
+    el.classList.toggle('on', i === idx);
+    if (i === idx) el.scrollIntoView({ block: 'nearest' });
+  });
+  S.dirty = true;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Rendering
+// ─────────────────────────────────────────────────────────────────
+function drawInRegion(img, rx, ry, rw, rh) {
+  if (!img) { ctx.fillStyle = '#0a0a0a'; ctx.fillRect(rx, ry, rw, rh); return; }
+  const { scale, x, y } = S.tr;
+  ctx.drawImage(img,
+    rx + rw/2 - img.width  * scale / 2 + x,
+    ry + rh/2 - img.height * scale / 2 + y,
+    img.width * scale, img.height * scale);
+}
+
+function drawLbl(text, color, rx, ry) {
+  ctx.font = 'bold 12px monospace';
+  const tw = ctx.measureText(text).width;
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(rx+5, ry+5, tw+10, 20);
+  ctx.fillStyle = color;
+  ctx.fillText(text, rx+10, ry+20);
+}
+
+function viewLbl(vi) { return S.views[vi].slot || '—'; }
+
+function renderFrame() {
+  if (!S.dirty) return;
+  S.dirty = false;
+
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  if (S.curSrc < 0 || !S.sources.length) return;
+
+  const vw = S.views;
+
+  if (S.mode === '2split') {
+    const dx = Math.round(S.splitX * W);
+
+    ctx.save(); ctx.beginPath(); ctx.rect(0,0,dx,H); ctx.clip();
+    drawInRegion(vw[0].img, 0, 0, W, H);
+    drawLbl(viewLbl(0), slotCol(vw[0].slot), 0, 0);
+    drawScores(0, 0, 0, dx, H);
+    ctx.restore();
+
+    ctx.save(); ctx.beginPath(); ctx.rect(dx,0,W-dx,H); ctx.clip();
+    drawInRegion(vw[1].img, 0, 0, W, H);
+    drawLbl(viewLbl(1), slotCol(vw[1].slot), dx, 0);
+    drawScores(1, dx, 0, W-dx, H);
+    ctx.restore();
+
+    // divider
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(dx,0); ctx.lineTo(dx,H); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath(); ctx.arc(dx, H/2, 7, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 1; ctx.stroke();
+
+  } else if (S.mode === '4split') {
+    const hw=W/2, hh=H/2;
+    const pos = [[0,0,hw,hh],[hw,0,hw,hh],[0,hh,hw,hh],[hw,hh,hw,hh]];
+    for (let i=0;i<4;i++) {
+      const [rx,ry,rw,rh] = pos[i];
+      ctx.save(); ctx.beginPath(); ctx.rect(rx,ry,rw,rh); ctx.clip();
+      drawInRegion(vw[i].img, rx, ry, rw, rh);
+      drawLbl(viewLbl(i), slotCol(vw[i].slot), rx, ry);
+      drawScores(i, rx, ry, rw, rh);
+      ctx.restore();
+    }
+    ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(hw,0); ctx.lineTo(hw,H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,hh); ctx.lineTo(W,hh); ctx.stroke();
+
+  } else { // overlay
+    const vi = S.ovIdx % 4;
+    ctx.fillStyle = '#0a0a0a'; ctx.fillRect(0,0,W,H);
+    drawInRegion(vw[vi].img, 0, 0, W, H);
+
+    // large label
+    const lbl = viewLbl(vi);
+    ctx.font = 'bold 13px monospace';
+    const tw = ctx.measureText(lbl).width;
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.fillRect(W/2-tw/2-8, 6, tw+16, 22);
+    ctx.fillStyle = slotCol(vw[vi].slot);
+    ctx.fillText(lbl, W/2-tw/2, 23);
+
+    drawScores(S.ovIdx % 4, 0, 0, W, H);
+    ctx.font = '10px monospace'; ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.fillText('Space / click to cycle  (drag to pan)', 8, H-8);
+  }
+
+  // zoom info
+  document.getElementById('zoom-info').textContent = Math.round(S.tr.scale*100)+'%';
+  document.getElementById('score-ov').classList.add('off'); // no longer used
+}
+
+// Draw per-view score block in bottom-right of region
+function drawScores(vi, rx, ry, rw, rh) {
+  if (S.curSrc < 0) return;
+  const slot = S.views[vi].slot;
+  const src  = S.sources[S.curSrc];
+  const sc   = src?.scores?.[slot];
+
+  // Debug: log once per second (not every frame)
+  const now = Date.now();
+  if (vi === 0 && (!S._dbgTime || now - S._dbgTime > 1000)) {
+    S._dbgTime = now;
+    console.log(`[drawScores] slot="${slot}" scores_keys=${src?.scores ? Object.keys(src.scores).join(',') : 'NONE'} sc_found=${!!sc}`);
+    if (sc) console.log(`[drawScores] sc=`, sc);
+  }
+
+  if (!sc) return;
+
+  const metrics = [
+    ['PSNR',  sc.psnr  != null ? sc.psnr.toFixed(2)  + ' dB' : null],
+    ['SSIM',  sc.ssim  != null ? sc.ssim.toFixed(4)           : null],
+    ['LPIPS', sc.lpips != null ? sc.lpips.toFixed(4)          : null],
+    ['DISTS', sc.dists != null ? sc.dists.toFixed(4)          : null],
+    ['NIQE',  sc.niqe  != null ? sc.niqe.toFixed(3)           : null],
+  ].filter(([, v]) => v !== null);
+
+  if (!metrics.length) return;
+
+  const fsize = 11;
+  const lh    = fsize + 5;
+  const pad   = 7;
+  const col   = slotCol(slot);
+
+  ctx.save();
+  ctx.font = `${fsize}px monospace`;
+
+  // Fixed-width columns (no measureText quirks)
+  const boxW = 130;
+  const boxH = metrics.length * lh + pad * 2;
+
+  const bx = rx + rw - boxW - 8;
+  const by = ry + rh - boxH - 8;
+
+  // background — plain fillRect, no path/roundRect
+  ctx.fillStyle = 'rgba(0,0,0,0.80)';
+  ctx.fillRect(bx, by, boxW, boxH);
+
+  // border
+  ctx.strokeStyle = col;
+  ctx.lineWidth = 1;
+  ctx.globalAlpha = 0.4;
+  ctx.strokeRect(bx + 0.5, by + 0.5, boxW - 1, boxH - 1);
+  ctx.globalAlpha = 1.0;
+
+  // text rows
+  ctx.textBaseline = 'alphabetic';
+  for (let i = 0; i < metrics.length; i++) {
+    const [label, val] = metrics[i];
+    const ty = by + pad + i * lh + fsize;
+    ctx.fillStyle = '#666';
+    ctx.textAlign = 'left';
+    ctx.fillText(label, bx + pad, ty);
+    ctx.fillStyle = label === 'PSNR' ? col : '#ccc';
+    ctx.textAlign = 'right';
+    ctx.fillText(val, bx + boxW - pad, ty);
+  }
+
+  ctx.restore();
+}
+
+S._frameCount = 0;
+S._dbgFrame = -1;
+function loop() { S._frameCount++; renderFrame(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+// ─────────────────────────────────────────────────────────────────
+// Folder loading
+// ─────────────────────────────────────────────────────────────────
+function loadFolder(files) {
+  const byMethod = {};  // methodName → File[]
+
+  for (const file of Array.from(files)) {
+    const parts = file.webkitRelativePath.split('/');
+    if (parts.length < 3) continue;
+    const method = parts[parts.length - 2];
+    const fname  = parts[parts.length - 1];
+    if (!fname.match(/\.(png|jpg|jpeg|bmp|tif|tiff)$/i)) continue;
+    if (!byMethod[method]) byMethod[method] = [];
+    byMethod[method].push(file);
+  }
+
+  // Sort each method's files alphabetically (ensures same-scene files align by index)
+  for (const m of Object.keys(byMethod))
+    byMethod[m].sort((a,b) => a.name.localeCompare(b.name, undefined, {numeric:true}));
+
+  // Canonical order: gt, noisy (special), then all other methods sorted
+  const specialMap = { '__gt__':'gt', '__gt2__':'gt2', '__noisy__':'noisy' };
+  const specials = Object.keys(specialMap).filter(k => byMethod[k]);
+  const methods  = Object.keys(byMethod).filter(k => !specialMap[k]).sort();
+
+  S.slots = [
+    ...specials.map(k => specialMap[k]),
+    ...methods,
+  ];
+
+  // Scene count from largest folder
+  const nScenes = Math.max(...Object.values(byMethod).map(a => a.length));
+
+  // Release old object URLs
+  S.sources.forEach(s => Object.values(s.urls).forEach(u => { try { URL.revokeObjectURL(u); } catch {} }));
+  Object.keys(IC).forEach(k => delete IC[k]);
+
+  // Build sources: index-matched across folders
+  const refFiles = byMethod['__gt__'] || byMethod['__noisy__'] || Object.values(byMethod)[0];
+  S.sources = [];
+  for (let i = 0; i < nScenes; i++) {
+    const refName = extractTag(refFiles[i]?.name || '') || `scene_${i}`;
+    const urls = {};
+    for (const [special, slot] of Object.entries(specialMap))
+      if (byMethod[special]?.[i]) urls[slot] = URL.createObjectURL(byMethod[special][i]);
+    for (const m of methods)
+      if (byMethod[m]?.[i]) urls[m] = URL.createObjectURL(byMethod[m][i]);
+    S.sources.push({ id: refName, urls, scores: {} });
+  }
+
+  document.getElementById('sc-count').textContent = S.sources.length;
+  document.getElementById('drop-msg').classList.add('off');
+
+  // Set default slots for views
+  const defaultSlots = ['noisy', methods[0]||'gt', methods[1]||'noisy', 'gt'];
+  for (let i=0;i<4;i++) S.views[i].slot = defaultSlots[i] || S.slots[0] || '';
+
+  buildVbar();
+  buildSidebar();
+  if (S.sources.length > 0) switchScene(0);
+
+  // Re-apply scores if JSON was already loaded before the folder
+  if (_scoreMap) applyScores();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// View bar (per-view slot dropdowns)
+// ─────────────────────────────────────────────────────────────────
+function buildVbar() {
+  const bar = document.getElementById('vbar');
+  bar.innerHTML = '';
+
+  for (let vi=0; vi<4; vi++) {
+    const cfg = document.createElement('div');
+    cfg.className = 'vcfg';
+
+    const num = document.createElement('span');
+    num.className = 'vnum';
+    num.textContent = `V${vi+1}`;
+    num.style.color = VCOL[vi];
+    num.style.background = VCOL[vi]+'20';
+    cfg.appendChild(num);
+
+    const sel = document.createElement('select');
+    sel.id = `vs${vi}`;
+    for (const slot of S.slots) {
+      sel.appendChild(new Option(slot, slot));
+    }
+    sel.value = S.views[vi].slot;
+    const _vi = vi;
+    sel.onchange = () => setViewSlot(_vi, sel.value);
+    cfg.appendChild(sel);
+
+    bar.appendChild(cfg);
+  }
+
+  // "Set all to:" shortcut
+  const sep = document.createElement('div'); sep.className='sep'; bar.appendChild(sep);
+  const allLbl = document.createElement('span'); allLbl.textContent='All:'; allLbl.style.color='#555'; allLbl.style.fontSize='11px'; bar.appendChild(allLbl);
+  const allSel = document.createElement('select');
+  allSel.id='vsall';
+  allSel.appendChild(new Option('—',''));
+  for (const slot of S.slots) allSel.appendChild(new Option(slot, slot));
+  allSel.onchange = () => {
+    if (!allSel.value) return;
+    for (let i=0;i<4;i++) {
+      setViewSlot(i, allSel.value);
+      const s = document.getElementById(`vs${i}`); if(s) s.value=allSel.value;
+    }
+    allSel.value='';
+  };
+  bar.appendChild(allSel);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Sidebar
+// ─────────────────────────────────────────────────────────────────
+function buildSidebar() {
+  const list = document.getElementById('src-list');
+  list.innerHTML = '';
+  for (let i=0; i<S.sources.length; i++) {
+    const s = S.sources[i];
+    const d = document.createElement('div');
+    d.className = 'si';
+    d.innerHTML = `<div class="si-id" title="${s.id}">${s.id}</div><div class="si-sc" id="ssc${i}"></div>`;
+    d.onclick = () => switchScene(i);
+    list.appendChild(d);
+    updateScoreLbl(i);
+  }
+}
+
+function updateScoreLbl(i) {
+  const el = document.getElementById(`ssc${i}`);
+  if (!el) return;
+  const sc = S.sources[i]?.scores;
+  if (!sc) return;
+  const parts = Object.entries(sc)
+    .filter(([,v]) => v?.psnr != null)
+    .map(([k,v]) => `${k}:${v.psnr.toFixed(1)}`);
+  el.textContent = parts.slice(0,2).join(' ');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Extract clean scene tag from filename by stripping known method suffixes
+function extractTag(fname) {
+  const base = fname.replace(/\.[^.]+$/, '');
+  const suffixes = [
+    '_gt_srgb', '_gt_srgb2', '_noisy_srgb', '_noisy_raw',
+    '_gt_raw', '_gt', '_noisy', '_den', '_denoised',
+  ];
+  for (const s of suffixes) {
+    if (base.endsWith(s)) return base.slice(0, -s.length);
+  }
+  // fallback: strip last _word segment
+  return base.replace(/_[^_]+$/, '');
+}
+
+// ─────────────────────────────────────────────────────────────────
+// JSON scores
+// Supports two formats:
+//   A) {"patches": {"sceneId": {"method": {"psnr":..}}}}   (viewer native)
+//   B) {"methods": {"method": [{"tag":"sceneId","psnr":..}]}}  (bench output)
+// ─────────────────────────────────────────────────────────────────
+function applyScores() {
+  if (!_scoreMap || !S.sources.length) return 0;
+  const scoreMapKeys = Object.keys(_scoreMap);
+  let matched = 0;
+  for (const src of S.sources) {
+    // Exact match, then prefix match
+    const key =
+      (scoreMapKeys.includes(src.id) ? src.id : null) ||
+      scoreMapKeys.find(t => src.id.startsWith(t + '_') || src.id.startsWith(t)) ||
+      null;
+    if (key) { src.scores = _scoreMap[key]; matched++; }
+    updateScoreLbl(S.sources.indexOf(src));
+  }
+  const statusEl = document.getElementById('score-status');
+  if (statusEl) {
+    statusEl.textContent = `Scores: ${matched}/${S.sources.length} matched`;
+    statusEl.style.color = matched > 0 ? '#5a9' : '#a55';
+  }
+  console.log(`[applyScores] ${matched}/${S.sources.length} matched`);
+  S.dirty = true;
+  return matched;
+}
+
+function loadJSON(file) {
+  if (!file) return;
+  const r = new FileReader();
+  r.onload = e => {
+    try {
+      const d = JSON.parse(e.target.result);
+      _scoreMap = {}; // tag → {method → {psnr, ssim, lpips, ...}}
+
+      if (d.methods) {
+        // Format B: bench output
+        for (const [method, entries] of Object.entries(d.methods)) {
+          for (const entry of entries) {
+            if (!entry.tag) continue;
+            if (!_scoreMap[entry.tag]) _scoreMap[entry.tag] = {};
+            _scoreMap[entry.tag][method] = {
+              psnr:  entry.psnr,
+              ssim:  entry.ssim,
+              lpips: entry.lpips,
+              dists: entry.dists,
+              niqe:  entry.niqe,
+            };
+          }
+        }
+      } else if (d.patches) {
+        // Format A: viewer native
+        _scoreMap = d.patches;
+      }
+
+      const scoreMapKeys = Object.keys(_scoreMap);
+      console.log(`[loadJSON] ${scoreMapKeys.length} tags loaded, methods per tag: ${Object.keys(_scoreMap[scoreMapKeys[0]]||{}).join(', ')}`);
+      console.log(`[loadJSON] first tag: "${scoreMapKeys[0]}", S.sources[0].id: "${S.sources[0]?.id}"`);
+
+      if (S.sources.length === 0) {
+        const statusEl = document.getElementById('score-status');
+        if (statusEl) { statusEl.textContent = `Scores: ${scoreMapKeys.length} tags loaded (open folder first)`; statusEl.style.color = '#a85'; }
+        console.log('[loadJSON] No sources yet — scores will apply after folder load');
+        return;
+      }
+
+      applyScores();
+    } catch(err) { alert('JSON error: ' + err); }
+  };
+  r.readAsText(file);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Drag & drop folder
+// ─────────────────────────────────────────────────────────────────
+cwrap.addEventListener('dragover', e => e.preventDefault());
+cwrap.addEventListener('drop', e => {
+  e.preventDefault();
+  const collected = [];
+  let pending = 0;
+  function scan(entry, path) {
+    if (entry.isFile) {
+      pending++;
+      entry.file(f => {
+        Object.defineProperty(f,'webkitRelativePath',{value:path+f.name});
+        collected.push(f);
+        if(--pending===0 && collected.length) loadFolder(collected);
+      });
+    } else if (entry.isDirectory) {
+      const rd = entry.createReader();
+      function read() { rd.readEntries(es => { if(!es.length) return; es.forEach(e2=>scan(e2,path+entry.name+'/')); read(); }); }
+      read();
+    }
+  }
+  for (const item of e.dataTransfer.items) {
+    const en = item.webkitGetAsEntry?.();
+    if (en) scan(en, '');
+  }
+  setTimeout(()=>{if(pending===0&&collected.length)loadFolder(collected);},800);
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Mode
+// ─────────────────────────────────────────────────────────────────
+function setMode(m) {
+  S.mode = m;
+  document.getElementById('b2').classList.toggle('active',  m==='2split');
+  document.getElementById('b4').classList.toggle('active',  m==='4split');
+  document.getElementById('bov').classList.toggle('active', m==='overlay');
+  S.dirty = true;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Zoom / Pan
+// ─────────────────────────────────────────────────────────────────
+function resetTr() { S.tr={scale:1,x:0,y:0}; S.dirty=true; }
+
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const f = e.deltaY < 0 ? 1.12 : 1/1.12;
+  const ns = Math.max(0.05, Math.min(64, S.tr.scale*f));
+  S.tr.x = (S.tr.x - e.offsetX) * (ns/S.tr.scale) + e.offsetX;
+  S.tr.y = (S.tr.y - e.offsetY) * (ns/S.tr.scale) + e.offsetY;
+  S.tr.scale = ns;
+  S.dirty = true;
+}, {passive:false});
+
+cv.addEventListener('mousedown', e => {
+  e.preventDefault();
+  S.dragDist = 0;
+  // Divider (2-split, left button)
+  if (S.mode==='2split' && e.button===0 && Math.abs(e.offsetX - S.splitX*cv.width)<10) {
+    S.dragType = 'divider';
+  } else {
+    S.dragType = 'pan';
+    cv.style.cursor = 'grabbing';
+  }
+  S.mx = e.clientX; S.my = e.clientY;
+});
+
+cv.addEventListener('mousemove', e => {
+  const dx = e.clientX - S.mx, dy = e.clientY - S.my;
+  S.dragDist += Math.abs(dx) + Math.abs(dy);
+
+  if (S.dragType === 'divider') {
+    S.splitX = Math.max(0.05, Math.min(0.95, e.offsetX/cv.width));
+    S.dirty = true;
+  } else if (S.dragType === 'pan') {
+    S.tr.x += dx; S.tr.y += dy; S.dirty = true;
+  }
+  S.mx = e.clientX; S.my = e.clientY;
+
+  // cursor hint
+  if (!S.dragType) {
+    if (S.mode==='2split' && Math.abs(e.offsetX-S.splitX*cv.width)<10)
+      cv.style.cursor='col-resize';
+    else
+      cv.style.cursor='grab';
+  }
+});
+
+window.addEventListener('mouseup', e => {
+  // click (no drag) in overlay → cycle
+  if (S.mode==='overlay' && S.dragType==='pan' && S.dragDist < 4) {
+    S.ovIdx = (S.ovIdx+1) % 4;
+    S.dirty = true;
+  }
+  S.dragType = null;
+  cv.style.cursor = 'grab';
+});
+
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('dblclick', resetTr);
+
+// ─────────────────────────────────────────────────────────────────
+// Keyboard
+// ─────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+  switch(e.key) {
+    case '1': setMode('2split'); break;
+    case '2': setMode('4split'); break;
+    case '3': setMode('overlay'); break;
+    case 'ArrowLeft':  switchScene(S.curSrc-1); break;
+    case 'ArrowRight': switchScene(S.curSrc+1); break;
+    case ' ':
+      e.preventDefault();
+      S.ovIdx=(S.ovIdx+1)%4;
+      if(S.mode!=='overlay') setMode('overlay'); else S.dirty=true;
+      break;
+    case 'd': case 'D': resetTr(); break;
+  }
+});
+</script>
+</body>
+</html>

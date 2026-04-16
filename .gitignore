@@ -1,0 +1,72 @@
+# --- Build artifacts ---
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.exp
+*.o
+*.obj
+*.a
+*.pdb
+*.ilk
+
+# --- Binary / intermediate data ---
+*.bin
+*.npy
+*.npz
+*.raw
+*.dng
+*.arw
+*.nef
+*.cr2
+
+# --- Model weights (re-downloadable from HF / source) ---
+weights/
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.pt
+
+# --- Datasets (live in C:\Users\luxgrain\datasets\) ---
+datasets/
+
+# --- Benchmark outputs (regeneratable, multi-GB) ---
+results/
+comparison_images/
+comparison_images_*/
+comparison_stride_*/
+debug_*/
+viewer_images/
+
+# --- Heavy method directories (NAFNet, PMN sources are upstream) ---
+methods/
+
+# --- Build / test logs ---
+*.txt
+build_*/
+*_log.*
+err*.txt
+out*.txt
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Allow specific text files even with broad rules above ---
+!README.md
+!CONTRIBUTING*.md
+!docs/*.md
+!standalone/*.txt
+!scripts/*.txt
