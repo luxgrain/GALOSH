@@ -42,15 +42,15 @@ from skimage.metrics import structural_similarity as ssim
 os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 
 BASE       = Path(__file__).parent.parent
-BENCH_DIR  = BASE / "datasets" / "sidd" / "medium_bench"
-OUTDIR     = BASE / "comparison_images_sidd" / "medium_fullimage"
+BENCH_DIR  = Path(r"C:\Users\luxgrain\datasets\sidd\medium_bench")
+OUTDIR     = BASE / "sidd_medium"
 RESULTS    = BASE / "results"
 RESULTS.mkdir(exist_ok=True)
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-GPU_EXE    = BASE / "standalone" / "rawdenoise_gpu.exe"
-KAIR_DIR   = Path(r"C:\Users\luxgrain\KAIR")
-NAFNET_DIR = Path(r"C:\Users\luxgrain\denoise_eval\methods\NAFNet")
+GPU_EXE    = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_gpu.exe")
+KAIR_DIR   = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\KAIR")
+NAFNET_DIR = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\NAFNet")
 BASH_EXE   = Path(r"C:\msys64\usr\bin\bash.exe")
 
 # EN: Make per-method wrappers under scripts/methods/ importable.
@@ -230,11 +230,11 @@ def run_nlm_cfa_cuda(noisy, sigma, patch_radius=2, search_radius=11):
 def run_galosh_yuv_gat_gpu(noisy_srgb, uid, strength_y=1.0, strength_c=1.0, cl_device=0):
     """GALOSH-YUV (new): sRGB -> OpenCL linear Y-GAT + chroma VST -> sRGB.
 
-    EN: Calls rawdenoise_gpu.exe with yuv_gat mode. All processing on GPU:
+    EN: Calls galosh_gpu.exe with yuv_gat mode. All processing on GPU:
         sRGB -> linear YCbCr, Y blind noise estimation (Foi+Alenius),
         Y-GAT + LOSH + Makitalo inverse, Cb/Cr linear VST + LOSH + inverse,
         bivariate Wiener coupling, YCbCr -> sRGB.
-    JP: yuv_gat モードで rawdenoise_gpu.exe を呼び出す。全処理 GPU 上。
+    JP: yuv_gat モードで galosh_gpu.exe を呼び出す。全処理 GPU 上。
     """
     H, W = noisy_srgb.shape[:2]
     in_path  = OUTDIR / f"_tmp_{uid}_yuvgat_in.bin"
@@ -547,7 +547,9 @@ DISPLAY_NAMES = {
     # Pre-demosaic
     "galosh_raw_gpu":       "GALOSH-RAW",
     "nlm_cfa_oracle":       "NLM-CFA (oracle)",
-    "bm3d_cfa":             "BM3D-CFA (Bayer)",
+    "bm3d_cfa":             "BM3D-CFA (blind)",
+    "bm3d_cfa_oracle":      "BM3D-CFA (oracle)",
+    "b2u":                  "Blind2Unblind (raw)",
     # After-demosaic (GPU) — GALOSH family
     "galosh_yuv_gpu":       "GALOSH-YUV",          # NEW: linear Y-GAT + chroma VST
     "galosh_yuv_gpu_old":   "GALOSH-YUV (old)",     # OLD: sRGB YCbCr plain Wiener (nogat)
@@ -567,7 +569,7 @@ DISPLAY_NAMES = {
     "cbm3d":                "CBM3D joint (CPU)",
 }
 
-PRE_IDS  = ["galosh_raw_gpu", "nlm_cfa_oracle", "bm3d_cfa"]
+PRE_IDS  = ["galosh_raw_gpu", "nlm_cfa_oracle", "bm3d_cfa", "bm3d_cfa_oracle", "b2u"]
 POST_IDS = ["galosh_yuv_gpu", "galosh_yuv_gpu_old",
             "nafnet", "dncnn_b", "drunet", "nlm_srgb",
             "guided_gpu", "ffdnet", "swinir_dn", "scunet", "restormer_dn",
@@ -674,17 +676,28 @@ def main():
             print(f"diag=[{aff[0,0]:.3f}, {aff[1,1]:.3f}, {aff[2,2]:.3f}]")
 
         print("\n--- Phase 1b: GT2 precomputation ---")
+        # GT2 is deterministic (gt_raw + per-scene affine, both fixed).
+        # Reuse the PNG cache from __gt2__/ if present to skip the ~7-8 s per
+        # image Menon demosaic + affine (saves ~10 min across 80 images).
+        from skimage.io import imread as _imread
+        gt2_cache_dir = OUTDIR / "__gt2__"
         for sk in scene_keys:
             aff = affines[sk]
             for s in scene_groups[sk]:
                 tag = s["tag"]
-                print(f"  GT2: {tag}...", end=" ", flush=True)
+                cached_path = gt2_cache_dir / f"{tag}_gt2.png"
                 t0 = time.time()
-                gt_raw = np.load(str(BENCH_DIR / f"{tag}_gt_raw.npy"))
-                gt2 = raw_to_srgb_calibrated(gt_raw, aff)
-                gt2_cache[tag] = gt2
-                print(f"({time.time()-t0:.1f}s)")
-                del gt_raw
+                if cached_path.exists():
+                    gt2 = _imread(str(cached_path)).astype(np.float32) / 255.0
+                    gt2_cache[tag] = gt2
+                    print(f"  GT2: {tag} (cached, {time.time()-t0:.2f}s)", flush=True)
+                else:
+                    print(f"  GT2: {tag}...", end=" ", flush=True)
+                    gt_raw = np.load(str(BENCH_DIR / f"{tag}_gt_raw.npy"))
+                    gt2 = raw_to_srgb_calibrated(gt_raw, aff)
+                    gt2_cache[tag] = gt2
+                    del gt_raw
+                    print(f"({time.time()-t0:.1f}s)")
 
     # --- Phase 2: Run denoisers + metrics ---
     print(f"\n{'='*70}")
@@ -746,6 +759,33 @@ def main():
                         den_raw, dt = run_bm3d_cfa_wrapper(noisy_raw)
                     except Exception as e:
                         print(f"    BM3D-CFA FAILED: {type(e).__name__}: {str(e)[:120]}")
+                        den_raw, dt = None, 0.0
+                    if den_raw is not None:
+                        aff = affines[sk]
+                        den_srgb = raw_to_srgb_calibrated(den_raw, aff)
+
+                elif mid == "bm3d_cfa_oracle":
+                    # Same as bm3d_cfa but sigma from (noisy - gt) std (oracle).
+                    try:
+                        from bm3d_cfa import run_bm3d_cfa
+                        sigma = float(np.std(noisy_raw.astype(np.float64) - gt_raw.astype(np.float64)))
+                        den_raw, dt = run_bm3d_cfa(noisy_raw, sigma=sigma)
+                    except Exception as e:
+                        print(f"    BM3D-CFA-oracle FAILED: {type(e).__name__}: {str(e)[:120]}")
+                        den_raw, dt = None, 0.0
+                    if den_raw is not None:
+                        aff = affines[sk]
+                        den_srgb = raw_to_srgb_calibrated(den_raw, aff)
+
+                elif mid == "b2u":
+                    # Pre-demosaic: pretrained Blind2Unblind (rawRGB_112rf20),
+                    # tile-inferred over full-res Bayer, then same calibrated
+                    # demosaic + ISP pipeline as other pre-demosaic methods.
+                    try:
+                        from b2u import run_b2u
+                        den_raw, dt = run_b2u(noisy_raw)
+                    except Exception as e:
+                        print(f"    B2U FAILED: {type(e).__name__}: {str(e)[:120]}")
                         den_raw, dt = None, 0.0
                     if den_raw is not None:
                         aff = affines[sk]

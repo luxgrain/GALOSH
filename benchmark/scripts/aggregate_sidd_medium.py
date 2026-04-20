@@ -35,7 +35,7 @@ if hasattr(sys.stdout, "buffer"):
                                    line_buffering=True)
 
 BASE = Path(__file__).parent.parent
-RESULTS = BASE / "results"
+SIDD_MEDIUM_DIR = BASE / "sidd_medium"
 
 # Mirror bench_sidd_medium.py's DISPLAY_NAMES and categories.
 DISPLAY_NAMES = {
@@ -79,7 +79,8 @@ PRE_IDS = {"galosh_raw_gpu", "nlm_cfa_oracle", "bm3d_cfa"}
 
 
 def load_method(mid: str) -> list[dict]:
-    p = RESULTS / f"sidd_medium_{mid}.json"
+    # New layout: benchmark/sidd_medium/<method>/metrics.json
+    p = SIDD_MEDIUM_DIR / mid / "metrics.json"
     if not p.exists():
         return []
     try:

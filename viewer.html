@@ -78,6 +78,11 @@ select { background: #1e1e1e; color: #ccc; border: 1px solid #363636; padding: 2
   <div class="sep"></div>
   <span id="score-status" style="color:#444;font-size:10px">No scores loaded</span>
   <div class="sep"></div>
+  <span id="iso-wrap" style="display:none;align-items:center;gap:3px">
+    <span style="color:#555;font-size:11px">ISO:</span>
+    <select id="iso-sel" onchange="switchIso(this.value)"></select>
+  </span>
+  <div class="sep"></div>
   <span style="color:#333;font-size:10px">Drag=pan · Scroll=zoom · ←→=scene · Space=overlay · D=reset</span>
 </div>
 
@@ -394,16 +399,79 @@ requestAnimationFrame(loop);
 // Folder loading
 // ─────────────────────────────────────────────────────────────────
 function loadFolder(files) {
-  const byMethod = {};  // methodName → File[]
-
+  // Parse every file once; auto-detect ISO middle layer.
+  // Supported layouts:
+  //   <method>/<img>.png              (SIDD Medium, SIDD)
+  //   <method>/iso<N>/<img>.png       (Kodak / McMaster / CBSD68)
+  // Non-image files (metrics.json etc.) are filtered out.
+  const rawFiles = [];   // { method, iso:null|'iso400'|..., file }
+  const isoSet   = new Set();
   for (const file of Array.from(files)) {
     const parts = file.webkitRelativePath.split('/');
-    if (parts.length < 3) continue;
-    const method = parts[parts.length - 2];
-    const fname  = parts[parts.length - 1];
+    const fname = parts[parts.length - 1];
     if (!fname.match(/\.(png|jpg|jpeg|bmp|tif|tiff)$/i)) continue;
-    if (!byMethod[method]) byMethod[method] = [];
-    byMethod[method].push(file);
+    if (parts.length < 2) continue;
+    const p2 = parts[parts.length - 2] || '';
+    const p3 = parts[parts.length - 3] || '';
+    let method, iso = null;
+    if (/^iso\d+$/i.test(p2) && p3) {
+      method = p3;
+      iso    = p2.toLowerCase();
+      isoSet.add(iso);
+    } else {
+      method = p2;
+    }
+    rawFiles.push({ method, iso, file });
+  }
+
+  // Stash for ISO switching and build scene list for the selected ISO.
+  S._rawFiles = rawFiles;
+  S._allIsos  = [...isoSet].sort((a, b) =>
+    parseInt(a.replace(/\D/g, ''), 10) - parseInt(b.replace(/\D/g, ''), 10));
+  S._currentIso = S._allIsos[0] || null;   // null = no ISO layer
+
+  buildIsoSelector();
+  rebuildScenes();
+}
+
+function buildIsoSelector() {
+  const wrap = document.getElementById('iso-wrap');
+  const sel  = document.getElementById('iso-sel');
+  if (!S._allIsos || S._allIsos.length === 0) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = 'inline-flex';
+  sel.innerHTML = '';
+  for (const iso of S._allIsos) sel.appendChild(new Option(iso, iso));
+  sel.value = S._currentIso;
+}
+
+function switchIso(iso) {
+  if (!S._allIsos || S._allIsos.indexOf(iso) < 0) return;
+  // Preserve current scene index + view slot selections across ISO changes.
+  const prevIdx   = S.curSrc;
+  const prevSlots = S.views.map(v => v.slot);
+  S._currentIso = iso;
+  rebuildScenes();
+  if (prevIdx > 0 && prevIdx < S.sources.length) switchScene(prevIdx);
+  for (let i = 0; i < 4; i++) {
+    if (prevSlots[i] && S.slots.includes(prevSlots[i])
+        && S.views[i].slot !== prevSlots[i]) {
+      setViewSlot(i, prevSlots[i]);
+      const sel = document.getElementById(`vs${i}`);
+      if (sel) sel.value = prevSlots[i];
+    }
+  }
+}
+
+function rebuildScenes() {
+  // Aggregate { method → File[] } from the raw file list, filtered by current ISO.
+  const byMethod = {};
+  for (const r of S._rawFiles || []) {
+    if (S._currentIso !== null && r.iso !== S._currentIso) continue;
+    if (!byMethod[r.method]) byMethod[r.method] = [];
+    byMethod[r.method].push(r.file);
   }
 
   // Sort each method's files alphabetically (ensures same-scene files align by index)

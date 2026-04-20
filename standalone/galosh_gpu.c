@@ -393,8 +393,8 @@ static int run_single_plane_gpu(const char *input_file, const char *output_file,
 
     /* Load & build kernel source */
     {
-        const char *cl_paths[] = {"galosh_fused.cl",
-            "C:/Users/luxgrain/denoise_eval/standalone/galosh_fused.cl", NULL};
+        const char *cl_paths[] = {"galosh.cl",
+            "C:/Users/luxgrain/GALOSH/standalone/galosh.cl", NULL};
         char *source = NULL; size_t src_len = 0;
         for(int i = 0; cl_paths[i]; i++) {
             source = load_kernel_source(cl_paths[i], &src_len);
@@ -612,10 +612,20 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     cl_kernel k_srgb2ycbcr = NULL, k_ycbcr2srgb = NULL;
     cl_kernel k_blk_stats = NULL, k_dark_samp = NULL, k_noise_est = NULL;
     cl_kernel k_dark_lap = NULL, k_dark_final = NULL, k_chroma_derive = NULL;
-    cl_kernel k_gat_fwd = NULL, k_vst_fwd = NULL, k_vst_inv = NULL;
+    cl_kernel k_gat_fwd = NULL;
     cl_kernel k_f2h = NULL, k_h2f = NULL;
     cl_kernel k_build_lut = NULL, k_lut_fin = NULL;
-    cl_kernel k_makitalo = NULL, k_fused = NULL, k_biv = NULL;
+    cl_kernel k_makitalo = NULL, k_fused = NULL;
+    /* Step 7 (Phase 2a) — Y-guided filter, 4-kernel separable pipeline:
+     *   1) moments_x        : 1D x-pass over (Y, Y², Cb, Cr, Y·Cb, Y·Cr)
+     *   2) moments_y_and_ab : 1D y-pass + local linear regression → (a, b)
+     *   3) apply_x          : 1D x-pass over (a, b) coefficient planes
+     *   4) apply_y          : 1D y-pass + output = mean_a·Y + mean_b
+     * Reduces per-pixel work from O((2r+1)²)=225 to O(2·(2r+1))=30 at r=7. */
+    cl_kernel k_guided_moments_x   = NULL;
+    cl_kernel k_guided_moments_yab = NULL;
+    cl_kernel k_guided_apply_x     = NULL;
+    cl_kernel k_guided_apply_y     = NULL;
 
     /* Buffer handles */
     cl_mem srgb_buf = NULL, y_buf = NULL, cb_buf = NULL, cr_buf = NULL;
@@ -623,6 +633,13 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     cl_mem scale_cb_buf = NULL, scale_cr_buf = NULL;
     cl_mem half_in_buf = NULL, half_out_buf = NULL;
     cl_mem cb_biv_buf = NULL, cr_biv_buf = NULL;
+    /* Phase 2a separable guided filter: 6 moments_x + 4 apply_x scratch.
+     * Float32, npix each — ≈640 MB total at 5326×2998 (desktop-only). */
+    cl_mem gf_sum_Y_x   = NULL, gf_sum_YY_x  = NULL;
+    cl_mem gf_sum_Cb_x  = NULL, gf_sum_Cr_x  = NULL;
+    cl_mem gf_sum_YCb_x = NULL, gf_sum_YCr_x = NULL;
+    cl_mem gf_a_cb_x    = NULL, gf_b_cb_x    = NULL;
+    cl_mem gf_a_cr_x    = NULL, gf_b_cr_x    = NULL;
     cl_mem blk_mean_buf = NULL, blk_var_buf = NULL;
     cl_mem dark_hist_buf = NULL, lap_hist_buf = NULL;
     cl_mem params_buf = NULL;
@@ -654,33 +671,24 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
     if(err) { fprintf(stderr, "[YUV_GAT] queue err=%d\n", err); goto yg_cleanup; }
 
-    /* --- Load & build 2-source CL program --- */
+    /* --- Load & build single-source CL program (galosh.cl) --- */
     {
-        const char *fused_paths[] = {"galosh_fused.cl",
-            "C:/Users/luxgrain/denoise_eval/standalone/galosh_fused.cl", NULL};
-        const char *yuv_paths[] = {"galosh_yuv_gat.cl",
-            "C:/Users/luxgrain/denoise_eval/standalone/galosh_yuv_gat.cl", NULL};
+        const char *cl_paths[] = {"galosh.cl",
+            "C:/Users/luxgrain/GALOSH/standalone/galosh.cl", NULL};
 
-        char *src_fused = NULL, *src_yuv = NULL;
-        size_t len_fused = 0, len_yuv = 0;
-        for(int i = 0; fused_paths[i]; i++) {
-            src_fused = load_kernel_source(fused_paths[i], &len_fused);
-            if(src_fused) break;
+        char *source = NULL;
+        size_t src_len = 0;
+        for(int i = 0; cl_paths[i]; i++) {
+            source = load_kernel_source(cl_paths[i], &src_len);
+            if(source) break;
         }
-        for(int i = 0; yuv_paths[i]; i++) {
-            src_yuv = load_kernel_source(yuv_paths[i], &len_yuv);
-            if(src_yuv) break;
-        }
-        if(!src_fused || !src_yuv) {
-            fprintf(stderr, "[YUV_GAT] Cannot load .cl sources\n");
-            free(src_fused); free(src_yuv);
+        if(!source) {
+            fprintf(stderr, "[YUV_GAT] Cannot load galosh.cl\n");
             goto yg_cleanup;
         }
 
-        const char *srcs[2] = { src_fused, src_yuv };
-        const size_t lens[2] = { len_fused, len_yuv };
-        prog = clCreateProgramWithSource(context, 2, srcs, lens, &err);
-        free(src_fused); free(src_yuv);
+        prog = clCreateProgramWithSource(context, 1, (const char **)&source, &src_len, &err);
+        free(source);
         if(err) { fprintf(stderr, "[YUV_GAT] program err=%d\n", err); goto yg_cleanup; }
 
         char opts[512];
@@ -712,15 +720,16 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     YG_KERNEL(k_dark_final,   "galosh_yuv_noise_dark_finalize_Y");
     YG_KERNEL(k_chroma_derive,"galosh_yuv_chroma_params_derive");
     YG_KERNEL(k_gat_fwd,      "galosh_yuv_gat_forward_Y");
-    YG_KERNEL(k_vst_fwd,      "galosh_yuv_vst_forward_C");
-    YG_KERNEL(k_vst_inv,      "galosh_yuv_vst_inverse_C");
     YG_KERNEL(k_f2h,          "galosh_yuv_float_to_half");
     YG_KERNEL(k_h2f,          "galosh_yuv_half_to_float");
     YG_KERNEL(k_build_lut,    "galosh_build_inv_lut");        /* from fused.cl */
     YG_KERNEL(k_lut_fin,      "galosh_lut_finalize");         /* from fused.cl */
     YG_KERNEL(k_makitalo,     "galosh_yuv_makitalo_inverse_Y");
     YG_KERNEL(k_fused,        "galosh_fused_pass12");         /* from fused.cl */
-    YG_KERNEL(k_biv,          "galosh_yuv_bivariate_wiener_cbcr");
+    YG_KERNEL(k_guided_moments_x,   "galosh_yuv_guided_moments_x");
+    YG_KERNEL(k_guided_moments_yab, "galosh_yuv_guided_moments_y_ab");
+    YG_KERNEL(k_guided_apply_x,     "galosh_yuv_guided_apply_x");
+    YG_KERNEL(k_guided_apply_y,     "galosh_yuv_guided_apply_y");
 #undef YG_KERNEL
 
     /* --- Allocate GPU buffers --- */
@@ -741,6 +750,17 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
         half_out_buf  = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
         cb_biv_buf    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
         cr_biv_buf    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        /* Separable guided-filter scratch (6 moments_x + 4 apply_x). */
+        gf_sum_Y_x   = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_sum_YY_x  = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_sum_Cb_x  = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_sum_Cr_x  = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_sum_YCb_x = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_sum_YCr_x = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_a_cb_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_b_cb_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_a_cr_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        gf_b_cr_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
         if(err) { fprintf(stderr, "[YUV_GAT] alloc plane bufs err=%d\n", err); goto yg_cleanup; }
 
         const int ne_n_bx = width / 16;
@@ -765,6 +785,8 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     {
         float h_params[PARAMS_SIZE];
         memset(h_params, 0, sizeof(h_params));
+        /* P_YG_EPS_BIV retained for parameter-slot compatibility; bivariate
+         * Wiener was retired in Step 7 (guided-filter-based chroma path). */
         h_params[P_YG_EPS_BIV] = 1e-3f;
         clEnqueueWriteBuffer(queue, params_buf, CL_FALSE, 0,
                              PARAMS_SIZE * sizeof(float), h_params, 0, NULL, NULL);
@@ -932,111 +954,97 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     dispatch_1d_named(queue, k_makitalo, align_up(npix, 256), 256, "YG4h makitalo");
 
     /* ================================================================
-     * Phase 5: Cb path — linear VST → fused LOSH → keep stabilised
+     * Phase 5: Y-guided filter on (Cb, Cr) (Step 7).
+     *
+     * Two-kernel guided filter (He 2013):
+     *   Kernel 1: compute per-pixel (a_Cb, b_Cb, a_Cr, b_Cr) via local
+     *             linear regression C ≈ a·Y + b within window.
+     *   Kernel 2: box-filter (a, b) coefficient planes and produce
+     *             output = mean(a)·Y + mean(b).
+     *
+     * ε = strength_c² · (α_C·Y + σ²_C)   (Poisson-Gauss, user-scalable)
+     *
+     * Coefficient planes reuse existing scratch buffers:
+     *   cb_stab_buf  ← a_Cb
+     *   scale_cb_buf ← b_Cb
+     *   cr_stab_buf  ← a_Cr
+     *   scale_cr_buf ← b_Cr
+     * Final output lands in cb_biv_buf / cr_biv_buf for ycbcr2srgb.
      * ================================================================ */
-    {
-        int chan = 0;  /* Cb */
-        clSetKernelArg(k_vst_fwd, 0, sizeof(cl_mem), &cb_buf);
-        clSetKernelArg(k_vst_fwd, 1, sizeof(cl_mem), &y_buf);  /* denoised Y */
-        clSetKernelArg(k_vst_fwd, 2, sizeof(cl_mem), &cb_stab_buf);
-        clSetKernelArg(k_vst_fwd, 3, sizeof(cl_mem), &scale_cb_buf);
-        clSetKernelArg(k_vst_fwd, 4, sizeof(cl_mem), &params_buf);
-        clSetKernelArg(k_vst_fwd, 5, sizeof(int), &chan);
-        clSetKernelArg(k_vst_fwd, 6, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_vst_fwd, align_up(npix, 256), 256, "YG5a vst_Cb");
+    /* Step 1: moments_x — 1D x-pass writes 6 intermediate sum buffers. */
+    clSetKernelArg(k_guided_moments_x,  0, sizeof(cl_mem), &y_buf);
+    clSetKernelArg(k_guided_moments_x,  1, sizeof(cl_mem), &cb_buf);
+    clSetKernelArg(k_guided_moments_x,  2, sizeof(cl_mem), &cr_buf);
+    clSetKernelArg(k_guided_moments_x,  3, sizeof(cl_mem), &gf_sum_Y_x);
+    clSetKernelArg(k_guided_moments_x,  4, sizeof(cl_mem), &gf_sum_YY_x);
+    clSetKernelArg(k_guided_moments_x,  5, sizeof(cl_mem), &gf_sum_Cb_x);
+    clSetKernelArg(k_guided_moments_x,  6, sizeof(cl_mem), &gf_sum_Cr_x);
+    clSetKernelArg(k_guided_moments_x,  7, sizeof(cl_mem), &gf_sum_YCb_x);
+    clSetKernelArg(k_guided_moments_x,  8, sizeof(cl_mem), &gf_sum_YCr_x);
+    clSetKernelArg(k_guided_moments_x,  9, sizeof(int),    &width);
+    clSetKernelArg(k_guided_moments_x, 10, sizeof(int),    &height);
+    dispatch_2d_named(queue, k_guided_moments_x,
+                      align_up(width, 16), align_up(height, 16),
+                      16, 16, "YG5a moments_x");
 
-        clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &cb_stab_buf);
-        clSetKernelArg(k_f2h, 1, sizeof(cl_mem), &half_in_buf);
-        clSetKernelArg(k_f2h, 2, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_f2h, align_up(npix, 256), 256, "YG5b f2h_Cb");
+    /* Step 2: moments_y + (a, b) — 1D y-pass + local linear regression. */
+    clSetKernelArg(k_guided_moments_yab,  0, sizeof(cl_mem), &gf_sum_Y_x);
+    clSetKernelArg(k_guided_moments_yab,  1, sizeof(cl_mem), &gf_sum_YY_x);
+    clSetKernelArg(k_guided_moments_yab,  2, sizeof(cl_mem), &gf_sum_Cb_x);
+    clSetKernelArg(k_guided_moments_yab,  3, sizeof(cl_mem), &gf_sum_Cr_x);
+    clSetKernelArg(k_guided_moments_yab,  4, sizeof(cl_mem), &gf_sum_YCb_x);
+    clSetKernelArg(k_guided_moments_yab,  5, sizeof(cl_mem), &gf_sum_YCr_x);
+    clSetKernelArg(k_guided_moments_yab,  6, sizeof(cl_mem), &y_buf);
+    clSetKernelArg(k_guided_moments_yab,  7, sizeof(cl_mem), &params_buf);
+    clSetKernelArg(k_guided_moments_yab,  8, sizeof(float),  &strength_c);
+    clSetKernelArg(k_guided_moments_yab,  9, sizeof(cl_mem), &cb_stab_buf);   /* a_Cb */
+    clSetKernelArg(k_guided_moments_yab, 10, sizeof(cl_mem), &scale_cb_buf);  /* b_Cb */
+    clSetKernelArg(k_guided_moments_yab, 11, sizeof(cl_mem), &cr_stab_buf);   /* a_Cr */
+    clSetKernelArg(k_guided_moments_yab, 12, sizeof(cl_mem), &scale_cr_buf);  /* b_Cr */
+    clSetKernelArg(k_guided_moments_yab, 13, sizeof(int),    &width);
+    clSetKernelArg(k_guided_moments_yab, 14, sizeof(int),    &height);
+    dispatch_2d_named(queue, k_guided_moments_yab,
+                      align_up(width, 16), align_up(height, 16),
+                      16, 16, "YG5b moments_y_ab");
 
-        cl_half hzero = 0;
-        clEnqueueFillBuffer(queue, half_out_buf, &hzero, sizeof(cl_half), 0,
-                            npix * sizeof(cl_half), 0, NULL, NULL);
+    /* Step 3: apply_x — 1D x-pass over (a, b) coefficient planes. */
+    clSetKernelArg(k_guided_apply_x, 0, sizeof(cl_mem), &cb_stab_buf);
+    clSetKernelArg(k_guided_apply_x, 1, sizeof(cl_mem), &scale_cb_buf);
+    clSetKernelArg(k_guided_apply_x, 2, sizeof(cl_mem), &cr_stab_buf);
+    clSetKernelArg(k_guided_apply_x, 3, sizeof(cl_mem), &scale_cr_buf);
+    clSetKernelArg(k_guided_apply_x, 4, sizeof(cl_mem), &gf_a_cb_x);
+    clSetKernelArg(k_guided_apply_x, 5, sizeof(cl_mem), &gf_b_cb_x);
+    clSetKernelArg(k_guided_apply_x, 6, sizeof(cl_mem), &gf_a_cr_x);
+    clSetKernelArg(k_guided_apply_x, 7, sizeof(cl_mem), &gf_b_cr_x);
+    clSetKernelArg(k_guided_apply_x, 8, sizeof(int),    &width);
+    clSetKernelArg(k_guided_apply_x, 9, sizeof(int),    &height);
+    dispatch_2d_named(queue, k_guided_apply_x,
+                      align_up(width, 16), align_up(height, 16),
+                      16, 16, "YG5c apply_x");
 
-        clSetKernelArg(k_fused, 0, sizeof(cl_mem), &half_in_buf);
-        clSetKernelArg(k_fused, 1, sizeof(cl_mem), &half_out_buf);
-        clSetKernelArg(k_fused, 2, sizeof(int), &width);
-        clSetKernelArg(k_fused, 3, sizeof(int), &height);
-        clSetKernelArg(k_fused, 4, sizeof(float), &strength_c);
-        dispatch_tile_named(queue, k_fused, width, height, "YG5d fused_Cb");
+    /* Step 4: apply_y — 1D y-pass + output = mean_a·Y + mean_b. */
+    clSetKernelArg(k_guided_apply_y, 0, sizeof(cl_mem), &gf_a_cb_x);
+    clSetKernelArg(k_guided_apply_y, 1, sizeof(cl_mem), &gf_b_cb_x);
+    clSetKernelArg(k_guided_apply_y, 2, sizeof(cl_mem), &gf_a_cr_x);
+    clSetKernelArg(k_guided_apply_y, 3, sizeof(cl_mem), &gf_b_cr_x);
+    clSetKernelArg(k_guided_apply_y, 4, sizeof(cl_mem), &y_buf);
+    clSetKernelArg(k_guided_apply_y, 5, sizeof(cl_mem), &cb_biv_buf);
+    clSetKernelArg(k_guided_apply_y, 6, sizeof(cl_mem), &cr_biv_buf);
+    clSetKernelArg(k_guided_apply_y, 7, sizeof(int),    &width);
+    clSetKernelArg(k_guided_apply_y, 8, sizeof(int),    &height);
+    dispatch_2d_named(queue, k_guided_apply_y,
+                      align_up(width, 16), align_up(height, 16),
+                      16, 16, "YG5d apply_y");
 
-        clSetKernelArg(k_h2f, 0, sizeof(cl_mem), &half_out_buf);
-        clSetKernelArg(k_h2f, 1, sizeof(cl_mem), &cb_stab_buf);
-        clSetKernelArg(k_h2f, 2, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_h2f, align_up(npix, 256), 256, "YG5e h2f_Cb");
-    }
-
-    /* ================================================================
-     * Phase 6: Cr path — linear VST → fused LOSH → keep stabilised
-     * ================================================================ */
-    {
-        int chan = 1;  /* Cr */
-        clSetKernelArg(k_vst_fwd, 0, sizeof(cl_mem), &cr_buf);
-        clSetKernelArg(k_vst_fwd, 1, sizeof(cl_mem), &y_buf);
-        clSetKernelArg(k_vst_fwd, 2, sizeof(cl_mem), &cr_stab_buf);
-        clSetKernelArg(k_vst_fwd, 3, sizeof(cl_mem), &scale_cr_buf);
-        clSetKernelArg(k_vst_fwd, 4, sizeof(cl_mem), &params_buf);
-        clSetKernelArg(k_vst_fwd, 5, sizeof(int), &chan);
-        clSetKernelArg(k_vst_fwd, 6, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_vst_fwd, align_up(npix, 256), 256, "YG6a vst_Cr");
-
-        clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &cr_stab_buf);
-        clSetKernelArg(k_f2h, 1, sizeof(cl_mem), &half_in_buf);
-        clSetKernelArg(k_f2h, 2, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_f2h, align_up(npix, 256), 256, "YG6b f2h_Cr");
-
-        cl_half hzero = 0;
-        clEnqueueFillBuffer(queue, half_out_buf, &hzero, sizeof(cl_half), 0,
-                            npix * sizeof(cl_half), 0, NULL, NULL);
-
-        clSetKernelArg(k_fused, 0, sizeof(cl_mem), &half_in_buf);
-        clSetKernelArg(k_fused, 1, sizeof(cl_mem), &half_out_buf);
-        clSetKernelArg(k_fused, 2, sizeof(int), &width);
-        clSetKernelArg(k_fused, 3, sizeof(int), &height);
-        clSetKernelArg(k_fused, 4, sizeof(float), &strength_c);
-        dispatch_tile_named(queue, k_fused, width, height, "YG6d fused_Cr");
-
-        clSetKernelArg(k_h2f, 0, sizeof(cl_mem), &half_out_buf);
-        clSetKernelArg(k_h2f, 1, sizeof(cl_mem), &cr_stab_buf);
-        clSetKernelArg(k_h2f, 2, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_h2f, align_up(npix, 256), 256, "YG6e h2f_Cr");
-    }
-
-    /* ================================================================
-     * Phase 7: Bivariate Wiener on stabilised (Cb, Cr)
-     * ================================================================ */
-    clSetKernelArg(k_biv, 0, sizeof(cl_mem), &cb_stab_buf);
-    clSetKernelArg(k_biv, 1, sizeof(cl_mem), &cr_stab_buf);
-    clSetKernelArg(k_biv, 2, sizeof(cl_mem), &cb_biv_buf);
-    clSetKernelArg(k_biv, 3, sizeof(cl_mem), &cr_biv_buf);
-    clSetKernelArg(k_biv, 4, sizeof(cl_mem), &params_buf);
-    clSetKernelArg(k_biv, 5, sizeof(int), &width);
-    clSetKernelArg(k_biv, 6, sizeof(int), &height);
-    dispatch_2d_named(queue, k_biv,
-                align_up(width, 16), align_up(height, 16), 16, 16, "YG7 biv_wiener");
-
-    /* ================================================================
-     * Phase 8: Chroma inverse VST
-     * ================================================================ */
-    clSetKernelArg(k_vst_inv, 0, sizeof(cl_mem), &cb_biv_buf);
-    clSetKernelArg(k_vst_inv, 1, sizeof(cl_mem), &scale_cb_buf);
-    clSetKernelArg(k_vst_inv, 2, sizeof(cl_mem), &cb_buf);
-    clSetKernelArg(k_vst_inv, 3, sizeof(int), &npix_i);
-    dispatch_1d_named(queue, k_vst_inv, align_up(npix, 256), 256, "YG8a inv_Cb");
-
-    clSetKernelArg(k_vst_inv, 0, sizeof(cl_mem), &cr_biv_buf);
-    clSetKernelArg(k_vst_inv, 1, sizeof(cl_mem), &scale_cr_buf);
-    clSetKernelArg(k_vst_inv, 2, sizeof(cl_mem), &cr_buf);
-    clSetKernelArg(k_vst_inv, 3, sizeof(int), &npix_i);
-    dispatch_1d_named(queue, k_vst_inv, align_up(npix, 256), 256, "YG8b inv_Cr");
+    cl_mem cb_final = cb_biv_buf;
+    cl_mem cr_final = cr_biv_buf;
 
     /* ================================================================
      * Phase 9: YCbCr → sRGB
      * ================================================================ */
-    clSetKernelArg(k_ycbcr2srgb, 0, sizeof(cl_mem), &y_buf);
-    clSetKernelArg(k_ycbcr2srgb, 1, sizeof(cl_mem), &cb_buf);
-    clSetKernelArg(k_ycbcr2srgb, 2, sizeof(cl_mem), &cr_buf);
+    clSetKernelArg(k_ycbcr2srgb, 0, sizeof(cl_mem), &y_buf);          /* Y_denoised */
+    clSetKernelArg(k_ycbcr2srgb, 1, sizeof(cl_mem), &cb_final);       /* Cb final bilateral pass */
+    clSetKernelArg(k_ycbcr2srgb, 2, sizeof(cl_mem), &cr_final);       /* Cr final bilateral pass */
     clSetKernelArg(k_ycbcr2srgb, 3, sizeof(cl_mem), &srgb_buf);
     clSetKernelArg(k_ycbcr2srgb, 4, sizeof(int), &npix_i);
     dispatch_1d_named(queue, k_ycbcr2srgb, align_up(npix, 256), 256, "YG9 ycbcr2srgb");
@@ -1088,15 +1096,12 @@ yg_cleanup:
     if(k_dark_final)   clReleaseKernel(k_dark_final);
     if(k_chroma_derive)clReleaseKernel(k_chroma_derive);
     if(k_gat_fwd)      clReleaseKernel(k_gat_fwd);
-    if(k_vst_fwd)      clReleaseKernel(k_vst_fwd);
-    if(k_vst_inv)      clReleaseKernel(k_vst_inv);
     if(k_f2h)          clReleaseKernel(k_f2h);
     if(k_h2f)          clReleaseKernel(k_h2f);
     if(k_build_lut)    clReleaseKernel(k_build_lut);
     if(k_lut_fin)      clReleaseKernel(k_lut_fin);
     if(k_makitalo)     clReleaseKernel(k_makitalo);
     if(k_fused)        clReleaseKernel(k_fused);
-    if(k_biv)          clReleaseKernel(k_biv);
 
     if(srgb_buf)       clReleaseMemObject(srgb_buf);
     if(y_buf)          clReleaseMemObject(y_buf);
@@ -1108,9 +1113,23 @@ yg_cleanup:
     if(scale_cb_buf)   clReleaseMemObject(scale_cb_buf);
     if(scale_cr_buf)   clReleaseMemObject(scale_cr_buf);
     if(half_in_buf)    clReleaseMemObject(half_in_buf);
+    if(k_guided_moments_x)   clReleaseKernel(k_guided_moments_x);
+    if(k_guided_moments_yab) clReleaseKernel(k_guided_moments_yab);
+    if(k_guided_apply_x)     clReleaseKernel(k_guided_apply_x);
+    if(k_guided_apply_y)     clReleaseKernel(k_guided_apply_y);
     if(half_out_buf)   clReleaseMemObject(half_out_buf);
     if(cb_biv_buf)     clReleaseMemObject(cb_biv_buf);
     if(cr_biv_buf)     clReleaseMemObject(cr_biv_buf);
+    if(gf_sum_Y_x)   clReleaseMemObject(gf_sum_Y_x);
+    if(gf_sum_YY_x)  clReleaseMemObject(gf_sum_YY_x);
+    if(gf_sum_Cb_x)  clReleaseMemObject(gf_sum_Cb_x);
+    if(gf_sum_Cr_x)  clReleaseMemObject(gf_sum_Cr_x);
+    if(gf_sum_YCb_x) clReleaseMemObject(gf_sum_YCb_x);
+    if(gf_sum_YCr_x) clReleaseMemObject(gf_sum_YCr_x);
+    if(gf_a_cb_x)    clReleaseMemObject(gf_a_cb_x);
+    if(gf_b_cb_x)    clReleaseMemObject(gf_b_cb_x);
+    if(gf_a_cr_x)    clReleaseMemObject(gf_a_cr_x);
+    if(gf_b_cr_x)    clReleaseMemObject(gf_b_cr_x);
     if(blk_mean_buf)   clReleaseMemObject(blk_mean_buf);
     if(blk_var_buf)    clReleaseMemObject(blk_var_buf);
     if(dark_hist_buf)  clReleaseMemObject(dark_hist_buf);
@@ -1265,6 +1284,15 @@ int main(int argc, char **argv)
     cl_kernel k_wht_decompose = NULL;
     cl_kernel k_pass1_only = NULL;
     cl_kernel k_fused_pass12 = NULL;
+    /* RAW mode chroma guided-filter (C1/C2/C3 plane): reuses yuv kernels. */
+    cl_kernel k_raw_chroma_derive      = NULL;
+    cl_kernel k_raw_h2f                = NULL;  /* half→float for raw chroma guide */
+    cl_kernel k_raw_f2h                = NULL;  /* float→half after apply_y      */
+    cl_kernel k_raw_guided_moments_x   = NULL;
+    cl_kernel k_raw_guided_moments_yab = NULL;
+    cl_kernel k_raw_guided_apply_x     = NULL;
+    cl_kernel k_raw_guided_apply_y     = NULL;
+    cl_kernel k_raw_guided_loess       = NULL;  /* LOESS (bilateral-weighted) guided filter */
     cl_kernel k_compute_L_fullres = NULL;
     cl_kernel k_pass2_only = NULL;
     cl_kernel k_reconstruct = NULL;
@@ -1276,6 +1304,15 @@ int main(int argc, char **argv)
     cl_mem ch0_buf = NULL, ch1_buf = NULL, ch2_buf = NULL, ch3_buf = NULL;
     cl_mem luma_buf = NULL, c1_buf = NULL, c2_buf = NULL, c3_buf = NULL;
     cl_mem l_out_buf = NULL, c1_out_buf = NULL, c2_out_buf = NULL, c3_out_buf = NULL;
+    /* Raw-mode chroma guided-filter scratch (6 moments_x + 4 apply_x, each hw*hh). */
+    cl_mem rgf_sum_Y_x = NULL, rgf_sum_YY_x = NULL;
+    cl_mem rgf_sum_Cb_x = NULL, rgf_sum_Cr_x = NULL;
+    cl_mem rgf_sum_YCb_x = NULL, rgf_sum_YCr_x = NULL;
+    cl_mem rgf_a_cb_x = NULL, rgf_b_cb_x = NULL;
+    cl_mem rgf_a_cr_x = NULL, rgf_b_cr_x = NULL;
+    /* Raw mode: luma/c1/c2/c3 are stored as half; guided filter kernels
+     * expect float32 — keep 4 converted float buffers here. */
+    cl_mem luma_f_buf = NULL, c1_f_buf = NULL, c2_f_buf = NULL, c3_f_buf = NULL;
     cl_mem Lfr_noisy_buf = NULL, Lfr_pilot_buf = NULL, Lfr_den_buf = NULL;
     cl_mem lut_d_buf = NULL, lut_x_buf = NULL, lut_params_buf = NULL;
     cl_mem params_buf = NULL;
@@ -1319,11 +1356,11 @@ int main(int argc, char **argv)
     queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
     CL_CHECK(err, "createQueue");
 
-    /* Load and build program (with binary cache) */
+    /* Load and build single-source program (galosh.cl = unified RAW + YUV kernels). */
     {
         const char *cl_paths[] = {
-            "galosh_fused.cl",
-            "C:/Users/luxgrain/denoise_eval/standalone/galosh_fused.cl",
+            "galosh.cl",
+            "C:/Users/luxgrain/GALOSH/standalone/galosh.cl",
             NULL
         };
         char *source = NULL;
@@ -1334,7 +1371,7 @@ int main(int argc, char **argv)
             if(source) { cl_src_path = cl_paths[i]; break; }
         }
         if(!source) {
-            fprintf(stderr, "[CL] Cannot find kernel .cl file\n");
+            fprintf(stderr, "[CL] Cannot find kernel source galosh.cl\n");
             goto cl_cleanup;
         }
 
@@ -1344,10 +1381,11 @@ int main(int argc, char **argv)
                  "-DHIST_BINS=%d -DREDUCE_WG_SIZE=%d",
                  GALOSH_STRIDE, TILE_SIZE, HIST_BINS, REDUCE_WG_SIZE);
 
-        /* Binary cache path */
+        /* Binary cache path — rev'd for single-source merged build so old
+         * 2-source caches are invalidated automatically. */
         char cache_path[512];
         snprintf(cache_path, sizeof(cache_path),
-                 "%s.fullpipe3_s%d_t%d_dev%d.bin",
+                 "%s.unified_s%d_t%d_dev%d.bin",
                  cl_src_path, GALOSH_STRIDE, TILE_SIZE, cl_device_idx);
 
         int use_cache = 0;
@@ -1389,7 +1427,7 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Compile from source */
+        /* Compile from source (single-source unified build). */
         program = clCreateProgramWithSource(context, 1, (const char **)&source, &src_len, &err);
         free(source);
         CL_CHECK(err, "createProgram");
@@ -1463,6 +1501,15 @@ int main(int argc, char **argv)
     k_pass1_only            = clCreateKernel(program, "galosh_pass1_only", &err);
     CL_CHECK(err, "kernel pass1_only");
     k_fused_pass12          = clCreateKernel(program, "galosh_fused_pass12", &err);
+    /* Raw-mode chroma guided filter kernels (reuse yuv kernels). */
+    k_raw_chroma_derive      = clCreateKernel(program, "galosh_yuv_chroma_params_derive", &err);
+    k_raw_h2f                = clCreateKernel(program, "galosh_yuv_half_to_float", &err);
+    k_raw_f2h                = clCreateKernel(program, "galosh_yuv_float_to_half", &err);
+    k_raw_guided_moments_x   = clCreateKernel(program, "galosh_yuv_guided_moments_x", &err);
+    k_raw_guided_moments_yab = clCreateKernel(program, "galosh_yuv_guided_moments_y_ab", &err);
+    k_raw_guided_apply_x     = clCreateKernel(program, "galosh_yuv_guided_apply_x", &err);
+    k_raw_guided_apply_y     = clCreateKernel(program, "galosh_yuv_guided_apply_y", &err);
+    k_raw_guided_loess       = clCreateKernel(program, "galosh_yuv_guided_loess", &err);
     CL_CHECK(err, "kernel fused_pass12");
     k_compute_L_fullres     = clCreateKernel(program, "galosh_compute_L_fullres", &err);
     CL_CHECK(err, "kernel compute_L_fullres");
@@ -1509,6 +1556,25 @@ int main(int argc, char **argv)
         c1_out_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_h, NULL, &err);
         c2_out_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_h, NULL, &err);
         c3_out_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_h, NULL, &err);
+        /* Guided-filter scratch for raw-mode chroma — all float32, so the
+         * buffer size is hw*hh*sizeof(float), NOT ch_bytes_h (which is for
+         * half precision = ×1/2 the size). */
+        const size_t ch_bytes_f = (size_t)hw * (size_t)hh * sizeof(float);
+        rgf_sum_Y_x   = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_sum_YY_x  = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_sum_Cb_x  = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_sum_Cr_x  = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_sum_YCb_x = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_sum_YCr_x = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_a_cb_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_b_cb_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_a_cr_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        rgf_b_cr_x    = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        /* Float32 copies of half luma/c1/c2/c3 used by guided filter. */
+        luma_f_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        c1_f_buf   = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        c2_f_buf   = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
+        c3_f_buf   = clCreateBuffer(context, CL_MEM_READ_WRITE, ch_bytes_f, NULL, &err);
         CL_CHECK(err, "alloc out_bufs (FP16)");
 
         Lfr_noisy_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, full_bytes_h, NULL, &err);
@@ -1844,21 +1910,96 @@ int main(int argc, char **argv)
         clSetKernelArg(k_fused_pass12, 4, sizeof(float), &luma_strength);
         dispatch_tile_named(queue, k_fused_pass12, hw, hh, "K13 fused_L");
 
-        /* C1 */
-        clSetKernelArg(k_fused_pass12, 0, sizeof(cl_mem), &c1_buf);
-        clSetKernelArg(k_fused_pass12, 1, sizeof(cl_mem), &c1_out_buf);
-        clSetKernelArg(k_fused_pass12, 4, sizeof(float), &chroma_strength);
-        dispatch_tile_named(queue, k_fused_pass12, hw, hh, "K13 fused_C1");
+        /* ========================================================
+         * C1/C2/C3 — Y-guided filter (Step 8: unified L/C split).
+         *
+         * Luma plane (L = 2×2-WHT DC) stays on WHT LOSH above; the three
+         * chroma sub-bands (C1, C2, C3) move to a Y-guided filter that
+         * mirrors the galosh_yuv_gpu chroma path:
+         *
+         *   C_out(x, y) ≈ mean_a(x,y)·L(x,y) + mean_b(x,y)
+         *
+         * ε_pixel = strength_c² · (α·L + σ²)  with α, σ² = raw blind
+         * estimates.  Guide = luma_buf (GAT'd noisy L plane — good enough
+         * as cross-guidance; we do not require the denoised L because
+         * edges in luminance are already 5-10× SNR over chroma).
+         *
+         * 2 dispatch runs (joint-pair + singleton):
+         *   Run 1: Cb slot=C1, Cr slot=C2 → C1_out, C2_out
+         *   Run 2: Cb slot=C3, Cr slot=C3 → C3_out (Cr output = same, discarded)
+         *
+         * ε α/σ² plumbed through params[16..19] (yuv chroma slots) —
+         * pre-write raw α/σ² there so the shared kernel reads valid values.
+         * ======================================================== */
+        {
+            /* Raw-mode pipeline uses half precision for luma/c1/c2/c3; the
+             * shared yuv guided-filter kernels operate on fp32.  Convert
+             * half → float once into dedicated scratch buffers, run the
+             * 4-stage guided filter, then convert the float output back to
+             * half to feed the downstream (half-based) reconstruct stages. */
+            const int chsize = hw * hh;
+            /* half → float for all 4 half buffers. */
+            clSetKernelArg(k_raw_h2f, 0, sizeof(cl_mem), &luma_buf);
+            clSetKernelArg(k_raw_h2f, 1, sizeof(cl_mem), &luma_f_buf);
+            clSetKernelArg(k_raw_h2f, 2, sizeof(int),    &chsize);
+            dispatch_1d_named(queue, k_raw_h2f, align_up(chsize, 256), 256, "K13.a h2f_L");
+            clSetKernelArg(k_raw_h2f, 0, sizeof(cl_mem), &c1_buf);
+            clSetKernelArg(k_raw_h2f, 1, sizeof(cl_mem), &c1_f_buf);
+            dispatch_1d_named(queue, k_raw_h2f, align_up(chsize, 256), 256, "K13.a h2f_C1");
+            clSetKernelArg(k_raw_h2f, 0, sizeof(cl_mem), &c2_buf);
+            clSetKernelArg(k_raw_h2f, 1, sizeof(cl_mem), &c2_f_buf);
+            dispatch_1d_named(queue, k_raw_h2f, align_up(chsize, 256), 256, "K13.a h2f_C2");
+            clSetKernelArg(k_raw_h2f, 0, sizeof(cl_mem), &c3_buf);
+            clSetKernelArg(k_raw_h2f, 1, sizeof(cl_mem), &c3_f_buf);
+            dispatch_1d_named(queue, k_raw_h2f, align_up(chsize, 256), 256, "K13.a h2f_C3");
 
-        /* C2 */
-        clSetKernelArg(k_fused_pass12, 0, sizeof(cl_mem), &c2_buf);
-        clSetKernelArg(k_fused_pass12, 1, sizeof(cl_mem), &c2_out_buf);
-        dispatch_tile_named(queue, k_fused_pass12, hw, hh, "K13 fused_C2");
+            /* Derive chroma (α, σ²) from params[13,14] into [16..19]. */
+            clSetKernelArg(k_raw_chroma_derive, 0, sizeof(cl_mem), &params_buf);
+            dispatch_1d_named(queue, k_raw_chroma_derive, 1, 0, "K13.0 chroma_derive");
 
-        /* C3 */
-        clSetKernelArg(k_fused_pass12, 0, sizeof(cl_mem), &c3_buf);
-        clSetKernelArg(k_fused_pass12, 1, sizeof(cl_mem), &c3_out_buf);
-        dispatch_tile_named(queue, k_fused_pass12, hw, hh, "K13 fused_C3");
+            /* LOESS (bilateral-weighted guided filter) — single 2D pass that
+             * replaces the old 4-kernel separable-guided pipeline.  Replaces
+             *   moments_x → moments_y_ab → apply_x → apply_y
+             * with one non-separable kernel that re-weights neighbours by
+             * exp(-(Y_i - Y_c)² / (2σ²)), excluding specular highlights from
+             * silver windows (see yuv_gat.cl docstring for derivation).
+             * Outputs to float scratch, then f2h to downstream c*_out_buf. */
+            for(int pass = 0; pass < 2; pass++) {
+                cl_mem cb_in      = (pass == 0) ? c1_f_buf : c3_f_buf;
+                cl_mem cr_in      = (pass == 0) ? c2_f_buf : c3_f_buf;
+                /* Float output scratch (not aliased with inputs): reuse the
+                 * now-unused rgf_a_cb_x / rgf_a_cr_x scalar-plane scratch. */
+                cl_mem cb_f_out   = rgf_a_cb_x;
+                cl_mem cr_f_out   = rgf_a_cr_x;
+                cl_mem cb_half_out = (pass == 0) ? c1_out_buf : c3_out_buf;
+                cl_mem cr_half_out = (pass == 0) ? c2_out_buf : rgf_b_cr_x;  /* unused */
+
+                clSetKernelArg(k_raw_guided_loess, 0, sizeof(cl_mem), &luma_f_buf);
+                clSetKernelArg(k_raw_guided_loess, 1, sizeof(cl_mem), &cb_in);
+                clSetKernelArg(k_raw_guided_loess, 2, sizeof(cl_mem), &cr_in);
+                clSetKernelArg(k_raw_guided_loess, 3, sizeof(cl_mem), &params_buf);
+                clSetKernelArg(k_raw_guided_loess, 4, sizeof(float),  &chroma_strength);
+                clSetKernelArg(k_raw_guided_loess, 5, sizeof(cl_mem), &cb_f_out);
+                clSetKernelArg(k_raw_guided_loess, 6, sizeof(cl_mem), &cr_f_out);
+                clSetKernelArg(k_raw_guided_loess, 7, sizeof(int),    &hw);
+                clSetKernelArg(k_raw_guided_loess, 8, sizeof(int),    &hh);
+                dispatch_2d_named(queue, k_raw_guided_loess,
+                                  align_up(hw, 16), align_up(hh, 16),
+                                  16, 16, "K13 raw_gf_loess");
+
+                /* Float → half: write to downstream c{1,2,3}_out_buf. */
+                clSetKernelArg(k_raw_f2h, 0, sizeof(cl_mem), &cb_f_out);
+                clSetKernelArg(k_raw_f2h, 1, sizeof(cl_mem), &cb_half_out);
+                clSetKernelArg(k_raw_f2h, 2, sizeof(int),    &chsize);
+                dispatch_1d_named(queue, k_raw_f2h, align_up(chsize, 256), 256, "K13 f2h_cb");
+                if(pass == 0) {
+                    clSetKernelArg(k_raw_f2h, 0, sizeof(cl_mem), &cr_f_out);
+                    clSetKernelArg(k_raw_f2h, 1, sizeof(cl_mem), &cr_half_out);
+                    dispatch_1d_named(queue, k_raw_f2h, align_up(chsize, 256), 256, "K13 f2h_cr");
+                }
+            }
+        }
+
     }
 
     /* ---- K14: Compute L fullres (noisy + pilot) ---- */
@@ -2019,6 +2160,14 @@ cl_cleanup:
     if(k_wht_decompose) clReleaseKernel(k_wht_decompose);
     if(k_pass1_only) clReleaseKernel(k_pass1_only);
     if(k_fused_pass12) clReleaseKernel(k_fused_pass12);
+    if(k_raw_chroma_derive)      clReleaseKernel(k_raw_chroma_derive);
+    if(k_raw_h2f)                clReleaseKernel(k_raw_h2f);
+    if(k_raw_f2h)                clReleaseKernel(k_raw_f2h);
+    if(k_raw_guided_moments_x)   clReleaseKernel(k_raw_guided_moments_x);
+    if(k_raw_guided_moments_yab) clReleaseKernel(k_raw_guided_moments_yab);
+    if(k_raw_guided_apply_x)     clReleaseKernel(k_raw_guided_apply_x);
+    if(k_raw_guided_apply_y)     clReleaseKernel(k_raw_guided_apply_y);
+    if(k_raw_guided_loess)       clReleaseKernel(k_raw_guided_loess);
     if(k_compute_L_fullres) clReleaseKernel(k_compute_L_fullres);
     if(k_pass2_only) clReleaseKernel(k_pass2_only);
     if(k_reconstruct) clReleaseKernel(k_reconstruct);
@@ -2039,6 +2188,20 @@ cl_cleanup:
     if(c1_out_buf) clReleaseMemObject(c1_out_buf);
     if(c2_out_buf) clReleaseMemObject(c2_out_buf);
     if(c3_out_buf) clReleaseMemObject(c3_out_buf);
+    if(rgf_sum_Y_x)   clReleaseMemObject(rgf_sum_Y_x);
+    if(rgf_sum_YY_x)  clReleaseMemObject(rgf_sum_YY_x);
+    if(rgf_sum_Cb_x)  clReleaseMemObject(rgf_sum_Cb_x);
+    if(rgf_sum_Cr_x)  clReleaseMemObject(rgf_sum_Cr_x);
+    if(rgf_sum_YCb_x) clReleaseMemObject(rgf_sum_YCb_x);
+    if(rgf_sum_YCr_x) clReleaseMemObject(rgf_sum_YCr_x);
+    if(rgf_a_cb_x)    clReleaseMemObject(rgf_a_cb_x);
+    if(rgf_b_cb_x)    clReleaseMemObject(rgf_b_cb_x);
+    if(rgf_a_cr_x)    clReleaseMemObject(rgf_a_cr_x);
+    if(rgf_b_cr_x)    clReleaseMemObject(rgf_b_cr_x);
+    if(luma_f_buf)    clReleaseMemObject(luma_f_buf);
+    if(c1_f_buf)      clReleaseMemObject(c1_f_buf);
+    if(c2_f_buf)      clReleaseMemObject(c2_f_buf);
+    if(c3_f_buf)      clReleaseMemObject(c3_f_buf);
     if(Lfr_noisy_buf) clReleaseMemObject(Lfr_noisy_buf);
     if(Lfr_pilot_buf) clReleaseMemObject(Lfr_pilot_buf);
     if(Lfr_den_buf) clReleaseMemObject(Lfr_den_buf);

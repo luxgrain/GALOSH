@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for rawdenoise_gpu.exe yuv_gat mode on SIDD Medium scene #0."""
+"""Smoke test for galosh_gpu.exe yuv_gat mode on SIDD Medium scene #0."""
 import numpy as np
 import subprocess
 import sys
@@ -8,7 +8,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 
 BASE = Path(__file__).parent.parent
 BENCH_DIR = BASE / "datasets" / "sidd" / "medium_bench"
-GPU_EXE = Path(__file__).parent / "rawdenoise_gpu.exe"
+GPU_EXE = Path(__file__).parent / "galosh_gpu.exe"
 BASH_EXE = Path(r"C:\msys64\usr\bin\bash.exe")
 
 # Load first scene

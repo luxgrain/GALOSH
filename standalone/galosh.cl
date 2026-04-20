@@ -1,3 +1,20 @@
+/* ================================================================
+ * GALOSH (Generalized Anscombe LOcal SHrinkage) — unified kernels
+ *
+ * Single OpenCL source covering both RAW and YUV pipelines.
+ * Organised into three thematic sections — core kernels shared by
+ * both modes (§1), RAW-mode specifics (§2), and YUV/Y-GAT-mode
+ * specifics (§3).  The guided_loess (LOESS chroma) kernel at the
+ * end of §3 is used by both pipelines.
+ *
+ * Build: loaded as a single-source program by rawdenoise_gpu.c
+ * (no runtime concatenation).  See README / paper for derivations.
+ * ================================================================
+ */
+
+/* ================================================================
+ * §1 + §2. Core (noise, GAT, WHT/LOSH, helpers) + RAW-mode kernels
+ * ================================================================*/
 /*
  * GALOSH Fused Tile Kernel — Pass1(BayesShrink) + Pass2(Wiener) in one dispatch
  *
@@ -238,13 +255,28 @@ kernel void galosh_pass1_only(
           if(lambda > lambda_max_unorm) lambda = lambda_max_unorm;
         }
 
+        /* Pass1 shrinkage — soft instead of hard.
+         * EN: Hard thresholding ( |c|<λ → 0 else c ) creates a discontinuity
+         *     at |c|=λ.  In yuv_gpu this leaks into the chroma path as a
+         *     blocky overlap-add artifact and inflates LPIPS.  Soft
+         *     thresholding ( c → sign(c)·max(|c|-λ, 0) ) is continuous and
+         *     preserves edge gradient direction.  Pass2 Wiener still applies
+         *     so noise floor is maintained.
+         * JP: Pass1 を soft 化。hard 不連続 → over-smooth + ブロック化、
+         *     perceptual を悪化させていた。soft で連続化、Pass2 Wiener が
+         *     後段で noise level 確保。 */
         int n_nonzero = 1;
         for(int i = 1; i < GALOSH_BP; i++)
         {
-          if(fabs((float)block[i]) < lambda)
+          const float v = (float)block[i];
+          const float a = fabs(v);
+          if(a < lambda)
             block[i] = (half)0.0f;
           else
+          {
+            block[i] = (half)copysign(a - lambda, v);
             n_nonzero++;
+          }
         }
 
         wht2d_8x8_h(block, 1);
@@ -382,13 +414,28 @@ kernel void galosh_fused_pass12(
           if(lambda > lambda_max_unorm) lambda = lambda_max_unorm;
         }
 
+        /* Pass1 shrinkage — soft instead of hard.
+         * EN: Hard thresholding ( |c|<λ → 0 else c ) creates a discontinuity
+         *     at |c|=λ.  In yuv_gpu this leaks into the chroma path as a
+         *     blocky overlap-add artifact and inflates LPIPS.  Soft
+         *     thresholding ( c → sign(c)·max(|c|-λ, 0) ) is continuous and
+         *     preserves edge gradient direction.  Pass2 Wiener still applies
+         *     so noise floor is maintained.
+         * JP: Pass1 を soft 化。hard 不連続 → over-smooth + ブロック化、
+         *     perceptual を悪化させていた。soft で連続化、Pass2 Wiener が
+         *     後段で noise level 確保。 */
         int n_nonzero = 1;
         for(int i = 1; i < GALOSH_BP; i++)
         {
-          if(fabs((float)block[i]) < lambda)
+          const float v = (float)block[i];
+          const float a = fabs(v);
+          if(a < lambda)
             block[i] = (half)0.0f;
           else
+          {
+            block[i] = (half)copysign(a - lambda, v);
             n_nonzero++;
+          }
         }
 
         wht2d_8x8_h(block, 1);
@@ -1872,20 +1919,31 @@ inline float gat_inv_lut(
   if(D >= d_max)
     return 1.0f;
 
-  /* O(1) direct index via algebraic GAT inverse:
-   * GAT(x) = (2/α)·√(αx + 3α²/8 + σ²)
-   * GAT_inv(D) = ((αD/2)² - 3α²/8 - σ²) / α
-   * Index = clamp(GAT_inv(D) × (N-1), 0, N-2)
-   * E[GAT] ≠ algebraic GAT → ±1 refinement step corrects.
-   * Quality-neutral: same LUT table, same linear interpolation. */
-  const float half_aD = alpha * D * 0.5f;
-  const float x_est = (half_aD * half_aD - 0.375f * alpha * alpha - sigma_sq) / alpha;
-  int lo = clamp((int)(x_est * (float)(GAT_LUT_SIZE - 1)), 0, GAT_LUT_SIZE - 2);
-
-  /* Bounded refinement for E[GAT] vs algebraic GAT mismatch (max ±8 steps) */
-  for(int r = 0; r < 8 && lo < GAT_LUT_SIZE - 2 && lut_d[lo + 1] < D; r++) lo++;
-  for(int r = 0; r < 8 && lo > 0 && lut_d[lo] > D; r++) lo--;
-
+  /* Bisection search for the LUT bin [lo, lo+1] containing D.
+   *
+   * EN: The earlier "O(1) algebraic estimate + 8-step refinement" failed
+   *     on bimodal chroma windows near specular highlights.  The algebraic
+   *     inverse x_est = (αD/2)² / α is only valid when D = α·GAT(x); but
+   *     in K16 D = (L_block ± C1 ± C2 ± C3)·sg/2 + dark_ref, mixing post-
+   *     WHT values with the unified_sigma normalisation.  x_est overshot
+   *     by >10× on chroma outliers, forcing lo to the LUT end, and 8
+   *     refinement steps could not climb back to the true bin.  Observed
+   *     gat_inv_lut returning 3.89e5 at D=175.8 whose true x ≈ 0.23 —
+   *     this injected saturated pixels into silver regions as the red/
+   *     blue grains visible on 6/80 SIDD Medium scenes (0077/0078 G4,
+   *     0083 GP).  Bisection is O(log N) = 12 reads, still cheap, and
+   *     guarantees a bracketing bin regardless of upstream val scale.
+   *
+   * JP: 旧 O(1) 代数推定 + ±8 step 補正は bimodal chroma で破綻。
+   *     x_est が >10× overshoot → lo が LUT 末尾にクランプ → 8 step では
+   *     戻れず内挿で 389239 を返す事故を観測 (silver 面の赤青粒)。
+   *     bisection の O(log N) ≈ 12 read に置換。L+C スケールに依らず
+   *     正しい bin が決まる。 */
+  int lo = 0, hi = GAT_LUT_SIZE - 1;
+  while(lo + 1 < hi){
+    const int mid = (lo + hi) >> 1;
+    if(lut_d[mid] <= D) lo = mid; else hi = mid;
+  }
   const float d0 = lut_d[lo], d1 = lut_d[lo + 1];
   const float t = (D - d0) / fmax(d1 - d0, 1e-10f);
   return lut_x[lo] + t * (lut_x[lo + 1] - lut_x[lo]);
@@ -1931,10 +1989,12 @@ kernel void galosh_reconstruct(
   const float yb = lut_params[2], tb = lut_params[3], sr = lut_params[4];
   const float al = lut_params[5], sq = lut_params[6];
 
-  output[fy     * width + fx]     = gat_inv_lut(val_R  * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq);
-  output[fy     * width + fx + 1] = gat_inv_lut(val_Gr * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq);
-  output[(fy+1) * width + fx]     = gat_inv_lut(val_Gb * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq);
-  output[(fy+1) * width + fx + 1] = gat_inv_lut(val_B  * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq);
+  /* Defensive clamp: gat_inv_lut can propagate NaN/Inf if upstream emits
+   * such poison; raw output is defined on [0,1]. */
+  output[fy     * width + fx]     = clamp(gat_inv_lut(val_R  * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq), 0.0f, 1.0f);
+  output[fy     * width + fx + 1] = clamp(gat_inv_lut(val_Gr * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq), 0.0f, 1.0f);
+  output[(fy+1) * width + fx]     = clamp(gat_inv_lut(val_Gb * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq), 0.0f, 1.0f);
+  output[(fy+1) * width + fx + 1] = clamp(gat_inv_lut(val_B  * sg, lut_d, lut_x, dm, dx, yb, tb, sr, al, sq), 0.0f, 1.0f);
 }
 
 
@@ -2334,3 +2394,962 @@ kernel void galosh_denormalize_single(
   const float sigma = sigma_buf[0];   /* sigma_out[0] = sigma */
   plane_out[i] = (float)plane_in[i] * sigma;
 }
+
+
+/* ================================================================
+ * §3. YUV/Y-GAT mode + shared chroma utilities
+ *
+ * Originally split as galosh_yuv_gat.cl; merged here as §3.
+ * Includes the shared LOESS chroma kernel used by both modes.
+ * ================================================================*/
+/*
+ * ================================================================
+ * galosh_yuv_gat.cl — Linear-domain Y-GAT + Y-driven chroma VST
+ *
+ * EN: Extension of GALOSH to sRGB inputs via linear-domain YCbCr
+ *     decomposition. The luma plane follows the original Poisson-Gauss
+ *     GALOSH pipeline (GAT → LOSH → Makitalo-Foi inverse), while the
+ *     chroma planes use a Y-driven *linear* variance-stabilising
+ *     transform `Cb_stab = Cb / sqrt(α_Cb · Y_lin + σ²_Cb)` that is
+ *     the exact VST for Gaussian noise whose variance depends only on
+ *     the luminance of the same pixel.
+ *
+ * JP: GALOSH を sRGB 入力に拡張する実装。sRGB → linear → YCbCr に
+ *     戻したうえで、Y 平面には従来の Poisson-Gauss GAT+LOSH を、
+ *     Cb/Cr 平面には Y 駆動の線形 VST (`÷√(α_Cb·Y+σ²_Cb)`) を適用。
+ *     Cb/Cr のノイズは R/G/B の shot/read noise の線形和だから、
+ *     分散は Cb 自身ではなく同画素の Y で決まる ─ この事実を利用した
+ *     1 回の blind estimation で 3 平面全てをカバーする設計。
+ *
+ * Physical rationale (see plan cosmic-brewing-toast.md):
+ *     Var[Y_lin]  ≈ α_Y · Y_lin + σ²_Y           → GAT (2√) non-linear
+ *     Var[Cb_lin] ≈ α_Cb · Y_lin + σ²_Cb         → linear ÷√ scaling
+ *     Var[Cr_lin] ≈ α_Cr · Y_lin + σ²_Cr         → linear ÷√ scaling
+ *     α_Cb ≈ 0.375·α_Y   σ²_Cb ≈ 0.375·σ²_Y      (BT.709 + iid shot)
+ *     α_Cr ≈ 0.605·α_Y   σ²_Cr ≈ 0.605·σ²_Y
+ *
+ * All kernels operate entirely on GPU; CPU does only input-read and
+ * output-write (1 clEnqueueWriteBuffer + 1 clEnqueueReadBuffer).
+ *
+ * Copyright (c) 2026 luxgrain. All rights reserved.
+ * ================================================================ */
+
+/* sRGB EOTF parameters (IEC 61966-2-1) */
+#define SRGB_A     0.055f
+#define SRGB_ONEP  1.055f
+#define SRGB_GAMMA 2.4f
+#define SRGB_PHI   12.92f
+#define SRGB_THRS  0.04045f
+#define SRGB_THRS_L 0.0031308f
+
+/* BT.709 linear YCbCr coefficients */
+#define BT709_KR 0.2126f
+#define BT709_KG 0.7152f
+#define BT709_KB 0.0722f
+/* Denominators from (B-Y)/(1-K_B) and (R-Y)/(1-K_R) — full-range video
+ * style; we keep Cb/Cr CENTRED AT 0 (not +0.5) for ease of VST. */
+#define BT709_CB_DEN 1.8556f   /* 2 * (1 - KB) */
+#define BT709_CR_DEN 1.5748f   /* 2 * (1 - KR) */
+
+/* Chroma variance-coefficient scaling.
+ * Derived from the fact that Cb = (B - Y)/(2(1-KB)); noise in (B,Y) is
+ * almost independent (cov ≈ 0.07·α·Y), so Var[Cb] = (Var[B]+(1-KB)²·
+ * Var[Y] - 2·(1-KB)·Cov[B,Y]) / (2(1-KB))². Plugging in the Poisson-
+ * Gauss shot-noise model gives α_Cb/α_Y ≈ 0.375, α_Cr/α_Y ≈ 0.605.
+ * σ² ratios follow the same identity (same linear combination). */
+/* Chroma noise-variance ratio against Y (BT.709 + iid Poisson + uniform-gray
+ * approximation, redrived 2026-04-18).
+ *
+ *   R/G/B independent Poisson, R=G=B=m ⇒
+ *     Var(Y)  = (w_R² + w_G² + w_B²)·α·m       = 0.5619·α·m
+ *     Var(Cb) = (w_R² + w_G² + (1-w_B)²)/d_Cb²·α·m = 0.4117·α·m
+ *     Var(Cr) = ((1-w_R)² + w_G² + w_B²)/d_Cr²·α·m = 0.4584·α·m
+ *   where (w_R,w_G,w_B) = (0.2126, 0.7152, 0.0722) and (d_Cb,d_Cr) = (1.8556, 1.5748).
+ *   blind α_Y_fit measures Var(Y)/m, so:
+ *     α_Cb / α_Y_fit = 0.4117 / 0.5619 ≈ 0.733
+ *     α_Cr / α_Y_fit = 0.4584 / 0.5619 ≈ 0.816
+ *   The previous hard-coded 0.375 / 0.605 underestimated σ²_C by ~50% / ~25%,
+ *   collapsing the Cb_stab denominator at low Y and amplifying chroma noise
+ *   into black-block artifacts on high-ISO low-light scenes (e.g. 0015, 0081).
+ *   Same ratios apply to σ²_C under R/G/B equal-variance read noise. */
+#define CHROMA_RATIO_CB 0.733f
+#define CHROMA_RATIO_CR 0.816f
+
+/* Params buffer indices for Y-GAT mode (extend of PARAMS_SIZE=32) */
+#define YG_P_LUMA_STR     11
+#define YG_P_CHROMA_STR   12
+#define YG_P_ALPHA_Y      13
+#define YG_P_SIGMA_SQ_Y   14
+#define YG_P_DARK_MAX     15
+#define YG_P_ALPHA_CB     16
+#define YG_P_SIGMA_SQ_CB  17
+#define YG_P_ALPHA_CR     18
+#define YG_P_SIGMA_SQ_CR  19
+#define YG_P_SIGMA_Y      20  /* mean √(α·Y+σ²) for Y — auto-selected sigma_strength */
+#define YG_P_SIGMA_CB     21  /* mean √(α_Cb·Y+σ²_Cb) — for LOSH strength tuning */
+#define YG_P_SIGMA_CR     22
+#define YG_P_EPS_BIV      23  /* regularisation for bivariate Wiener */
+
+/* Y-plane block-stats layout: same 8×8 block, 2-stride as Bayer path,
+ * but only one channel (no CFA offset). Block size constants reuse
+ * the Bayer defines. */
+#ifndef NE_BLOCK_SZ
+#define NE_BLOCK_SZ 8
+#endif
+#ifndef NE_BLOCK_STEP
+#define NE_BLOCK_STEP 2
+#endif
+#ifndef NE_BSEARCH_ITER
+#define NE_BSEARCH_ITER 14
+#endif
+
+/* ================================================================
+ * Utility: sRGB <-> linear conversion (per-pixel)
+ * ================================================================ */
+static inline float srgb_to_lin(float c)
+{
+  return (c <= SRGB_THRS) ? (c / SRGB_PHI)
+                          : pow((c + SRGB_A) / SRGB_ONEP, SRGB_GAMMA);
+}
+static inline float lin_to_srgb(float c)
+{
+  return (c <= SRGB_THRS_L) ? (SRGB_PHI * c)
+                            : (SRGB_ONEP * pow(c, 1.0f / SRGB_GAMMA) - SRGB_A);
+}
+
+/* ================================================================
+ * YG1: sRGB → linear YCbCr (fused, per-pixel)
+ *
+ * Dispatch: 1D, global = npix = W×H.
+ * Input: 3-ch interleaved sRGB float32  (rgb[0..3*npix-1])
+ * Output: 3 separate float32 planes (Y_lin, Cb_lin, Cr_lin), each length npix.
+ *
+ * Fused sRGB EOTF → linear RGB → BT.709 YCbCr. Saves 1 global RT.
+ *
+ * JP: sRGB 3ch 入力を per-pixel 1 kernel で linear YCbCr 3 平面に展開。
+ *     global memory を 1 回だけ round-trip → register 内で完結。
+ * ================================================================ */
+kernel void galosh_yuv_srgb_to_linear_ycbcr(
+    global const float *restrict srgb_rgb,     /* length 3*npix, interleaved */
+    global float       *restrict Y_out,        /* length npix */
+    global float       *restrict Cb_out,       /* length npix */
+    global float       *restrict Cr_out,       /* length npix */
+    const int npix)
+{
+  const int i = get_global_id(0);
+  if(i >= npix) return;
+
+  const int base = 3 * i;
+  const float R_s = srgb_rgb[base + 0];
+  const float G_s = srgb_rgb[base + 1];
+  const float B_s = srgb_rgb[base + 2];
+
+  /* sRGB EOTF inverse */
+  const float R = srgb_to_lin(R_s);
+  const float G = srgb_to_lin(G_s);
+  const float B = srgb_to_lin(B_s);
+
+  /* BT.709 linear YCbCr (centred Cb/Cr, NOT +0.5) */
+  const float Y  = BT709_KR * R + BT709_KG * G + BT709_KB * B;
+  const float Cb = (B - Y) * (1.0f / BT709_CB_DEN);
+  const float Cr = (R - Y) * (1.0f / BT709_CR_DEN);
+
+  Y_out[i]  = Y;
+  Cb_out[i] = Cb;
+  Cr_out[i] = Cr;
+}
+
+/* ================================================================
+ * YG11: linear YCbCr → sRGB (fused, per-pixel)
+ *
+ * Dispatch: 1D, global = npix.
+ * Inverse of YG1. Clips output to [0,1] after OETF.
+ * ================================================================ */
+kernel void galosh_yuv_ycbcr_to_srgb(
+    global const float *restrict Y_in,
+    global const float *restrict Cb_in,
+    global const float *restrict Cr_in,
+    global float       *restrict srgb_rgb_out,
+    const int npix)
+{
+  const int i = get_global_id(0);
+  if(i >= npix) return;
+
+  const float Y  = Y_in[i];
+  const float Cb = Cb_in[i];
+  const float Cr = Cr_in[i];
+
+  /* YCbCr → linear RGB (BT.709 inverse) */
+  const float R = Y + BT709_CR_DEN * Cr;
+  const float G = Y - (BT709_KR * BT709_CR_DEN / BT709_KG) * Cr
+                    - (BT709_KB * BT709_CB_DEN / BT709_KG) * Cb;
+  const float B = Y + BT709_CB_DEN * Cb;
+
+  /* Clip linear to [0,1] to keep OETF well-defined */
+  const float Rc = fmax(fmin(R, 1.0f), 0.0f);
+  const float Gc = fmax(fmin(G, 1.0f), 0.0f);
+  const float Bc = fmax(fmin(B, 1.0f), 0.0f);
+
+  /* sRGB OETF */
+  const int base = 3 * i;
+  srgb_rgb_out[base + 0] = lin_to_srgb(Rc);
+  srgb_rgb_out[base + 1] = lin_to_srgb(Gc);
+  srgb_rgb_out[base + 2] = lin_to_srgb(Bc);
+}
+
+/* ================================================================
+ * YG2: Y-plane block statistics (for Foi+Alenius blind estimation)
+ *
+ * Dispatch: 1D (n_total = n_bx * n_by), local = 64.
+ * Same algorithm as galosh_noise_block_stats for Bayer but operates
+ * on a single full-resolution plane (no CFA offset).
+ *
+ * Writes blk_mean[] and blk_var[] arrays (length n_total) that feed
+ * galosh_noise_estimate.
+ *
+ * JP: Y 平面用の block statistics kernel。Bayer 版と数式は同一だが
+ *     CFA オフセットなし。64×64 pixel 領域ごとに mean と
+ *     sigma_lap² を計算し、その後の Foi 回帰で α/σ² を推定。
+ * ================================================================ */
+kernel void galosh_yuv_noise_block_stats_Y(
+    global const float *restrict plane,
+    global float       *restrict blk_mean,
+    global float       *restrict blk_var,
+    const int width,
+    const int height,
+    const int n_bx,
+    const int n_by)
+{
+  const int gid = get_global_id(0);
+  const int total = n_bx * n_by;
+  if(gid >= total) return;
+
+  const int by = gid / n_bx;
+  const int bx = gid % n_bx;
+
+  /* 64×64 pixel region (NE_BLOCK_SZ * NE_BLOCK_STEP = 8 * 2 = 16 in
+   * CFA space, but here in full-res Y we double the foot-print to
+   * keep the same absolute area: step 2 × block 8 = 16 pixels). */
+  const int y0 = by * (NE_BLOCK_SZ * NE_BLOCK_STEP);
+  const int x0 = bx * (NE_BLOCK_SZ * NE_BLOCK_STEP);
+
+  /* Mean over 8×8 sub-block at upper-left */
+  float sum = 0.0f;
+  for(int y = y0; y < y0 + NE_BLOCK_SZ; y++)
+    for(int x = x0; x < x0 + NE_BLOCK_SZ; x++)
+      sum += plane[y * width + x];
+  const float bm = sum * (1.0f / (float)(NE_BLOCK_SZ * NE_BLOCK_SZ));
+
+  /* Binary-search median of |Laplacian| (horizontal + vertical). */
+  float lap_min = 1e30f, lap_max = 0.0f;
+  int nl = 0;
+
+  for(int y = y0; y < y0 + NE_BLOCK_SZ; y++)
+    for(int x = x0; x < x0 + NE_BLOCK_SZ - 2; x++)
+    {
+      const float v0 = plane[y * width + x];
+      const float v1 = plane[y * width + x + 1];
+      const float v2 = plane[y * width + x + 2];
+      const float L = fabs(v0 - 2.0f * v1 + v2);
+      lap_min = fmin(lap_min, L);
+      lap_max = fmax(lap_max, L);
+      nl++;
+    }
+  for(int y = y0; y < y0 + NE_BLOCK_SZ - 2; y++)
+    for(int x = x0; x < x0 + NE_BLOCK_SZ; x++)
+    {
+      const float v0 = plane[y * width + x];
+      const float v1 = plane[(y + 1) * width + x];
+      const float v2 = plane[(y + 2) * width + x];
+      const float L = fabs(v0 - 2.0f * v1 + v2);
+      lap_min = fmin(lap_min, L);
+      lap_max = fmax(lap_max, L);
+      nl++;
+    }
+
+  if(nl <= 10) { blk_mean[gid] = bm; blk_var[gid] = 1e10f; return; }
+
+  const int med_idx = nl >> 1;
+  float lo = lap_min, hi = lap_max;
+  for(int iter = 0; iter < NE_BSEARCH_ITER; iter++)
+  {
+    const float mid = (lo + hi) * 0.5f;
+    int cnt = 0;
+    for(int y = y0; y < y0 + NE_BLOCK_SZ; y++)
+      for(int x = x0; x < x0 + NE_BLOCK_SZ - 2; x++)
+      {
+        const float v0 = plane[y * width + x];
+        const float v1 = plane[y * width + x + 1];
+        const float v2 = plane[y * width + x + 2];
+        if(fabs(v0 - 2.0f * v1 + v2) <= mid) cnt++;
+      }
+    for(int y = y0; y < y0 + NE_BLOCK_SZ - 2; y++)
+      for(int x = x0; x < x0 + NE_BLOCK_SZ; x++)
+      {
+        const float v0 = plane[y * width + x];
+        const float v1 = plane[(y + 1) * width + x];
+        const float v2 = plane[(y + 2) * width + x];
+        if(fabs(v0 - 2.0f * v1 + v2) <= mid) cnt++;
+      }
+    if(cnt <= med_idx) lo = mid; else hi = mid;
+  }
+  const float med = (lo + hi) * 0.5f;
+  const float sigma_lap = med / 0.6745f;
+  const float sigma_lap_sq = sigma_lap * sigma_lap;
+
+  blk_mean[gid] = bm;
+  blk_var[gid]  = sigma_lap_sq / 6.0f;
+}
+
+/* ================================================================
+ * YG3: Y-plane dark-sample histogram
+ *
+ * Dispatch: 1D, global = n_samples = ceil(H/3)*ceil(W/3).
+ * Each WI samples one pixel (stride-3 in x and y), atomic_inc into
+ * 1024-bin dark histogram. Same role as galosh_noise_dark_samp_hist
+ * but single-plane.
+ * ================================================================ */
+kernel void galosh_yuv_noise_dark_samp_hist_Y(
+    global const float *restrict plane,
+    global int         *restrict dark_hist,   /* 1024 bins, bin_scale=1024 over [0,1] */
+    const int width,
+    const int height,
+    const int samp_per_row,
+    const int n_samples)
+{
+  const int gid = get_global_id(0);
+  if(gid >= n_samples) return;
+  const int sy = gid / samp_per_row;
+  const int sx = gid % samp_per_row;
+  const int y = sy * 3;
+  const int x = sx * 3;
+  if(x >= width || y >= height) return;
+  const float v = plane[y * width + x];
+  const int bin = clamp((int)(v * 1024.0f), 0, 1023);
+  atomic_inc(&dark_hist[bin]);
+}
+
+/* ================================================================
+ * YG4: Y-plane dark-Laplacian histogram (refines σ² on truly dark
+ * pixels identified by dark_max threshold from params[YG_P_DARK_MAX]).
+ *
+ * Dispatch: 1D (H*(W-2) + (H-2)*W positions).
+ * ================================================================ */
+kernel void galosh_yuv_noise_dark_lap_hist_Y(
+    global const float *restrict plane,
+    global int         *restrict lap_hist,   /* 2048 bins */
+    global const float *restrict params,
+    const int width,
+    const int height,
+    const int pos_per_row_h,
+    const int pos_per_ch)
+{
+  const int gid = get_global_id(0);
+  if(gid >= pos_per_ch) return;
+  const float dark_max = params[YG_P_DARK_MAX];
+
+  int x, y;
+  int is_h;
+  if(gid < pos_per_row_h)
+  {
+    /* horizontal Laplacian: (v0 - 2*v1 + v2) along x */
+    is_h = 1;
+    y = gid / (width - 2);
+    x = gid % (width - 2);
+  }
+  else
+  {
+    /* vertical Laplacian along y */
+    is_h = 0;
+    const int g2 = gid - pos_per_row_h;
+    y = g2 / width;
+    x = g2 % width;
+  }
+
+  float v0, v1, v2;
+  if(is_h)
+  {
+    v0 = plane[y * width + x];
+    v1 = plane[y * width + x + 1];
+    v2 = plane[y * width + x + 2];
+  }
+  else
+  {
+    v0 = plane[y * width + x];
+    v1 = plane[(y + 1) * width + x];
+    v2 = plane[(y + 2) * width + x];
+  }
+
+  /* Only use dark pixels (center value below dark_max) */
+  if(v1 > dark_max) return;
+  const float L = fabs(v0 - 2.0f * v1 + v2);
+  const int bin = clamp((int)(L * 4096.0f), 0, 2047);
+  atomic_inc(&lap_hist[bin]);
+}
+
+/* ================================================================
+ * YG5: Dark sigma_sq finalise (for Y plane).
+ *
+ * Dispatch: 1 WI. Scans lap_hist (2048 bins), picks median, converts
+ * to σ²_Y (same formula as galosh_noise_dark_finalize). Writes back
+ * into params[YG_P_SIGMA_SQ_Y].
+ * ================================================================ */
+kernel void galosh_yuv_noise_dark_finalize_Y(
+    global const int   *restrict lap_hist,
+    global float       *restrict params)
+{
+  if(get_global_id(0) != 0) return;
+
+  int total = 0;
+  for(int i = 0; i < 2048; i++) total += lap_hist[i];
+  if(total < 100) return;  /* too few dark pixels — keep bright estimate */
+
+  const int med_idx = total / 2;
+  int cum = 0, mb = 0;
+  for(int i = 0; i < 2048; i++)
+  {
+    cum += lap_hist[i];
+    if(cum >= med_idx) { mb = i; break; }
+  }
+  const float med = ((float)mb + 0.5f) / 4096.0f;
+  const float sigma_lap = med / 0.6745f;
+  const float sigma_sq_dark = (sigma_lap * sigma_lap) / 6.0f;
+
+  /* Reconcile bright-side (Huber WLS) and dark-only (Laplacian MAD) σ² estimates.
+   *
+   * EN: Bright-side Huber WLS can fail to recover a positive intercept on
+   *     low-light / high-ISO scenes (all residuals computed with σ²=0 stay
+   *     valid, so the iterator never updates the initial 0).  In that case
+   *     the old `fmin(sy2_cur, sigma_sq_dark)` silently wrote 0 back, killing
+   *     σ²_Y/σ²_Cb/σ²_Cr downstream and producing black-block noise on scene
+   *     0015 (ISO3200) et al.  Fall back to the dark estimate when bright
+   *     fit effectively failed; otherwise keep the more reliable (smaller)
+   *     of the two — dark is preferable because shot-noise vanishes in
+   *     shadows, but a truncated-dark estimate can exceed bright fit on
+   *     heavily clipped pixels, hence the min.
+   * JP: bright fit (Huber WLS) が 0 を返したら dark 単独推定を採用。
+   *     そうでなければ両者の小さい方 (暗部側が shot-noise 寄与を含まないぶん
+   *     信頼性が高いが、クリップ画素で過大評価される場合があるため min)。 */
+  const float sy2_cur = params[YG_P_SIGMA_SQ_Y];
+  params[YG_P_SIGMA_SQ_Y] = (sy2_cur > 1e-10f)
+      ? fmin(sy2_cur, sigma_sq_dark)
+      : sigma_sq_dark;
+}
+
+/* ================================================================
+ * YG6: Chroma noise-parameter derivation (closed-form).
+ *
+ * Dispatch: 1 WI.
+ * Reads (α_Y, σ²_Y) from params, writes analytically-derived chroma
+ * parameters (α_Cb, σ²_Cb, α_Cr, σ²_Cr) into the extended slots.
+ *
+ * See top of file for the derivation (BT.709 linear combination of
+ * independent R/G/B Poisson-Gauss noise).
+ * ================================================================ */
+kernel void galosh_yuv_chroma_params_derive(
+    global float *restrict params)
+{
+  if(get_global_id(0) != 0) return;
+  const float a_Y  = params[YG_P_ALPHA_Y];
+  const float s2_Y = params[YG_P_SIGMA_SQ_Y];
+  params[YG_P_ALPHA_CB]    = CHROMA_RATIO_CB * a_Y;
+  params[YG_P_SIGMA_SQ_CB] = CHROMA_RATIO_CB * s2_Y;
+  params[YG_P_ALPHA_CR]    = CHROMA_RATIO_CR * a_Y;
+  params[YG_P_SIGMA_SQ_CR] = CHROMA_RATIO_CR * s2_Y;
+}
+
+/* ================================================================
+ * YG7: Y-plane forward GAT
+ *
+ * Dispatch: 1D, global = npix.
+ * Applies generalised Anscombe transform:
+ *     Y_stab = (2/α) · sqrt(α·Y + 0.375·α² + σ²_Y)
+ * Output variance ≈ 1.  Written as float (precision preserved);
+ * a separate float→half conversion kernel feeds galosh_fused_pass12.
+ *
+ * JP: Y 平面 forward GAT。出力 variance ≈ 1。結果は float で返し、
+ *     次段で half に落とす (fused_pass12 は half 入出力)。
+ * ================================================================ */
+kernel void galosh_yuv_gat_forward_Y(
+    global const float *restrict Y_lin,
+    global float       *restrict Y_stab,
+    global const float *restrict params,
+    const int npix)
+{
+  const int i = get_global_id(0);
+  if(i >= npix) return;
+  const float a  = params[YG_P_ALPHA_Y];
+  const float s2 = params[YG_P_SIGMA_SQ_Y];
+  const float c  = 0.375f * a * a + s2;
+  const float inv_a = 2.0f / fmax(a, 1e-12f);
+  Y_stab[i] = inv_a * sqrt(fmax(a * Y_lin[i] + c, 0.0f));
+}
+
+
+/* ================================================================
+ * YG_MAKITALO_INVERSE_Y: Makitalo-Foi unbiased inverse GAT via LUT.
+ *
+ * Uses the 4096-entry LUT prebuilt by galosh_build_inv_lut /
+ * galosh_lut_finalize (driven by Y-plane α, σ²).  Looks up clean x from
+ * the stabilised value d via binary search + linear interpolation.
+ * ================================================================ */
+kernel void galosh_yuv_makitalo_inverse_Y(
+    global const float *restrict d_stab,
+    global       float *restrict x_out,
+    global const float *restrict lut_d,
+    global const float *restrict lut_x,
+    global const float *restrict lut_params,
+    const int npix)
+{
+  const int i = get_global_id(0);
+  if(i >= npix) return;
+  const float d = d_stab[i];
+  const float d_min = lut_params[0];
+  const float d_max = lut_params[1];
+
+  /* Binary search within lut_d[] for the interval containing d. */
+  float result;
+  if(d <= d_min) {
+    result = lut_x[0];
+  } else if(d >= d_max) {
+    result = lut_x[4095];
+  } else {
+    int lo = 0, hi = 4095;
+    while(hi - lo > 1)
+    {
+      const int mid = (lo + hi) >> 1;
+      if(lut_d[mid] <= d) lo = mid; else hi = mid;
+    }
+    const float d0 = lut_d[lo], d1 = lut_d[hi];
+    const float t  = (d - d0) / fmax(d1 - d0, 1e-20f);
+    result = lut_x[lo] * (1.0f - t) + lut_x[hi] * t;
+  }
+  x_out[i] = fmax(result, 0.0f);
+}
+
+/* ================================================================
+ * YG12: Float ↔ Half helper kernels (required because
+ * galosh_fused_pass12 operates on half buffers, but our colour-
+ * space / VST kernels work in float).
+ *
+ * Dispatch: 1D, global = npix.
+ * ================================================================ */
+kernel void galosh_yuv_float_to_half(
+    global const float *restrict src,
+    global half        *restrict dst,
+    const int npix)
+{
+  const int i = get_global_id(0);
+  if(i >= npix) return;
+  dst[i] = (half)src[i];
+}
+
+kernel void galosh_yuv_half_to_float(
+    global const half  *restrict src,
+    global float       *restrict dst,
+    const int npix)
+{
+  const int i = get_global_id(0);
+  if(i >= npix) return;
+  dst[i] = (float)src[i];
+}
+
+
+/* ================================================================
+ * Y-guided filter (He 2013) for chroma — SEPARABLE implementation.
+ *
+ * 4-kernel pipeline: 2D box filters decomposed into x-pass + y-pass.
+ * Reduces per-pixel work from O((2r+1)²) to O(2·(2r+1)), an 8× cut at
+ * r=7 (225 → 30 taps).
+ *
+ * Pipeline:
+ *   (1) moments_x       : row sum of (Y, Y², Cb, Cr, Y·Cb, Y·Cr)
+ *   (2) moments_y_and_ab: column sum + local regression → (a, b)
+ *   (3) apply_x         : row sum of (a, b) coefficient planes
+ *   (4) apply_y         : column sum + output = mean_a·Y + mean_b
+ *
+ * Quality: numerically identical to the non-separable reference (box
+ * filtering is separable).  Memory footprint is 6+4 float intermediate
+ * buffers (≈640 MB at 5326×2998) — a desktop-GPU trade.  For ISP/tile
+ * deployment the same 4 kernels can be wrapped in a tile loop with
+ * overlap = radius; the per-pixel operation is purely local and
+ * produces bit-for-bit identical output when overlap ≥ radius.
+ *
+ * Physics / ε: pixel-adaptive ε(Y) = strength_c²·(α_C·Y + σ²_C) is
+ * folded into moments_y_and_ab (step 2), where α_C/σ²_C are already
+ * averaged across Cb/Cr from chroma_params_derive.
+ *
+ * Compile-time knob:
+ *   YG_GF_RADIUS — half window size (full window = 2r+1).  Default 7 (15×15).
+ *
+ * Caller convention:
+ *   — moments_x writes 6 intermediate buffers (driver's responsibility)
+ *   — moments_y_and_ab produces 4 coefficient planes (a_Cb, b_Cb, a_Cr, b_Cr)
+ *   — apply_x writes 4 intermediate coefficient planes
+ *   — apply_y consumes 4 intermediate + Y and writes (Cb_out, Cr_out)
+ * ================================================================ */
+#ifndef YG_GF_RADIUS
+#define YG_GF_RADIUS 7
+#endif
+
+/* --- Kernel 1: 1D x-pass over (Y, Y², Cb, Cr, Y·Cb, Y·Cr). ------------- */
+kernel void galosh_yuv_guided_moments_x(
+    global const float *restrict y_guide,
+    global const float *restrict cb_in,
+    global const float *restrict cr_in,
+    global       float *restrict sum_Y_x,
+    global       float *restrict sum_YY_x,
+    global       float *restrict sum_Cb_x,
+    global       float *restrict sum_Cr_x,
+    global       float *restrict sum_YCb_x,
+    global       float *restrict sum_YCr_x,
+    const int width,
+    const int height)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= width || y >= height) return;
+
+  float sY = 0.0f, sYY = 0.0f;
+  float sCb = 0.0f, sCr = 0.0f;
+  float sYCb = 0.0f, sYCr = 0.0f;
+
+  for(int dx = -YG_GF_RADIUS; dx <= YG_GF_RADIUS; dx++)
+  {
+    int xi = x + dx;
+    if(xi < 0) xi = -xi;
+    if(xi >= width) xi = 2 * width - xi - 2;
+    const int p = y * width + xi;
+    const float Y  = y_guide[p];
+    const float Cb = cb_in[p];
+    const float Cr = cr_in[p];
+    sY   += Y;
+    sYY  += Y * Y;
+    sCb  += Cb;
+    sCr  += Cr;
+    sYCb += Y * Cb;
+    sYCr += Y * Cr;
+  }
+
+  const int cx = y * width + x;
+  sum_Y_x[cx]   = sY;
+  sum_YY_x[cx]  = sYY;
+  sum_Cb_x[cx]  = sCb;
+  sum_Cr_x[cx]  = sCr;
+  sum_YCb_x[cx] = sYCb;
+  sum_YCr_x[cx] = sYCr;
+}
+
+
+/* --- Kernel 2: 1D y-pass over intermediates + local linear regression. */
+kernel void galosh_yuv_guided_moments_y_ab(
+    global const float *restrict sum_Y_x,
+    global const float *restrict sum_YY_x,
+    global const float *restrict sum_Cb_x,
+    global const float *restrict sum_Cr_x,
+    global const float *restrict sum_YCb_x,
+    global const float *restrict sum_YCr_x,
+    global const float *restrict y_guide,
+    global const float *restrict params,
+    const float strength_c,
+    global       float *restrict a_cb_out,
+    global       float *restrict b_cb_out,
+    global       float *restrict a_cr_out,
+    global       float *restrict b_cr_out,
+    const int width,
+    const int height)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= width || y >= height) return;
+
+  float sY = 0.0f, sYY = 0.0f;
+  float sCb = 0.0f, sCr = 0.0f;
+  float sYCb = 0.0f, sYCr = 0.0f;
+
+  for(int dy = -YG_GF_RADIUS; dy <= YG_GF_RADIUS; dy++)
+  {
+    int yi = y + dy;
+    if(yi < 0) yi = -yi;
+    if(yi >= height) yi = 2 * height - yi - 2;
+    const int p = yi * width + x;
+    sY   += sum_Y_x[p];
+    sYY  += sum_YY_x[p];
+    sCb  += sum_Cb_x[p];
+    sCr  += sum_Cr_x[p];
+    sYCb += sum_YCb_x[p];
+    sYCr += sum_YCr_x[p];
+  }
+
+  /* Window pixel count = (2r+1)² under reflect padding. */
+  const float inv_n2   = 1.0f / (float)((2 * YG_GF_RADIUS + 1) * (2 * YG_GF_RADIUS + 1));
+  const float mean_Y   = sY   * inv_n2;
+  const float mean_YY  = sYY  * inv_n2;
+  const float mean_Cb  = sCb  * inv_n2;
+  const float mean_Cr  = sCr  * inv_n2;
+  const float mean_YCb = sYCb * inv_n2;
+  const float mean_YCr = sYCr * inv_n2;
+
+  const float var_Y    = fmax(mean_YY - mean_Y * mean_Y, 0.0f);
+  const float cov_YCb  = mean_YCb - mean_Y * mean_Cb;
+  const float cov_YCr  = mean_YCr - mean_Y * mean_Cr;
+
+  const int cx = y * width + x;
+
+  /* ---------------------------------------------------------------------
+   * Principled ε derivation from the GAT-stabilised noise model.
+   *
+   * EN: The guided filter fits the local linear model
+   *       Cb_i = a·Y_i + b + ε_i,  i ∈ window(x,y)
+   *     with MAP estimate  a = cov(Y,Cb) / (var(Y) + ε).
+   *     Pre-GAT (raw) pixel variance is Poisson-Gauss: var(x_raw)=α·x+σ².
+   *     The GAT forward is designed so that var(Y_stab) ≈ 1 for every
+   *     pixel regardless of signal level (variance-stabilising transform).
+   *     Hence in GAT space every per-pixel noise variance — luma AND
+   *     chroma alike (WHT coeffs are orthonormal combinations of GAT
+   *     pixels) — is uniformly ≈ 1.
+   *
+   *     Imposing a Gaussian prior on the slope a ~ N(0, τ²) and applying
+   *     Bayes MAP:
+   *           a_MAP = cov(Y,Cb) / (var(Y) + σ²_noise / τ²),
+   *     so ε = σ²_noise / τ² = 1/τ² is a CONSTANT in GAT space — signal-
+   *     independent, determined only by the slope prior.  τ = 1 encodes
+   *     "|a| ≤ 2 with 95% prior mass", a conservative bound for natural
+   *     luma-chroma coupling.  User-exposed `strength_c²` retains
+   *     smoothing control.
+   *
+   *     The previous formula ε = strength² · (α_c·Y + σ²_c) re-injected
+   *     the raw-space Poisson-Gauss variance into the already-stabilised
+   *     GAT domain — a unit-mismatch that gave ε ≈ 0.03 on the raw path
+   *     and ≈ 0 on flat tiles.  The new constant ε keeps the whole
+   *     GALOSH pipeline under a single Poisson-Gauss / GAT story.
+   *
+   * JP: guided filter は局所線形モデル Cb = a·Y + b + ε を当てはめる。
+   *     GAT forward は per-pixel 分散を 1 に正規化するため、GAT 後空間では
+   *     Y も Cb も一律に σ²_noise ≈ 1。slope に Gaussian prior a ~ N(0, τ²)
+   *     を置いた Bayes MAP から a = cov(Y,Cb) / (var(Y) + 1/τ²) となり、
+   *     ε = 1/τ² は GAT 空間での定数（信号非依存）。τ²=1 (|a|≤2 を ~95%
+   *     カバー) を既定、`strength_c²` はユーザー平滑化制御として温存。
+   *     旧式 α·Y+σ² は raw 空間の式を GAT 後に再使用する単位混同であり、
+   *     この修正で Poisson-Gauss / GAT 理論と pipeline 全体が整合する。
+   * --------------------------------------------------------------------- */
+  const float YG_GF_TAU_SQ_INV = 1.0f;  /* = 1/τ² for slope prior N(0,τ²) */
+  const float eps_gat = strength_c * strength_c * YG_GF_TAU_SQ_INV;
+
+  /* Safety floor below var_Y + ε in case both are tiny on degenerate tiles. */
+  const float denom = fmax(var_Y + eps_gat, 1e-6f);
+  const float a_cb  = cov_YCb / denom;
+  const float a_cr  = cov_YCr / denom;
+  const float b_cb  = mean_Cb - a_cb * mean_Y;
+  const float b_cr  = mean_Cr - a_cr * mean_Y;
+
+  a_cb_out[cx] = a_cb;
+  b_cb_out[cx] = b_cb;
+  a_cr_out[cx] = a_cr;
+  b_cr_out[cx] = b_cr;
+}
+
+
+/* --- Kernel 3: 1D x-pass over (a_Cb, b_Cb, a_Cr, b_Cr). ---------------- */
+kernel void galosh_yuv_guided_apply_x(
+    global const float *restrict a_cb_in,
+    global const float *restrict b_cb_in,
+    global const float *restrict a_cr_in,
+    global const float *restrict b_cr_in,
+    global       float *restrict a_cb_x,
+    global       float *restrict b_cb_x,
+    global       float *restrict a_cr_x,
+    global       float *restrict b_cr_x,
+    const int width,
+    const int height)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= width || y >= height) return;
+
+  float sa_cb = 0.0f, sb_cb = 0.0f;
+  float sa_cr = 0.0f, sb_cr = 0.0f;
+
+  for(int dx = -YG_GF_RADIUS; dx <= YG_GF_RADIUS; dx++)
+  {
+    int xi = x + dx;
+    if(xi < 0) xi = -xi;
+    if(xi >= width) xi = 2 * width - xi - 2;
+    const int p = y * width + xi;
+    sa_cb += a_cb_in[p];
+    sb_cb += b_cb_in[p];
+    sa_cr += a_cr_in[p];
+    sb_cr += b_cr_in[p];
+  }
+
+  const int cx = y * width + x;
+  a_cb_x[cx] = sa_cb;
+  b_cb_x[cx] = sb_cb;
+  a_cr_x[cx] = sa_cr;
+  b_cr_x[cx] = sb_cr;
+}
+
+
+/* --- Kernel 4: 1D y-pass + output = mean_a·Y + mean_b. ----------------- */
+kernel void galosh_yuv_guided_apply_y(
+    global const float *restrict a_cb_x,
+    global const float *restrict b_cb_x,
+    global const float *restrict a_cr_x,
+    global const float *restrict b_cr_x,
+    global const float *restrict y_guide,
+    global       float *restrict cb_out,
+    global       float *restrict cr_out,
+    const int width,
+    const int height)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= width || y >= height) return;
+
+  float sa_cb = 0.0f, sb_cb = 0.0f;
+  float sa_cr = 0.0f, sb_cr = 0.0f;
+
+  for(int dy = -YG_GF_RADIUS; dy <= YG_GF_RADIUS; dy++)
+  {
+    int yi = y + dy;
+    if(yi < 0) yi = -yi;
+    if(yi >= height) yi = 2 * height - yi - 2;
+    const int p = yi * width + x;
+    sa_cb += a_cb_x[p];
+    sb_cb += b_cb_x[p];
+    sa_cr += a_cr_x[p];
+    sb_cr += b_cr_x[p];
+  }
+
+  const float inv_n2 = 1.0f / (float)((2 * YG_GF_RADIUS + 1) * (2 * YG_GF_RADIUS + 1));
+  const float mean_a_cb = sa_cb * inv_n2;
+  const float mean_b_cb = sb_cb * inv_n2;
+  const float mean_a_cr = sa_cr * inv_n2;
+  const float mean_b_cr = sb_cr * inv_n2;
+
+  const int cx = y * width + x;
+  const float Y_c = y_guide[cx];
+  cb_out[cx] = mean_a_cb * Y_c + mean_b_cb;
+  cr_out[cx] = mean_a_cr * Y_c + mean_b_cr;
+}
+
+/* ================================================================
+ * YG_GF_LOESS: Luma-weighted guided filter (LOESS / kernel regression).
+ *
+ * EN: A single 2D pass replacing the box-based separable guided filter
+ *     (moments_x → moments_y_ab → apply_x → apply_y).  For every output
+ *     pixel (x,y) the local linear model
+ *         Cb_i = a·Y_i + b,   i ∈ window
+ *     is fit with a Gaussian bilateral kernel on the luma difference:
+ *         w_i = exp( −(Y_i − Y_c)² / (2·σ²) )
+ *     where σ (YG_LOESS_BW) is the bandwidth in GAT-stabilised units.
+ *     This is locally-weighted regression (Cleveland 1979 / LOESS,
+ *     equivalently kernel-regression / cross-bilateral guided filter).
+ *
+ *     Motivation: the box-weighted guided filter fits one line through
+ *     a bimodal window (silver + specular highlight), producing red/blue
+ *     chroma grains on silver surfaces adjacent to saturated highlights.
+ *     LOESS downweights samples whose luma differs from the centre
+ *     pixel's luma by more than ~σ, so each fit sees only its own luma
+ *     "population" and the regression remains stable across edges.
+ *
+ *     σ = 3 (in GAT units where per-pixel noise std ≈ 1) gives:
+ *       |Y_i − Y_c| ≤ 1σ (noise): weight ≈ 0.94   (kept)
+ *       |Y_i − Y_c| ≈ 3σ       : weight ≈ 0.01    (heavily down-weighted)
+ *       typical specular gap (~50 GAT units): weight ≈ 0  (excluded)
+ *     → clean silver windows get uniform weights, grain-prone
+ *       silver+highlight windows shrink to silver-only regression.
+ *
+ *     ε is kept consistent with the principled Bayes-MAP derivation
+ *     (ε = 1/τ² in GAT space, τ²=1).
+ *
+ * JP: box 平均の separable guided filter (moments_x → moments_y_ab
+ *     → apply_x → apply_y) を 1 個の 2D pass に置き換え。output pixel
+ *     ごとに luma 差分の Gaussian bilateral 重み w_i=exp(-(Y_i-Y_c)²/(2σ²))
+ *     を掛けて局所線形回帰。σ=3 (GAT 空間の per-pixel noise std ≈1 の 3σ)
+ *     で silver+highlight bimodal window を center の luma 属する population
+ *     のみに自動絞り込み、silver 面の赤青粒を根絶する。
+ *     ε は前段の Bayes MAP (GAT 空間 σ²_noise=1, slope prior τ²=1) と一貫。
+ * ================================================================ */
+#ifndef YG_LOESS_RADIUS
+#define YG_LOESS_RADIUS 7
+#endif
+#ifndef YG_LOESS_BW
+#define YG_LOESS_BW 3.0f
+#endif
+
+kernel void galosh_yuv_guided_loess(
+    global const float *restrict y_guide,
+    global const float *restrict cb_in,
+    global const float *restrict cr_in,
+    global const float *restrict params,
+    const float strength_c,
+    global       float *restrict cb_out,
+    global       float *restrict cr_out,
+    const int width,
+    const int height)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= width || y >= height) return;
+
+  const int cx = y * width + x;
+  const float Y_c = y_guide[cx];
+  const float inv_2sigma_sq = 1.0f / (2.0f * YG_LOESS_BW * YG_LOESS_BW);
+
+  float sumW   = 0.0f, sumY   = 0.0f, sumYY  = 0.0f;
+  float sumCb  = 0.0f, sumCr  = 0.0f;
+  float sumYCb = 0.0f, sumYCr = 0.0f;
+
+  for(int dy = -YG_LOESS_RADIUS; dy <= YG_LOESS_RADIUS; dy++){
+    int yi = y + dy;
+    if(yi < 0) yi = -yi;
+    if(yi >= height) yi = 2 * height - yi - 2;
+    for(int dx = -YG_LOESS_RADIUS; dx <= YG_LOESS_RADIUS; dx++){
+      int xi = x + dx;
+      if(xi < 0) xi = -xi;
+      if(xi >= width) xi = 2 * width - xi - 2;
+      const int p = yi * width + xi;
+      const float Yi  = y_guide[p];
+      const float Cbi = cb_in[p];
+      const float Cri = cr_in[p];
+      const float dY  = Yi - Y_c;
+      const float w   = native_exp(-dY * dY * inv_2sigma_sq);
+      sumW   += w;
+      sumY   += w * Yi;
+      sumYY  += w * Yi * Yi;
+      sumCb  += w * Cbi;
+      sumCr  += w * Cri;
+      sumYCb += w * Yi * Cbi;
+      sumYCr += w * Yi * Cri;
+    }
+  }
+
+  /* Guard against degenerate weight sums (e.g., reflect-padded edge blocks
+   * where every neighbour has Y ≈ Y_c — still OK — but play safe). */
+  const float invW = 1.0f / fmax(sumW, 1e-10f);
+  const float mean_Y   = sumY   * invW;
+  const float mean_YY  = sumYY  * invW;
+  const float mean_Cb  = sumCb  * invW;
+  const float mean_Cr  = sumCr  * invW;
+  const float mean_YCb = sumYCb * invW;
+  const float mean_YCr = sumYCr * invW;
+
+  const float var_Y   = fmax(mean_YY - mean_Y * mean_Y, 0.0f);
+  const float cov_YCb = mean_YCb - mean_Y * mean_Cb;
+  const float cov_YCr = mean_YCr - mean_Y * mean_Cr;
+
+  /* Principled ε from Bayes MAP in GAT-stabilised space (see moments_y_ab
+   * docstring for derivation).  τ²=1 encodes |a|≤2 at ~95% prior mass. */
+  const float eps_gat = strength_c * strength_c * 1.0f;
+  const float denom   = fmax(var_Y + eps_gat, 1e-6f);
+  const float a_cb    = cov_YCb / denom;
+  const float a_cr    = cov_YCr / denom;
+  const float b_cb    = mean_Cb - a_cb * mean_Y;
+  const float b_cr    = mean_Cr - a_cr * mean_Y;
+
+  cb_out[cx] = a_cb * Y_c + b_cb;
+  cr_out[cx] = a_cr * Y_c + b_cr;
+}
+
+/* End of galosh_yuv_gat.cl */

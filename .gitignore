@@ -40,6 +40,18 @@ comparison_stride_*/
 debug_*/
 viewer_images/
 
+# --- Benchmark heavy subtrees (datasets, archive, external, weights, methods) ---
+benchmark/archive/
+benchmark/external/
+benchmark/weights/
+benchmark/methods/
+benchmark/sidd_medium/
+benchmark/sidd/
+benchmark/kodak/
+benchmark/mcmaster/
+benchmark/cbsd68/
+benchmark/rawnind/
+
 # --- Heavy method directories (NAFNet, PMN sources are upstream) ---
 methods/
 
@@ -63,6 +75,15 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- Claude Code session state (not repo) ---
+.claude/
+
+# --- Session-local scratch ---
+standalone/_split_core.py
+standalone/archive/
+standalone/*.bak
+standalone/*.backup
 
 # --- Allow specific text files even with broad rules above ---
 !README.md
