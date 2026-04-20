@@ -2,7 +2,9 @@
 
 **GALOSH** = **G**eneralised **A**nscombe **Lo**cal **Sh**rinkage
 
-生 RAW (pre-demosaic) と sRGB (post-demosaic) の両方で動く、完全盲検（blind, 事前情報ゼロ）で学習不要なイメージデノイザです。8 ×8 WHT + 局所収縮（BayesShrink → empirical Wiener）が luma パイプの中核で、chroma 側は LOESS（局所重み付き回帰、Cleveland 1979）で空間適応的に処理します。
+生 RAW (pre-demosaic) と sRGB (post-demosaic) の両方で動く、完全盲検（blind, 事前情報ゼロ）かつ学習不要の一貫設計デノイザです。Poisson-Gauss ノイズモデルを出発点に置き、そこから **GAT で分散を平坦化 → luma / chroma を同じ GAT 空間で処理 → 各プレーンに適した収縮推定**、という一本の筋で全段を導出しています。
+
+**設計方針**: 全ステージを同じ確率モデル（Poisson-Gauss + GAT）の上に建て、調整パラメータは物理的に解釈できる量（slope prior τ、bandwidth σ）だけに限定する。luma は 8 × 8 WHT + 2 パス局所収縮（Bayesian 閾値 → empirical Wiener）、chroma は luma-guide つき LOESS。どちらも **GAT 後空間で σ²_noise = 1** という同一前提下で解かれます。
 
 ---
 
@@ -33,91 +35,87 @@ var(x_raw) = α·x + σ²
 
 ---
 
-## 2. 主要アイディア
+## 2. Noise model からの導出
 
-### 2.1 Foi-Alenius (2008) Blind Noise Estimation
+設計は 5 段階。**どれも前段の「var ≈ 1」という仮定が使えるように整え、次段に渡す**のが一貫した原則です。
 
-- 小ブロック (8×8) ごとに `mean`, `Laplacian variance` を計算
-- 点群 (mean, var) に線形回帰 → `var = α·mean + σ²`
-- dark pixel サンプリング + Laplacian ヒストグラムで σ² を refine
+### 2.1 分散モデルの同定 (Foi-Alenius, 2008)
 
-GALOSH の K0 段がこれです。dark_ref は後で各 Bayer チャネルごとの DC オフセット除去に使います。
+画素ごとの分散 `var = α·x + σ²` を、事前情報なしで画像 1 枚から推定します。小ブロック (mean, Laplacian 変分) を大量に散布し、線形回帰で (α, σ²) を解く、というアプローチ。GALOSH の K0 段が dark pixel ヒストグラムによる σ² の refine も含めて実装しています。
 
-### 2.2 GAT (Generalised Anscombe Transform)
+この (α, σ²) がその後の**全ステージ共通の物理パラメータ**になります。
 
-Makitalo-Foi (2013) の変形:
+### 2.2 分散の平坦化 — GAT (Makitalo-Foi, 2013)
 
 ```
 y = T(x) = (2/α) · √(α·x + 3α²/8 + σ²)
 ```
 
-1 次テイラーで分散伝播すると、**あらゆる x に対して var(y) ≈ 1**。これが GAT の肝で、以降の処理は「ガウスノイズ前提」で済みます。
+1 次テイラー展開の下で `var(y) ≈ 1`（GAT はこの目的で作られた変換）。Poisson-Gauss 前提の noise モデルが「ガウス unit variance」という**後段で数学的に扱いやすい形**に変形されます。
 
-低輝度で √ 内部が負になるのを防ぐため、`t_break = 2σ/α` 以下では線形枝（C¹ 連続な拡張）を使います。逆変換 `T⁻¹` は不偏推定を閉じた形で取れないため、事前に 4096 点 LUT を build して binary search で引きます（Makitalo-Foi の数値手法に沿う）。
+GALOSH は Makitalo-Foi のオリジナル GAT に 2 点の実装上の工夫を加えます:
 
-### 2.3 2×2 WHT（L/C 分解、RAW モード専用）
+- 低輝度で √ 内部が負になる場合の **C¹ 連続な線形枝拡張** (`t_break = 2σ/α` 閾値)
+- 逆変換が閉形式で不偏推定できないので、**4096 点 LUT + bisection** で $O(\log N)$ 参照
 
-Bayer 2×2 ブロックに Walsh-Hadamard 変換を当てると、4 係数が得られます：
+### 2.3 方向独立成分への分解 — 2×2 WHT (RAW モード)
 
-```
-L  = (R + G₁ + G₂ + B) / 2   → 輝度 DC
-C1 = (R − G₁ + G₂ − B) / 2   → 水平 chroma
-C2 = (R + G₁ − G₂ − B) / 2   → 垂直 chroma
-C3 = (R − G₁ − G₂ + B) / 2   → 斜め chroma
-```
-
-- Bayer → 4 つの half-res プレーン
-- L は「クリーンな luma 成分」、C1/C2/C3 は「色差」
-- それぞれ独立に (強度を別々に設定して) デノイズできる
-- WHT は直交なので GAT 空間の var≈1 が保存される
-
-sRGB モードでは BT.709 の YCbCr に直接分解します（2×2 WHT は使いません）。
-
-### 2.4 LOSH（Local Shrinkage）
-
-「非局所 BM3D を、局所 WHT + 2-pass 収縮で置き換えた」のが LOSH。GALOSH の主背骨です。
-
-**Pass 1（pilot 生成、BayesShrink ハード閾値）**:
-```
-各 8×8 overlapping patch に対して:
-  WHT → 係数 C
-  σ² 推定 (noise variance, GAT 空間で ≈1)
-  threshold = σ² / σ_signal   (BayesShrink)
-  ハード閾値 → 逆 WHT
-Kaiser 窓で overlap-add
-```
-
-**Pass 2（empirical Wiener、pilot 参照）**:
-```
-各 8×8 patch に対して:
-  WHT(noisy) と WHT(pilot)
-  利得 g = |pilot|² / (|pilot|² + σ²)    (Wiener)
-  g を noisy 係数に掛ける → 逆 WHT
-```
-
-stride=2 (75% overlap) と stride=4 (50% overlap) を設定可能。stride=2 の方が滑らかで質も上、計算量は 4 倍。
-
-### 2.5 LOESS chroma（今セッションで導入）
-
-従来は C1/C2/C3 にも LOSH を独立にかけていました。しかし GAT-luma を guide に使った **guided filter (He 2010)** の方が、luma edges を保持しつつ chroma を空間滑らかにできます。これを採用して完全に入れ替えました。
-
-標準 guided filter は box 窓内の全サンプルを等重みで平均します。ところが specular highlight (鏡面反射) が silver 面 (低彩度) の近傍にあるとき、window 内で luma 分布が **bimodal** になり、線形回帰係数が暴れて silver 表面に赤青の chroma 粒が噴出します（SIDD Medium の 6 scene で実際に発生）。
-
-**LOESS (Cleveland 1979)** はこの box 重みを Gaussian bilateral に置き換えます：
+Bayer 2×2 ブロックに Walsh-Hadamard 変換を当てると 4 つの orthonormal 成分に分解できます:
 
 ```
-w_i = exp(-(Y_i − Y_c)² / (2·σ²))
+L  = (R + G₁ + G₂ + B) / 2   → 輝度 DC (Y に相当)
+C1 = (R − G₁ + G₂ − B) / 2   → 水平差分
+C2 = (R + G₁ − G₂ − B) / 2   → 垂直差分
+C3 = (R − G₁ − G₂ + B) / 2   → 斜め差分
 ```
 
-中心 pixel `Y_c` とかけ離れた luma のサンプルは自動的に重み 0 近くになり、window が「center と同じ population」だけに事実上縮まります。σ = 3 (GAT 単位。per-pixel ノイズ std ≈ 1 の 3σ) で specular(|ΔY|≈50) を完全除外、silver 面のノイズ平均化は通常通り。
+orthonormal なので **GAT 後の `var ≈ 1` 前提が 4 成分すべてに保存されます**。加えて、L は空間的に強い相関を持ち、C1-C3 は主にエッジ情報を持つので、「luma は強めに平滑化、chroma は edge 保存を優先」という**物理的に自然な強度分離**が自動的に実現されます。
 
-**ε の principled 導出**: guided filter の `a = cov(Y,Cb) / (var(Y) + ε)` の `ε` は、従来 strength² · (α·Y + σ²) と書いていました。しかし GAT 後空間では **signal 非依存で σ²_noise ≈ 1 (定数)**。Bayes MAP (slope prior `a ~ N(0, τ²)`) から:
+sRGB モードでは入力が既に色空間分離済み (BT.709 YCbCr) なので 2×2 WHT は使わず、Y と Cb/Cr を直接取り扱います。
+
+### 2.4 Luma の局所収縮 — LOSH
+
+**LOSH (LOcal SHrinkage)**: GAT 空間の L プレーン上で、8 × 8 WHT 係数に対する 2 パス Bayesian shrinkage を行います。
+
+**Pass 1 — BayesShrink (Chang-Yu-Vetterli, 2000) によるハード閾値で pilot 推定**:
 
 ```
-ε = σ²_noise / τ² = 1/τ²    (τ²=1 で |a|≤2 の prior を 95% カバー)
+各 8×8 overlapping patch:
+  WHT(noisy) → 係数 C
+  signal σ_x 推定 (block 毎の Bayesian MAP)
+  threshold = σ²_noise / σ_x            ← GAT 空間で σ²_noise = 1 固定
+  hard-threshold(|C|) → 逆 WHT → overlap-add (Kaiser 窓)
 ```
 
-GAT 空間の変分構造と整合した形で ε が導けます。旧式は raw 空間の分散を GAT 後に再適用する単位混同でした。
+**Pass 2 — pilot を事前分布にとった empirical Wiener**:
+
+```
+各 8×8 patch:
+  gain = |pilot|² / (|pilot|² + σ²_noise)
+  係数に gain を掛ける → 逆 WHT → overlap-add
+```
+
+Pass 1 で生成した pilot が Pass 2 の Wiener filter の empirical 事前分布になるので、非局所 block matching 無しでも BM3D-CFA 同等レベルの性能が出ます（§5 ベンチ参照）。Kaiser 窓 overlap-add は stride=2 (75% 重なり) が質的最良です。
+
+### 2.5 Chroma の空間適応推定 — LOESS guided regression
+
+C1/C2/C3 (RAW) もしくは Cb/Cr (YUV) は、luma と比べて信号帯域が狭いため、**luma を guide にとった局所線形回帰**で推定するのが自然です:
+
+$$C_b(x) = a(x) \cdot Y(x) + b(x) + \varepsilon, \quad \varepsilon \sim \mathcal{N}(0, \sigma^2_{\text{noise}})$$
+
+ここで `(a, b)` を局所窓内で MAP 推定します。**GAT 空間で σ²_noise = 1** だから、slope に Gaussian prior `a ~ N(0, τ²)` を置くと Bayes MAP が閉形式で解けて:
+
+$$a = \frac{\text{cov}(Y, C_b)}{\text{var}(Y) + \varepsilon}, \quad \varepsilon = \frac{\sigma^2_{\text{noise}}}{\tau^2} = \frac{1}{\tau^2}$$
+
+**ε は GAT 空間で signal 非依存の定数**になります (τ² = 1 とすれば |a| ≤ 2 の prior を 95% カバー)。残る調整パラメータは τ² 一つで、「chroma-luma 相関の強さの事前仮定」という物理的に解釈できる量です。
+
+**窓重みの適応化 (LOESS, Cleveland 1979)**: 標準的な box 窓で等重み平均してしまうと、specular highlight (鏡面反射) と silver 面 (低彩度) のように luma が bimodal な近傍で線形仮定が破綻します。そこで **中心 pixel `Y_c` との luma 距離で Gaussian kernel 重み**を掛けます:
+
+$$w_i = \exp\left(-\frac{(Y_i - Y_c)^2}{2\sigma^2}\right)$$
+
+これは古典的 **locally-weighted regression (LOESS)** と同じ形式で、kernel regression 理論の下で最適性が保証されます。σ = 3 (GAT 単位で per-pixel ノイズ std の 3σ) にすると、noise は通過、|ΔY| ≳ 50 の specular pixel は自動的に重み 0 に収束、という望ましい挙動になります。σ² 自体が GAT 空間の物理量から定まるので、**ここにも調整パラメータは増えません**。
+
+ε の定数化と window 重みの bilateral 化が組み合わさって、**GAT の「σ²_noise = 1」仮定が推定器全体に一貫して効く**構造ができています。
 
 ---
 
