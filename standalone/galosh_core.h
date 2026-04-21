@@ -63,7 +63,22 @@
 #include <emmintrin.h>  /* SSE2 */
 #include <pmmintrin.h>  /* SSE3: _mm_hadd_ps */
 
-/* --- darktable compatibility stubs --- */
+/* =====================================================================
+ *  Environment compat layer
+ *
+ *  This header is used in three contexts:
+ *    (a) standalone CPU drivers (galosh_raw_cpu.c, galosh_yuv_cpu.c),
+ *        built without darktable — we provide every symbol locally.
+ *    (b) darktable IOP (rawdenoise.c) — the real dt_* symbols come from
+ *        darktable headers that the IOP already included BEFORE this
+ *        header is pulled in.  Define GALOSH_DT_ENV before including
+ *        galosh_core.h in that case to skip the standalone stubs.
+ *    (c) external plugins — decide per host.
+ *
+ *  The standalone stubs block below only compiles when !GALOSH_DT_ENV.
+ * ===================================================================== */
+#ifndef GALOSH_DT_ENV
+
 #define DT_OMP_FOR() _Pragma("omp parallel for schedule(static)")
 
 typedef int gboolean;
@@ -107,6 +122,8 @@ static inline void dt_free_align(void *p) {
 }
 
 typedef struct { int width, height; } dt_iop_roi_t;
+
+#endif /* !GALOSH_DT_ENV */
 
 /* ===================== GALOSH Constants =====================
  * GALOSH: GAT L/C-decomposed Overlap Shrinkage
