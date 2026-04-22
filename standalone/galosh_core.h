@@ -14,6 +14,12 @@
 #ifndef GALOSH_CORE_H
 #define GALOSH_CORE_H
 
+/* Introspection TUs see every static function here but only use
+ * the params struct from rawdenoise.c.  Silence -Wunused-function so
+ * -Werror doesn't kill the auto-generated introspection compile. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+
 /*
  * Standalone raw denoiser -- GALOSH (GAT L/C-decomposed Overlap Shrinkage)
  *
@@ -77,6 +83,20 @@
  *
  *  The standalone stubs block below only compiles when !GALOSH_DT_ENV.
  * ===================================================================== */
+#ifdef GALOSH_DT_ENV
+/* darktable exposes `dt_alloc_aligned(size)` (1-arg, implicit cacheline
+ * alignment via DT_CACHELINE_BYTES).  Our core calls `dt_alloc_align(
+ * alignment, sz)` (2-arg) in a few places where the standalone build
+ * picks a tighter alignment.  Wrap to the 1-arg form and discard the
+ * explicit alignment — DT_CACHELINE_BYTES satisfies every SSE/AVX load
+ * we do. */
+static inline void *dt_alloc_align(size_t alignment, size_t sz)
+{
+  (void)alignment;
+  return dt_alloc_aligned(sz);
+}
+#endif
+
 #ifndef GALOSH_DT_ENV
 
 #define DT_OMP_FOR() _Pragma("omp parallel for schedule(static)")
@@ -1367,5 +1387,7 @@ static void galosh_loess_chroma(const float *restrict y_guide,
     }
   }
 }
+
+#pragma GCC diagnostic pop
 
 #endif /* GALOSH_CORE_H */
