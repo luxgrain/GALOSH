@@ -1,0 +1,178 @@
+commit 019392c193bfeb8af59d36ca020a2800b769ff80
+Author: luxgrain <luxgrain@users.noreply.github.com>
+Date:   Tue Apr 21 22:05:58 2026 +0900
+
+    iop: add fft_notch + GALOSH algorithm in rawdenoise
+    
+    New IOP: fft_notch (Bayer CFA FFT band-stop, per darktable_ai).  Sits
+    between hotpixels and rawdenoise to remove periodic sensor banding
+    (fixed-pattern readout) before stochastic denoise sees the noise
+    floor.  Links libfftw3f.  No-op on X-Trans (6x6 super-pixel makes
+    the per-slot split non-trivial).
+    
+    iop_order: rawdenoise moved to priority 4.0f so the raw denoise chain
+      3.0  hotpixels
+      3.5  fft_notch  (NEW)
+      4.0  rawdenoise
+      5.0  cacorrect
+      6.0  temperature
+      7.0  highlights
+    runs with Poisson-Gauss noise statistics intact (pre-WB, pre-highlight
+    clipping).  Applied to legacy_order, v30_order, v50_order; JPG
+    pipelines are unaffected.
+    
+    rawdenoise: add "algorithm" dropdown (introspection v2 -> v3).
+      - DT_IOP_RAWDENOISE_ALGO_WAVELET (default) -> existing wavelet path.
+      - DT_IOP_RAWDENOISE_ALGO_GALOSH            -> GAT + 2x2 WHT L/C +
+        LOSH(luma) + LOESS(chroma), fully blind Foi+Alenius noise
+        estimation.  X-Trans falls back to wavelet.
+    
+    GALOSH bundled as two headers under src/iop/:
+      - galosh_core.h   (1300+ lines) — noise estimation, GAT forward/
+        inverse LUT, 8x8 WHT + 2-pass LOSH, LOESS guided chroma.  Same
+        file as GALOSH/standalone; new GALOSH_DT_ENV guard suppresses the
+        standalone compatibility stubs (gboolean/dt_iop_roi_t/dt_alloc_*/
+        CLAMP/MIN/MAX) so darktable's native definitions take precedence.
+      - galosh_bayer.h  (1050 lines) — raw Bayer driver
+        (CFA-protected DC, 2x2 WHT decompose/reconstruct, compute_L_full-
+        res, gat_galosh_denoise_rawlc).  Header-only; static functions
+        compile once into rawdenoise's translation unit.
+    
+    legacy_params v2 -> v3 defaults `algorithm = WAVELET` so every
+    existing edit keeps rendering identically until the user explicitly
+    picks GALOSH from the new dropdown.
+    
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/iop/rawdenoise.c b/src/iop/rawdenoise.c
+index 33d673a4a9..c8b694cbe9 100644
+--- a/src/iop/rawdenoise.c
++++ b/src/iop/rawdenoise.c
+@@ -34,7 +34,15 @@
+ #include <stdlib.h>
+ #include <strings.h>
+ 
+-DT_MODULE_INTROSPECTION(2, dt_iop_rawdenoise_params_t)
++/* GALOSH (GAT Local SHrinkage) Bayer denoiser — header-only include.
++ * GALOSH_DT_ENV disables the standalone stubs in galosh_core.h so that
++ * darktable's native dt_alloc_align_float / dt_iop_roi_t / DT_OMP_FOR /
++ * CLAMP / MIN / MAX definitions take precedence. */
++#define GALOSH_DT_ENV
++#include "galosh_core.h"
++#include "galosh_bayer.h"
++
++DT_MODULE_INTROSPECTION(3, dt_iop_rawdenoise_params_t)
+ 
+ #define DT_IOP_RAWDENOISE_INSET DT_PIXEL_APPLY_DPI(5)
+ #define DT_IOP_RAWDENOISE_RES 64
+@@ -49,11 +57,24 @@ typedef enum dt_iop_rawdenoise_channel_t
+   DT_RAWDENOISE_NONE = 4
+ } dt_iop_rawdenoise_channel_t;
+ 
++/* Algorithm selector — user-facing dropdown.
++ * WAVELET: the classic darktable wavelet/median-subtraction denoise
++ *          (band threshold per channel, on-pipeline curves).
++ * GALOSH:  GAT + 2x2 WHT L/C decomposition + LOSH (luma) + LOESS (chroma).
++ *          Blind Foi+Alenius noise estimation; `threshold` maps to
++ *          `chroma_strength` and `y[ALL][0]` as a broadband multiplier. */
++typedef enum dt_iop_rawdenoise_algorithm_t
++{
++  DT_IOP_RAWDENOISE_ALGO_WAVELET = 0, // $DESCRIPTION: "wavelet (classic)"
++  DT_IOP_RAWDENOISE_ALGO_GALOSH  = 1, // $DESCRIPTION: "GALOSH (GAT + LOSH/LOESS, blind)"
++} dt_iop_rawdenoise_algorithm_t;
++
+ typedef struct dt_iop_rawdenoise_params_t
+ {
+   float threshold; // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.01 $DESCRIPTION: "noise threshold"
+   float x[DT_RAWDENOISE_NONE][DT_IOP_RAWDENOISE_BANDS];
+   float y[DT_RAWDENOISE_NONE][DT_IOP_RAWDENOISE_BANDS]; // $DEFAULT: 0.5
++  dt_iop_rawdenoise_algorithm_t algorithm; // $DEFAULT: DT_IOP_RAWDENOISE_ALGO_WAVELET $DESCRIPTION: "algorithm"
+ } dt_iop_rawdenoise_params_t;
+ 
+ typedef struct dt_iop_rawdenoise_gui_data_t
+@@ -61,6 +82,7 @@ typedef struct dt_iop_rawdenoise_gui_data_t
+   dt_draw_curve_t *transition_curve; // curve for gui to draw
+ 
+   GtkWidget *threshold;
++  GtkWidget *algorithm;
+   GtkDrawingArea *area;
+   GtkNotebook *channel_tabs;
+   double mouse_x, mouse_y, mouse_pick;
+@@ -80,6 +102,7 @@ typedef struct dt_iop_rawdenoise_data_t
+   dt_draw_curve_t *curve[DT_RAWDENOISE_NONE];
+   dt_iop_rawdenoise_channel_t channel;
+   float force[DT_RAWDENOISE_NONE][DT_IOP_RAWDENOISE_BANDS];
++  dt_iop_rawdenoise_algorithm_t algorithm;
+ } dt_iop_rawdenoise_data_t;
+ 
+ typedef struct dt_iop_rawdenoise_global_data_t
+@@ -125,6 +148,25 @@ int legacy_params(dt_iop_module_t *self,
+     *new_version = 2;
+     return 0;
+   }
++
++  if(old_version == 2)
++  {
++    /* v2 -> v3: adds `algorithm` field.  Default to WAVELET so existing
++     * edits keep rendering identically; the user must opt in to GALOSH
++     * from the new dropdown. */
++    const dt_iop_rawdenoise_params_v2_t *o = (dt_iop_rawdenoise_params_v2_t *)old_params;
++    dt_iop_rawdenoise_params_t *n = malloc(sizeof(dt_iop_rawdenoise_params_t));
++
++    n->threshold = o->threshold;
++    memcpy(n->x, o->x, sizeof(o->x));
++    memcpy(n->y, o->y, sizeof(o->y));
++    n->algorithm = DT_IOP_RAWDENOISE_ALGO_WAVELET;
++
++    *new_params = n;
++    *new_params_size = sizeof(dt_iop_rawdenoise_params_t);
++    *new_version = 3;
++    return 0;
++  }
+   return 1;
+ }
+ 
+@@ -481,7 +523,19 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
+   {
+     const uint32_t filters = piece->filters;
+     const uint8_t(*const xtrans)[6] = piece->xtrans;
+-    if(filters != 9u)
++
++    /* GALOSH path is Bayer-only and uses the broadband `threshold` slider as
++     * a single blind-strength multiplier (luma = chroma).  X-Trans currently
++     * falls back to wavelet. */
++    if(d->algorithm == DT_IOP_RAWDENOISE_ALGO_GALOSH && filters != 9u)
++    {
++      const dt_iop_roi_t roi = { .width = roi_in->width, .height = roi_in->height };
++      const float luma_str   = d->threshold;
++      const float chroma_str = d->threshold;
++      gat_galosh_denoise_rawlc((const float *)ivoid, (float *)ovoid, &roi,
++                                luma_str, chroma_str, filters);
++    }
++    else if(filters != 9u)
+       wavelet_denoise(ivoid, ovoid, roi_in, d, filters);
+     else
+       wavelet_denoise_xtrans(ivoid, ovoid, roi_in, d, xtrans);
+@@ -523,6 +577,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *params, dt_dev_pixelp
+   dt_iop_rawdenoise_data_t *d = piece->data;
+ 
+   d->threshold = p->threshold;
++  d->algorithm = p->algorithm;
+ 
+   for(int ch = 0; ch < DT_RAWDENOISE_NONE; ch++)
+   {
+@@ -918,6 +973,14 @@ void gui_init(dt_iop_module_t *self)
+   g_signal_connect(G_OBJECT(g->area), "leave-notify-event", G_CALLBACK(rawdenoise_leave_notify), self);
+   g_signal_connect(G_OBJECT(g->area), "scroll-event", G_CALLBACK(rawdenoise_scrolled), self);
+ 
++  /* Algorithm selector: wavelet (classic) vs GALOSH (GAT + LOSH/LOESS blind).
++   * Introspection reads $DESCRIPTION strings from the params enum above. */
++  g->algorithm = dt_bauhaus_combobox_from_params(self, "algorithm");
++  gtk_widget_set_tooltip_text(g->algorithm,
++    _("denoise algorithm — \"wavelet\" uses darktable's native band-threshold "
++      "wavelet shrinkage; \"GALOSH\" uses Foi+Alenius blind noise estimation + "
++      "GAT + 2x2 WHT L/C decomposition + LOSH/LOESS, fully blind"));
++
+   g->threshold = dt_bauhaus_slider_from_params(self, "threshold");
+   dt_bauhaus_slider_set_soft_max(g->threshold, 0.1);
+   dt_bauhaus_slider_set_digits(g->threshold, 3);
