@@ -166,11 +166,19 @@ static void galosh_yuv_denoise_srgb(const float *restrict in_srgb,
           alpha, sigma_sq, sigma_gat,
           width, height, strength_y, strength_c);
 
-  /* Step 6: LOSH on Y (pass1 pilot + pass2 Wiener, 75% overlap stride=2). */
+  /* Step 6: LOSH on Y (pass1 pilot + pass2 Wiener, 75% overlap stride=2).
+   * GALOSH_YUV_G uses MAD-based sigma_Y unconditionally (use_robust_shrink=1)
+   * — the partial-selection-sort robust noise estimator that kills spatial
+   * noise clusters fooling the L2 sum_sq estimator (Donoho-Johnstone 1995).
+   * Single-orientation path; n_orient=1 collapses to the legacy pass1+pass2
+   * sequence inside the wrapper. */
   const int losh_stride = 2;
-  galosh_pass1(Y_stab, Y_pilot, width, height, strength_y, losh_stride);
-  galosh_pass2(Y_stab, Y_pilot, Y_den, width, height, strength_y, losh_stride);
-  fprintf(stderr, "[yuv_cpu] Y LOSH pass1+pass2 done\n");
+  galosh_pass12_multiorient_blocked(Y_stab, Y_den, width, height,
+                                     strength_y, GALOSH_BLOCK_SIZE,
+                                     losh_stride, /*n_orient=*/1,
+                                     /*use_robust_shrink=*/1);
+  (void)Y_pilot;  /* internal pilot now lives inside the wrapper */
+  fprintf(stderr, "[GALOSH_YUV_G] Y LOSH pass1(MAD)+pass2 done\n");
 
   /* Step 7: LOESS on Cb, Cr with noisy Y as guide (matches GPU raw path;
    * using the denoised Y gives slightly smoother chroma but also
