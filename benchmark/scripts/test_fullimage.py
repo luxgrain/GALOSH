@@ -19,7 +19,7 @@ CROP   = BASE / "datasets" / "sidd" / "test_crop"
 OUTDIR = BASE / "comparison_images_sidd" / "fullimage_test"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-GPU_EXE = BASE / "standalone" / "galosh_gpu.exe"
+GPU_EXE = BASE / "standalone" / "galosh_raw_gpu.exe"
 
 # ── Pipeline helpers ──────────────────────────────────────────────
 

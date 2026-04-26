@@ -475,7 +475,7 @@ def run_raw_gpu_exe(noisy: np.ndarray, w: int, h: int,
                     uid: str, cl_device: int = 0) -> np.ndarray:
     """Call galosh_gpu.exe (OpenCL full-pipeline). Returns denoised RAW float32 (H,W).
     Fully blind — alpha/sigma_sq set to 0 for blind estimation on GPU."""
-    exe_path = BASE / "standalone" / "galosh_gpu.exe"
+    exe_path = BASE / "standalone" / "galosh_raw_gpu.exe"
     inp = str(BASE / "standalone" / f"tmp_sidd_{uid}.bin")
     out = str(BASE / "standalone" / f"tmp_sidd_out_{uid}.bin")
     noisy.astype(np.float32).tofile(inp)
@@ -510,15 +510,15 @@ def method_galosh_gpu_after(noisy_srgb: np.ndarray, uid: str,
 def run_single_plane_gpu(plane: np.ndarray, w: int, h: int,
                          strength: float, uid: str,
                          cl_device: int = 0) -> np.ndarray:
-    """Call galosh_gpu.exe in single-plane mode (all-GPU pipeline).
+    """Call galosh_single_gpu.exe (all-GPU single-plane pipeline).
     Input/output: single float32 plane (H,W)."""
-    exe_path = BASE / "standalone" / "galosh_gpu.exe"
+    exe_path = BASE / "standalone" / "galosh_single_gpu.exe"
     inp = str(BASE / "standalone" / f"tmp_sp_{uid}.bin")
     out = str(BASE / "standalone" / f"tmp_sp_out_{uid}.bin")
     plane.astype(np.float32).tofile(inp)
     cmd = [str(BASH_EXE), "-c",
-           f'"{exe_path}" "{inp}" "{out}" {w} {h} single '
-           f'{strength} 0 0 0 0 {cl_device}']
+           f'"{exe_path}" "{inp}" "{out}" {w} {h} '
+           f'{strength} {cl_device}']
     result = subprocess.run(cmd, capture_output=True, timeout=300)
     try: os.remove(inp)
     except: pass
@@ -891,7 +891,7 @@ def build_method_registry() -> dict:
 
     def raw_gpu_cal(strength=1.0, ls=1.0, cs=1.0, cl_device=0):
         """GALOSH GPU (OpenCL) pre-demosaic, calibrated sRGB output."""
-        gpu_exe = BASE / "standalone" / "galosh_gpu.exe"
+        gpu_exe = BASE / "standalone" / "galosh_raw_gpu.exe"
         def fn(noisy, gt, w, h, uid, affine=None, **kw):
             den_raw = run_raw_gpu_exe(noisy, w, h, strength, ls, cs,
                                       uid=uid, cl_device=cl_device)
@@ -942,7 +942,7 @@ def build_method_registry() -> dict:
 
     def yuv_gpu_srgb(strength_y=1.0, strength_c=1.0, cl_device=0):
         """GALOSH YUV GPU: ISP sRGB → BT.709 YCbCr → per-plane GPU → RGB."""
-        gpu_exe = BASE / "standalone" / "galosh_gpu.exe"
+        gpu_exe = BASE / "standalone" / "galosh_raw_gpu.exe"
         def fn(noisy, gt, w, h, uid, noisy_srgb_ref=None, gt_srgb_ref=None):
             if noisy_srgb_ref is None:
                 raise RuntimeError("sRGB mat not loaded")

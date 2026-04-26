@@ -79,6 +79,9 @@ Thumbs.db
 # --- Claude Code session state (not repo) ---
 .claude/
 
+# --- Clean upstream darktable checkout for GALOSH integration testing ---
+darktable-5.4.1/
+
 # --- Session-local scratch ---
 standalone/_split_core.py
 standalone/archive/

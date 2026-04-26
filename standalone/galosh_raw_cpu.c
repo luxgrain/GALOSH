@@ -16,7 +16,58 @@
 #include <time.h>
 #include <stdint.h>
 
-#include "galosh_core.h"
+#include "galosh_cpu.h"
+
+/* ----------------------------------------------------------------------
+ * Diagonal-quality bench variant flags (set from CLI in main()).
+ * Used to A/B/C-test the proposed jaggy-fix combinations without
+ * recompiling for every cell of the bench matrix.
+ *
+ *   g_galosh_stride       : 1 or 2.  stride=1 enables full cycle-spinning
+ *                           (variant A).  Default 2 = legacy behaviour.
+ *   g_galosh_n_orient     : 1 or 4.  n_orient=4 enables 4-orientation
+ *                           WHT averaging (variant B).
+ *   g_galosh_lfr_kernel   : 0 = legacy box compute_L_fullres,
+ *                           1 = EWA jinc-windowed-jinc-3 (variant C).
+ *
+ * Both variants A and B affect every WHT-LOSH call (half-res L pass1+
+ * pass2 and full-res L pass2).  Variant C affects only the half-res ->
+ * full-res L upsample step inside gat_galosh_denoise_rawlc.
+ * ---------------------------------------------------------------------- */
+static int g_galosh_stride     = 2;
+static int g_galosh_n_orient   = 1;
+static int g_galosh_lfr_kernel = 0;
+static int g_galosh_unified    = 0;  /* legacy exploration path (v4 archived):
+                                       *   1 = upsample L+C with EWA-JL3, K15 抜き
+                                       *   var=1 不変性破壊で denoise 性能↓
+                                       *   採用しない、bench archive 用にだけ残す */
+/* GALOSH_RAW_G adopts two structural features unconditionally:
+ *
+ *   (i)  K16 chroma full-res reconstruction:
+ *        c1/c2/c3 are upsampled to full-res via EWA Jinc-Lanczos-3 and
+ *        the inverse 2x2 WHT is applied per-pixel with the Bayer-aware
+ *        sign tables.  Replaces the legacy block-replicated inverse
+ *        (which produced visible 2x2 stair-steps on diagonal edges)
+ *        without breaking the K11/K14/K15 var=1 noise invariance.
+ *
+ *   (ii) Pass1 BayesShrink with MAD-based sigma_Y estimator:
+ *        sigma_Y = median(|AC coef|) / 0.6745.  Robust to ~25% outlier
+ *        coefficients (Donoho-Johnstone 1995); kills the spatial noise
+ *        clusters that the legacy L2 sum_sq estimator over-includes as
+ *        "false signal" (the BM3D-CFA-clearable residual).  Pass1's
+ *        improved pilot propagates to Pass2's empirical Wiener.
+ *
+ * Both are baked into the standard pipeline and cannot be disabled.
+ * Earlier ad-hoc names "v1 chromaup" / "v5 robust-MAD" referred to the
+ * development variants that introduced (i) and (ii) respectively; the
+ * final pipeline subsumes both. */
+
+/* K13 4x4 grain-scale-matched experiment (archived 2026-04-26).
+ *   8 = GALOSH_RAW_G default (full-res grain dominated by K15 8x8)
+ *   4 = K13 4x4 -- theory said matches K15 grain scale, bench showed
+ *       K15 dominates and 4x4 just adds noisier-pilot trade-off
+ * Exposed for reproducibility / future K15-4x4 ablation work. */
+static int g_galosh_k13_block = 8;
 
 #define CFA_IDX_HORIZ  1   /* row=0, col=1 → 0*8+1 */
 #define CFA_IDX_VERT   8   /* row=1, col=0 → 1*8+0 */
@@ -384,6 +435,144 @@ static void compute_L_fullres(const float *restrict L,
 
 
 /* ================================================================
+ * EWA jinc-windowed-jinc 3-tap (Lanczos-Jinc-3) compute_L_fullres
+ * variant — RAW-specific archived experiment (variant C).
+ *
+ * Replaces the legacy box-like 4-tap reconstruction (compute_L_fullres
+ * above) with a circularly symmetric, band-limited reconstruction
+ * kernel.  Active only when --lfr-kernel=ewajl3 is passed; otherwise
+ * the legacy compute_L_fullres is used.  Archived because pure EWA-JL3
+ * reconstruction at the 4 sub-pixel positions used by the inverse 2x2
+ * WHT introduces ~1 px shift relative to the legacy box convention
+ * (PSNR -0.5 dB in bench).  Kept here for reproducibility of the
+ * variant-C numbers in the bench archive.
+ *
+ * Lives in galosh_raw_cpu.c rather than galosh_core.h because the
+ * subpixel offsets and the 4-channel API are RAW-Bayer-specific; the
+ * generic 2x EWA-JL3 upsample for v1 chromaup chroma upsampling stays
+ * in galosh_core.h as galosh_upsample_2x_ewajl3().
+ *
+ * Sub-pixel offsets (half-res units, relative to half-res sample
+ * centre): TL(-0.25,-0.25), TR(-0.25,+0.25), BL(+0.25,-0.25),
+ * BR(+0.25,+0.25).  We sample a 5x5 half-res window and apply a
+ * precomputed normalized weight table per sub-pixel.
+ * ================================================================ */
+static void galosh_compute_L_fullres_ewajl3(const float *restrict L,
+                                             const float *restrict C1,
+                                             const float *restrict C2,
+                                             const float *restrict C3,
+                                             const int halfwidth, const int halfheight,
+                                             float *restrict L_out)
+{
+    /* C1/C2/C3 unused: pure spatial reconstruction from the L plane.
+     * The chroma-derived L refinement of the legacy formulas is sacrificed
+     * for bandlimited diagonal accuracy -- this trade-off is intentional
+     * for variant C and is part of what the bench is measuring. */
+    (void)C1; (void)C2; (void)C3;
+
+    const int fw = 2 * halfwidth;
+    const int fh = 2 * halfheight;
+
+    /* NOTE on alignment.
+     *
+     * Pure EWA-JL3 reconstruction at the geometric pixel centre offset
+     * (TL at (-0.25,-0.25) half-res, etc.) produces a clean L plane that
+     * is band-limited but is HALF A PIXEL DOWN-RIGHT of legacy's
+     * block-centroid-stored-at-TL convention.  The downstream inverse
+     * 2x2 WHT was tuned around legacy's built-in shift, so plain EWA-
+     * JL3 ends up displaying RGGB output shifted ~1 px DOWN-RIGHT
+     * relative to the base / A / B variants, as flagged in the dartboard
+     * bench.
+     *
+     * Trying to match legacy by sampling at offsets {0, +0.5, +0.5, +0.5}
+     * collides with jinc's negative ring at ~r_full=1.41 and produces
+     * numerically unstable EWA weights for the BR position (only four
+     * samples land inside support, all with negative inner-jinc and
+     * positive outer-jinc contributions, leaving wsum tiny and the
+     * normalised kernel magnifying small noise into huge values).
+     *
+     * Conclusion: C-1 (pure EWA-JL3 on L) is structurally incompatible
+     * with the legacy WHT inverse pipeline.  The right fix is C-2 --
+     * keep legacy compute_L_fullres formulas (which have the correct
+     * built-in shift convention) and add a band-limited refinement on
+     * top.  Until C-2 is implemented we stay with the original geometric
+     * offsets here, which the user already saw shifts by ~1 px but at
+     * least produces stable values to feed into the bench. */
+    const float subpix[4][2] = {
+        { -0.25f, -0.25f },  /* TL */
+        { -0.25f, +0.25f },  /* TR */
+        { +0.25f, -0.25f },  /* BL */
+        { +0.25f, +0.25f },  /* BR */
+    };
+
+    /* Precompute 4 normalized 5x5 weight tables. */
+    const int W = 2;          /* half-window radius in half-res samples */
+    const int kw = 2 * W + 1; /* 5 */
+    float weights[4][5][5];
+
+    for(int si = 0; si < 4; si++)
+    {
+        const float oy = subpix[si][0];
+        const float ox = subpix[si][1];
+        float wsum = 0.0f;
+        for(int dy = -W; dy <= W; dy++)
+        {
+            for(int dx = -W; dx <= W; dx++)
+            {
+                const float ry = (float)dy - oy;
+                const float rx = (float)dx - ox;
+                const float r_half = sqrtf(rx * rx + ry * ry);
+                const float r_full = r_half * 2.0f;  /* output pixel units */
+                float w_val = 0.0f;
+                if(r_full < 3.0f)
+                    w_val = galosh_jinc(r_full) * galosh_jinc(r_full / 3.0f);
+                weights[si][dy + W][dx + W] = w_val;
+                wsum += w_val;
+            }
+        }
+        const float inv_wsum = 1.0f / fmaxf(wsum, 1e-20f);
+        for(int dy = 0; dy < kw; dy++)
+            for(int dx = 0; dx < kw; dx++)
+                weights[si][dy][dx] *= inv_wsum;
+    }
+
+    /* Apply weights to produce 4 full-res samples per half-res block. */
+    DT_OMP_FOR()
+    for(int hy = 0; hy < halfheight; hy++)
+    {
+        for(int hx = 0; hx < halfwidth; hx++)
+        {
+            for(int si = 0; si < 4; si++)
+            {
+                const int sub_dy = si / 2;
+                const int sub_dx = si % 2;
+                const int fr = 2 * hy + sub_dy;
+                const int fc = 2 * hx + sub_dx;
+                if(fr >= fh || fc >= fw) continue;
+
+                float sum = 0.0f;
+                for(int dy = -W; dy <= W; dy++)
+                {
+                    int hyi = hy + dy;
+                    if(hyi < 0)            hyi = 0;
+                    if(hyi >= halfheight)  hyi = halfheight - 1;
+                    for(int dx = -W; dx <= W; dx++)
+                    {
+                        int hxi = hx + dx;
+                        if(hxi < 0)           hxi = 0;
+                        if(hxi >= halfwidth)  hxi = halfwidth - 1;
+                        sum += L[(size_t)hyi * halfwidth + hxi]
+                             * weights[si][dy + W][dx + W];
+                    }
+                }
+                L_out[(size_t)fr * fw + fc] = sum;
+            }
+        }
+    }
+}
+
+
+/* ================================================================
  *  GALOSH -- Full pipeline (RAW L/C decomposed)
  *
  *  Pre-demosaic denoiser operating on RGGB before WB and demosaic.
@@ -683,12 +872,17 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
     const int chroma_stride = GALOSH_STRIDE;
 #endif
 
-    /* ----------------------------------------------------------------
-     * LOESS chroma (replaces WHT-LOSH pass1+pass2 on C1/C2/C3).
-     * Noisy half-res L (`luma`) is the guide; bilateral weight exp(-(Y_i
-     * -Y_c)²/(2σ²)) excludes specular highlights from silver windows.
-     * Two calls handle 3 chroma planes (Cb/Cr pair per call).
-     * ---------------------------------------------------------------- */
+    /* Chroma denoise: LOESS (luma-guided locally-weighted linear regression).
+     * Noisy half-res L is the guide; bilateral weight exp(-(Y_i-Y_c)²/(2σ²))
+     * excludes specular highlights from silver windows.  Two calls handle the
+     * 3 chroma planes (Cb/Cr pair per call).
+     *
+     * Archived alternatives (removed 2026-04-26):
+     *   - v2 chromawiener (Lee residual reinjection): no effect in flat regions
+     *     (α=0), worsened textured regions; PSNR -1.16 dB / LPIPS +0.034
+     *   - v3 chromawhtlosh (B-cfa: WHT-LOSH on C with low-freq 2x2 protect):
+     *     8x8 block grid artifact, PSNR -3.46 dB / SSIM -0.13 / LPIPS +0.12
+     * Both removed from code; reproducibility lives in git history. */
     galosh_loess_chroma(luma, chroma1, chroma2, c1_out, c2_out,
                         halfwidth, halfheight, chroma_strength);
     galosh_loess_chroma(luma, chroma3, chroma3, c3_out, c3_pilot /*dummy*/,
@@ -696,6 +890,7 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
 
     fprintf(stderr, "[rawdenoise] GALOSH: chroma LOESS done (sigma_C=%.3f, R=%d, BW=%.1f)\n",
             chroma_strength, GALOSH_LOESS_RADIUS, GALOSH_LOESS_BW);
+
     (void)chroma_stride; (void)c1_pilot; (void)c2_pilot;  /* no longer used */
   }
 
@@ -742,23 +937,134 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
       goto cleanup_rawlc;
     }
 
-    /* Half-res luma stride: same logic as chroma stride.
-     *   GALOSH_F_HALF or GALOSH_F: stride=2 (75% overlap)
-     *   GALOSH_F_FULL:             stride=4 (50% overlap) */
-#if defined(GALOSH_F_HALF) || defined(GALOSH_F)
-    const int halfres_stride = 2;
-#else
-    const int halfres_stride = GALOSH_STRIDE;
-#endif
+    /* Half-res luma stride.  legacy default: stride=2 (= 75% overlap on
+     *   8×8 block).  When K13 block = 4, stride=2 means only 50% overlap;
+     *   to match the legacy 75% overlap quality (and required to suppress
+     *   block grid given the smaller block), default stride to 1 instead.
+     *   User may still override via --stride=N. */
+    int halfres_stride = g_galosh_stride;
+    if(g_galosh_k13_block == 4 && halfres_stride == 2)
+      halfres_stride = 1;
 
     fprintf(stderr, "[rawdenoise] GALOSH_F: half-res luma Pass1+2 "
-                     "(%dx%d, sigma_L=%.3f, stride=%d)\n",
-                     halfwidth, halfheight, luma_strength, halfres_stride);
+                     "(%dx%d, sigma_L=%.3f, block=%d, stride=%d, n_orient=%d)\n",
+                     halfwidth, halfheight, luma_strength,
+                     g_galosh_k13_block, halfres_stride, g_galosh_n_orient);
 
-    galosh_pass1(luma, l_pilot, halfwidth, halfheight, luma_strength, halfres_stride);
-    galosh_pass2(luma, l_pilot, l_out, halfwidth, halfheight, luma_strength, halfres_stride);
+    /* Pass1+Pass2 with optional 4-orientation averaging.  When
+     * g_galosh_k13_block == 4, the half-res L is processed with 4×4 WHT-
+     * LOSH so that K15's 8×8 full-res WHT-LOSH and K13's effective
+     * full-res grain scale (2 × 4 = 8 pixels) match. */
+    /* GALOSH_RAW_G: use_robust_shrink hardcoded to 1 (MAD-based BayesShrink
+     * is part of the adopted pipeline definition; see file-top comment). */
+    galosh_pass12_multiorient_blocked(luma, l_out, halfwidth, halfheight,
+                                       luma_strength, g_galosh_k13_block,
+                                       halfres_stride, g_galosh_n_orient,
+                                       /*use_robust_shrink=*/1);
+    (void)l_pilot;  /* internal pilot now lives inside the wrapper */
 
     fprintf(stderr, "[rawdenoise] GALOSH_F: half-res luma done\n");
+
+    /* ----------------------------------------------------------------
+     * Unified-reconstruction path (g_galosh_unified == 1).
+     *
+     * Replaces Step (b) compute_L_fullres + Step (c) full-res LOSH +
+     * Step (d) block-replicated inverse 2x2 WHT with a single coherent
+     * 4-plane upsample + per-pixel reconstruction.
+     *
+     * Why: legacy Step (b) reconstructs full-res L by mixing half-res L
+     * and chroma corrections via 4 box-weighted formulas, then Step (d)
+     * REPLICATES half-res chroma to all 4 pixels of every 2x2 block.
+     * This produces visible 2x2 stair-stepping on diagonal edges (the
+     * specific bug the user observed: hard_baseline clean, guided_c
+     * blocky on text edges).
+     *
+     * Unified path: bandlimit-upsample L AND each of C1/C2/C3 to full
+     * res with the same EWA jinc-windowed-jinc-3 kernel, then run the
+     * inverse 2x2 WHT PER-PIXEL using the upsampled values and Bayer-
+     * pattern-aware sign tables.  Chroma now varies smoothly across
+     * the 2x2 block boundary, killing the stair.
+     *
+     * Theory: the half-res L and C planes are samples of bandlimited
+     * signals at 1/2 Nyquist; EWA-JL3 is a near-optimal isotropic
+     * reconstruction kernel.  Each Bayer pixel value is then a linear
+     * combination of those four reconstructed values with the
+     * channel-specific WHT inverse signs -- exactly the per-block
+     * inverse the legacy code applies, but evaluated AT EACH PIXEL
+     * rather than once per block. */
+    if(g_galosh_unified)
+    {
+      const size_t fullsize_unified = (size_t)width * height;
+      float *L_full  = dt_alloc_align_float(fullsize_unified);
+      float *C1_full = dt_alloc_align_float(fullsize_unified);
+      float *C2_full = dt_alloc_align_float(fullsize_unified);
+      float *C3_full = dt_alloc_align_float(fullsize_unified);
+      if(!L_full || !C1_full || !C2_full || !C3_full)
+      {
+        dt_free_align(L_full);  dt_free_align(C1_full);
+        dt_free_align(C2_full); dt_free_align(C3_full);
+        dt_free_align(l_pilot); dt_free_align(l_out);
+        goto cleanup_rawlc;
+      }
+
+      galosh_upsample_2x_ewajl3(l_out,  L_full,  halfwidth, halfheight);
+      galosh_upsample_2x_ewajl3(c1_out, C1_full, halfwidth, halfheight);
+      galosh_upsample_2x_ewajl3(c2_out, C2_full, halfwidth, halfheight);
+      galosh_upsample_2x_ewajl3(c3_out, C3_full, halfwidth, halfheight);
+
+      fprintf(stderr, "[rawdenoise] GALOSH_F unified: 4-plane EWA-JL3 upsample done\n");
+
+      /* Channel-slot lookup from 2x2 cell offset, RGGB hardcoded for
+       * the standalone CPU reference (filters arg is ignored here as
+       * elsewhere in this file -- the darktable build uses
+       * galosh_bayer.h which derives co_row/co_col from FC()).  RGGB
+       * gives R at (0,0), Gb at (1,0), Gr at (0,1), B at (1,1). */
+      int ch_lut[2][2];
+      ch_lut[0][0] = 0;  /* R  at TL */
+      ch_lut[1][0] = 1;  /* Gb at BL */
+      ch_lut[0][1] = 2;  /* Gr at TR */
+      ch_lut[1][1] = 3;  /* B  at BR */
+
+      /* Inverse 2x2 WHT signs: for output channel ch the linear
+       * combination is L + s1*C1 + s2*C2 + s3*C3, all scaled by 1/2.
+       * SIGNS[ch] = {s1, s2, s3} matches the legacy formulas:
+       *   R  = (L + C1 + C2 + C3)/2
+       *   Gb = (L - C1 + C2 - C3)/2
+       *   Gr = (L + C1 - C2 - C3)/2
+       *   B  = (L - C1 - C2 + C3)/2
+       */
+      static const float SIGNS[4][3] = {
+        { +1.0f, +1.0f, +1.0f },  /* R  */
+        { -1.0f, +1.0f, -1.0f },  /* Gb */
+        { +1.0f, -1.0f, -1.0f },  /* Gr */
+        { -1.0f, -1.0f, +1.0f },  /* B  */
+      };
+
+      const float sg_unified = sigma_gat_ch[0];  /* unified_sigma */
+
+      DT_OMP_FOR()
+      for(int fr = 0; fr < height; fr++)
+      {
+        for(int fc = 0; fc < width; fc++)
+        {
+          const int ch = ch_lut[fr & 1][fc & 1];
+          const size_t pos = (size_t)fr * width + fc;
+          const float val = 0.5f * (L_full[pos]
+                                  + SIGNS[ch][0] * C1_full[pos]
+                                  + SIGNS[ch][1] * C2_full[pos]
+                                  + SIGNS[ch][2] * C3_full[pos])
+                          + ch_dark_ref[ch];
+          out[pos] = gat_inverse_exact(val * sg_unified);
+        }
+      }
+
+      fprintf(stderr, "[rawdenoise] GALOSH_F unified: per-pixel inverse WHT + inv-GAT done\n");
+
+      dt_free_align(L_full);  dt_free_align(C1_full);
+      dt_free_align(C2_full); dt_free_align(C3_full);
+      dt_free_align(l_pilot); dt_free_align(l_out);
+      goto cleanup_rawlc;
+    }
 
     /* Step (b): Compute L_fullres from noisy and pilot half-res L/C.
      *
@@ -781,27 +1087,39 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
       goto cleanup_rawlc;
     }
 
-    /* Full-res L stride selection:
-     *   GALOSH_F_FULL or GALOSH_F: stride=2 (75% overlap)
-     *   GALOSH_F_HALF or baseline:  stride=4 (50% overlap) */
-#if defined(GALOSH_F_FULL) || defined(GALOSH_F)
-    const int fullres_stride = 2;
-#else
-    const int fullres_stride = GALOSH_STRIDE;
-#endif
+    /* Full-res L stride: bench-overrideable for variant A. */
+    const int fullres_stride = g_galosh_stride;
 
-    compute_L_fullres(luma, chroma1, chroma2, chroma3,
-                      halfwidth, halfheight, L_fr_noisy);
-    compute_L_fullres(l_out, c1_out, c2_out, c3_out,
-                      halfwidth, halfheight, L_fr_pilot);
+    /* compute_L_fullres kernel selection (variant C):
+     *   0 = legacy 4-tap box (axis-aligned, square frequency response)
+     *   1 = EWA jinc-windowed-jinc-3 (isotropic, circular freq response,
+     *       targets diagonal stair-step from upsample aliasing) */
+    if(g_galosh_lfr_kernel == 1)
+    {
+        galosh_compute_L_fullres_ewajl3(luma, chroma1, chroma2, chroma3,
+                                         halfwidth, halfheight, L_fr_noisy);
+        galosh_compute_L_fullres_ewajl3(l_out, c1_out, c2_out, c3_out,
+                                         halfwidth, halfheight, L_fr_pilot);
+    }
+    else
+    {
+        compute_L_fullres(luma, chroma1, chroma2, chroma3,
+                          halfwidth, halfheight, L_fr_noisy);
+        compute_L_fullres(l_out, c1_out, c2_out, c3_out,
+                          halfwidth, halfheight, L_fr_pilot);
+    }
 
     fprintf(stderr, "[rawdenoise] GALOSH_F: L_fullres computed (%dx%d), "
-                     "full-res stride=%d\n", width, height, fullres_stride);
+                     "full-res stride=%d, lfr_kernel=%s\n",
+                     width, height, fullres_stride,
+                     g_galosh_lfr_kernel == 1 ? "EWA-JL3" : "box");
 
     /* Step (c): GALOSH Pass2 on full-res L.
      * Only Pass2 (Wiener) — the pilot from step (b) is already denoised.
-     * No Pass1 needed because the pilot is built from half-res denoised L/C. */
-    galosh_pass2(L_fr_noisy, L_fr_pilot, L_fr_den, width, height, luma_strength, fullres_stride);
+     * Multi-orientation averaging (variant B) wraps the pass2 call. */
+    galosh_pass2_multiorient(L_fr_noisy, L_fr_pilot, L_fr_den,
+                             width, height, luma_strength,
+                             fullres_stride, g_galosh_n_orient);
 
     dt_free_align(L_fr_noisy); L_fr_noisy = NULL;
     dt_free_align(L_fr_pilot); L_fr_pilot = NULL;
@@ -829,45 +1147,79 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
      *
      * 逆 2x2 WHT: 全解像度 L_den + 半解像度 C_den → RGGB。
      * dark_ref を加算して absolute GAT-norm 空間に戻す。 */
+
+        /* ------------------------------------------------------------------
+     * GALOSH_RAW_G K16 chroma full-res reconstruction:
+     *   - Legacy K14 (compute_L_fullres) + K15 Pass2 produce L_fr_den
+     *     in GAT-normalized var=1 space (already done above).
+     *   - K16 upsamples c1/c2/c3 to full resolution via EWA Jinc-Lanczos-3
+     *     and applies the inverse 2x2 WHT per-pixel with Bayer-aware sign
+     *     tables: val[fr,fc] = (L_fr_den + signs[ch] dot C_full) / 2 + dark_ref[ch].
+     *   - Replaces the legacy block-replicated inverse (which produced
+     *     visible 2x2 stair-steps on diagonal edges) without breaking
+     *     K11/K14/K15's var=1 noise invariance.
+     *
+     * 全 res L_den + EWA-JL3 で full-res 化した chroma + per-pixel
+     * inverse 2x2 WHT。block 階段除去 + var=1 不変性保存。 */
     {
-      const float sg = sigma_gat_ch[0]; /* = unified_sigma */
+      const size_t fullsize = (size_t)width * height;
+      float *C1_full = dt_alloc_align_float(fullsize);
+      float *C2_full = dt_alloc_align_float(fullsize);
+      float *C3_full = dt_alloc_align_float(fullsize);
+      if(!C1_full || !C2_full || !C3_full)
+      {
+        dt_free_align(C1_full); dt_free_align(C2_full); dt_free_align(C3_full);
+        dt_free_align(L_fr_den); dt_free_align(l_out);
+        goto cleanup_rawlc;
+      }
+
+      galosh_upsample_2x_ewajl3(c1_out, C1_full, halfwidth, halfheight);
+      galosh_upsample_2x_ewajl3(c2_out, C2_full, halfwidth, halfheight);
+      galosh_upsample_2x_ewajl3(c3_out, C3_full, halfwidth, halfheight);
+
+      /* Channel-slot lookup (RGGB hardcoded for the standalone CPU
+       * reference; darktable build uses galosh_bayer.h's FC()-derived
+       * co_row/co_col which already supports any Bayer pattern).
+       *
+       * Slot order matches the channel extraction in Phase 1:
+       *   0 = R  at TL (fr%2=0, fc%2=0)
+       *   1 = Gb at BL (fr%2=1, fc%2=0)
+       *   2 = Gr at TR (fr%2=0, fc%2=1)
+       *   3 = B  at BR (fr%2=1, fc%2=1) */
+      int ch_lut[2][2];
+      ch_lut[0][0] = 0;  /* R  */
+      ch_lut[1][0] = 1;  /* Gb */
+      ch_lut[0][1] = 2;  /* Gr */
+      ch_lut[1][1] = 3;  /* B  */
+
+      /* Inverse 2x2 WHT sign tables (per Bayer channel). */
+      static const float SIGNS[4][3] = {
+        { +1.0f, +1.0f, +1.0f },  /* R  */
+        { -1.0f, +1.0f, -1.0f },  /* Gb */
+        { +1.0f, -1.0f, -1.0f },  /* Gr */
+        { -1.0f, -1.0f, +1.0f },  /* B  */
+      };
+
+      const float sg = sigma_gat_ch[0];
+
       DT_OMP_FOR()
-      for(int hy = 0; hy < halfheight; hy++)
-        for(int hx = 0; hx < halfwidth; hx++)
+      for(int fr = 0; fr < height; fr++)
+      {
+        for(int fc = 0; fc < width; fc++)
         {
-          const size_t hi = (size_t)hy * halfwidth + hx;
-          const int fr = 2 * hy, fc = 2 * hx;
-
-          /* Half-res chroma (dark-ref-free, sigma-normalized) */
-          const float c1 = c1_out[hi];
-          const float c2 = c2_out[hi];
-          const float c3 = c3_out[hi];
-
-          /* Use block-aligned L only (2hy, 2hx) to avoid pixel shift.
-           *
-           * L_fullres at non-aligned positions is interpolated from adjacent
-           * blocks, but C values are from this block only → spatial mismatch.
-           * Using L at block-aligned position ensures L and C are consistent.
-           * The full-res GALOSH Pass2 still improves L estimation quality
-           * via cross-block spatial context in 8x8 WHT shrinkage.
-           *
-           * ブロック整合位置 (2hy, 2hx) の L のみ使用。非整合位置の
-           * L_fullres は隣接ブロックから補間されており、自ブロックの C と
-           * 空間的に不整合 → ピクセルシフトの原因。 */
-          const float L_block = L_fr_den[(size_t)fr * width + fc];
-
-          /* Inverse 2x2 WHT + dark_ref restore → absolute GAT-norm space.
-           * Then sigma-denormalize (*sg) → inverse GAT → linear raw. */
-          const float val_R  = (L_block + c1 + c2 + c3) * 0.5f + ch_dark_ref[0];
-          const float val_Gb = (L_block - c1 + c2 - c3) * 0.5f + ch_dark_ref[1];
-          const float val_Gr = (L_block + c1 - c2 - c3) * 0.5f + ch_dark_ref[2];
-          const float val_B  = (L_block - c1 - c2 + c3) * 0.5f + ch_dark_ref[3];
-
-          out[(size_t)fr       * width + fc]     = gat_inverse_exact(val_R  * sg);
-          out[(size_t)(fr + 1) * width + fc]     = gat_inverse_exact(val_Gb * sg);
-          out[(size_t)fr       * width + fc + 1] = gat_inverse_exact(val_Gr * sg);
-          out[(size_t)(fr + 1) * width + fc + 1] = gat_inverse_exact(val_B  * sg);
+          const int ch = ch_lut[fr & 1][fc & 1];
+          const size_t pos = (size_t)fr * width + fc;
+          const float val = 0.5f * (L_fr_den[pos]
+                                  + SIGNS[ch][0] * C1_full[pos]
+                                  + SIGNS[ch][1] * C2_full[pos]
+                                  + SIGNS[ch][2] * C3_full[pos])
+                          + ch_dark_ref[ch];
+          out[pos] = gat_inverse_exact(val * sg);
         }
+      }
+
+      dt_free_align(C1_full); dt_free_align(C2_full); dt_free_align(C3_full);
+      fprintf(stderr, "[GALOSH_RAW_G] K16 EWA-JL3 chroma + per-pixel inverse done\n");
     }
 
     dt_free_align(L_fr_den);  L_fr_den = NULL;
@@ -1050,12 +1402,70 @@ cleanup_rawlc:
 /* --- main() --- */
 int main(int argc, char **argv)
 {
+  /* Strip --stride / --orient / --lfr-kernel flags out of argv before
+   * parsing positional args.  Order-independent so the bench harness
+   * can append them anywhere on the CLI. */
+  int new_argc = 0;
+  char *positional[32];
+  for(int i = 0; i < argc; i++)
+  {
+    const char *a = argv[i];
+    if(strncmp(a, "--stride=", 9) == 0)
+    {
+      g_galosh_stride = atoi(a + 9);
+      if(g_galosh_stride < 1 || g_galosh_stride > 8) g_galosh_stride = 2;
+    }
+    else if(strncmp(a, "--orient=", 9) == 0)
+    {
+      g_galosh_n_orient = atoi(a + 9);
+      if(g_galosh_n_orient != 1 && g_galosh_n_orient != 4) g_galosh_n_orient = 1;
+    }
+    else if(strncmp(a, "--lfr-kernel=", 13) == 0)
+    {
+      const char *k = a + 13;
+      if(strcmp(k, "ewajl3") == 0 || strcmp(k, "ewa-jl3") == 0)
+        g_galosh_lfr_kernel = 1;
+      else
+        g_galosh_lfr_kernel = 0;
+    }
+    else if(strncmp(a, "--unified=", 10) == 0)
+    {
+      g_galosh_unified = (atoi(a + 10) != 0);
+    }
+    else if(strncmp(a, "--k13-block=", 12) == 0)
+    {
+      const int b = atoi(a + 12);
+      if(b == 4 || b == 8) g_galosh_k13_block = b;
+      else                 g_galosh_k13_block = 8;
+    }
+    else if(strncmp(a, "--chroma-up=",     12) == 0 ||
+            strncmp(a, "--robust-shrink=", 16) == 0 ||
+            strncmp(a, "--chroma-wiener=", 16) == 0 ||
+            strncmp(a, "--chroma-method=", 16) == 0)
+    {
+      /* Deprecated flags from the v0..v6 development variants -- these
+       * features are now baked into GALOSH_RAW_G's definition (chroma-up
+       * + robust-shrink) or removed as archived experiments (chroma-
+       * wiener / chroma-method).  Silently accepted for bench-script
+       * backward compatibility. */
+    }
+    else
+    {
+      if(new_argc < 32) positional[new_argc++] = (char *)a;
+    }
+  }
+  argv = positional;
+  argc = new_argc;
+
   if(argc < 5)
   {
     fprintf(stderr,
       "Usage: %s input.bin output.bin width height\n"
       "       [method] [strength] [luma_str] [chroma_str]\n"
       "       [alpha] [sigma_sq]\n"
+      "       [--stride=N]      (1 or 2, default 2; A enables stride=1)\n"
+      "       [--orient=N]      (1 or 4, default 1; B enables orient=4)\n"
+      "       [--lfr-kernel=K]  (box | ewajl3, default box; C enables ewajl3)\n"
       "\n"
       "  method:  'galosh' or 'ours' (GALOSH local WHT shrinkage, default)\n"
       "  luma_str:   sigma_L for luma shrinkage (default 0.5, user-tunable)\n"
@@ -1065,6 +1475,12 @@ int main(int argc, char **argv)
       argv[0]);
     return 1;
   }
+
+  fprintf(stderr, "[GALOSH_RAW_G] stride=%d orient=%d lfr_kernel=%s "
+                  "unified=%d k13_block=%d\n",
+          g_galosh_stride, g_galosh_n_orient,
+          g_galosh_lfr_kernel == 1 ? "ewajl3" : "box",
+          g_galosh_unified, g_galosh_k13_block);
 
   const char *input_file = argv[1];
   const char *output_file = argv[2];

@@ -35,7 +35,7 @@ VARIANTS = {
            "label": "GALOSH_F (stride=2, CPU quality)", "gpu": False},
     "S4": {"exe": BASE / "standalone" / "rawdenoise_v9_s4.exe",
            "label": "GALOSH_FULLRES_L (stride=4, CPU fast)", "gpu": False},
-    "GPU": {"exe": BASE / "standalone" / "galosh_gpu.exe",
+    "GPU": {"exe": BASE / "standalone" / "galosh_raw_gpu.exe",
             "label": "GALOSH fused tile (stride=4, FP32, GPU gfx1036)", "gpu": True,
             "cl_device": 2},
 }

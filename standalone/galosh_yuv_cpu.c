@@ -30,7 +30,27 @@
 #include <time.h>
 #include <stdint.h>
 
-#include "galosh_core.h"
+#include "galosh_cpu.h"
+
+/* Diagonal-quality bench variant flags (set from CLI in main()).
+ *   g_yuv_stride    : 1 or 2 (variant A: stride=1)
+ *   g_yuv_n_orient  : 1 or 4 (variant B: 4-orient averaging)
+ * Variant C (EWA-JL3 compute_L_fullres) is RAW-specific so YUV
+ * pipeline doesn't expose --lfr-kernel. */
+static int g_yuv_stride   = 2;
+static int g_yuv_n_orient = 1;
+
+/* GALOSH_YUV_G adopts MAD-based BayesShrink (Pass1 sigma_Y estimator)
+ * unconditionally.  sigma_Y = median(|AC coef|)/0.6745, robust to ~25%
+ * outlier coefficients (Donoho-Johnstone 1995).  Kills the spatial noise
+ * clusters that the L2 sum_sq estimator over-includes as "false signal"
+ * (the BM3D-CFA-clearable residual).  Applied to Y plane Pass1; Cb/Cr
+ * LOESS path is unaffected (LOESS is a separate guided-regression
+ * estimator).
+ *
+ * Earlier ad-hoc name "v5 robust-MAD" referred to the development variant
+ * that introduced this on YUV; the final pipeline subsumes it.  No
+ * runtime flag exposes it -- it is part of GALOSH_YUV_G's definition. */
 
 /* ================================================================
  * sRGB ↔ linear + BT.709 YCbCr helpers
@@ -179,11 +199,17 @@ static void galosh_yuv_denoise_srgb(const float *restrict in_srgb,
           alpha, sigma_sq, sigma_gat,
           width, height, strength_y, strength_c);
 
-  /* Step 6: LOSH on Y (pass1 pilot + pass2 Wiener, 75% overlap stride=2). */
-  const int losh_stride = 2;
-  galosh_pass1(Y_stab, Y_pilot, width, height, strength_y, losh_stride);
-  galosh_pass2(Y_stab, Y_pilot, Y_den, width, height, strength_y, losh_stride);
-  fprintf(stderr, "[yuv_cpu] Y LOSH pass1+pass2 done\n");
+  /* Step 6: LOSH on Y (Pass1 BayesShrink pilot + Pass2 empirical Wiener).
+   * block_size = 8.  GALOSH_YUV_G uses MAD-based sigma_Y unconditionally
+   * (use_robust_shrink hardcoded to 1).  Stride / orientation remain
+   * bench-overrideable for archived variants A/B. */
+  const int losh_stride = g_yuv_stride;
+  galosh_pass12_multiorient_blocked(Y_stab, Y_den, width, height,
+                                     strength_y, GALOSH_BLOCK_SIZE,
+                                     losh_stride, g_yuv_n_orient,
+                                     /*use_robust_shrink=*/1);
+  (void)Y_pilot;  /* pilot now lives inside the multiorient wrapper */
+  fprintf(stderr, "[GALOSH_YUV_G] Y LOSH Pass1(MAD)+Pass2 done\n");
 
   /* Step 7: LOESS on Cb, Cr with noisy Y as guide (matches GPU raw path;
    * using the denoised Y gives slightly smoother chroma but also
@@ -221,14 +247,47 @@ cleanup:
  * ================================================================ */
 int main(int argc, char **argv)
 {
+  /* Strip --stride / --orient flags before positional parsing. */
+  int new_argc = 0;
+  char *positional[32];
+  for(int i = 0; i < argc; i++)
+  {
+    const char *a = argv[i];
+    if(strncmp(a, "--stride=", 9) == 0)
+    {
+      g_yuv_stride = atoi(a + 9);
+      if(g_yuv_stride < 1 || g_yuv_stride > 8) g_yuv_stride = 2;
+    }
+    else if(strncmp(a, "--orient=", 9) == 0)
+    {
+      g_yuv_n_orient = atoi(a + 9);
+      if(g_yuv_n_orient != 1 && g_yuv_n_orient != 4) g_yuv_n_orient = 1;
+    }
+    else if(strncmp(a, "--robust-shrink=", 16) == 0)
+    {
+      /* Deprecated -- MAD-based BayesShrink is now part of GALOSH_YUV_G's
+       * definition.  Silently accepted for bench-script back-compat. */
+    }
+    else
+    {
+      if(new_argc < 32) positional[new_argc++] = (char *)a;
+    }
+  }
+  argv = positional;
+  argc = new_argc;
+
   if(argc < 5)
   {
     fprintf(stderr,
             "Usage: %s in.bin out.bin width height "
-            "[strength_y=1.0] [strength_c=1.0] [alpha=0] [sigma_sq=0]\n",
+            "[strength_y=1.0] [strength_c=1.0] [alpha=0] [sigma_sq=0]\n"
+            "       [--stride=1|2] [--orient=1|4]\n",
             argv[0]);
     return 1;
   }
+
+  fprintf(stderr, "[GALOSH_YUV_G] stride=%d orient=%d\n",
+          g_yuv_stride, g_yuv_n_orient);
 
   const char *in_path  = argv[1];
   const char *out_path = argv[2];

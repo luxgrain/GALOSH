@@ -48,7 +48,11 @@ RESULTS    = BASE / "results"
 RESULTS.mkdir(exist_ok=True)
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-GPU_EXE    = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_gpu.exe")
+GPU_RAW_EXE    = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_raw_gpu.exe")
+GPU_YUV_EXE    = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_yuv_gpu.exe")
+GPU_SINGLE_EXE = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_single_gpu.exe")
+# Backward-compat alias (some legacy bench helpers reference GPU_EXE).
+GPU_EXE        = GPU_RAW_EXE
 KAIR_DIR   = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\KAIR")
 NAFNET_DIR = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\NAFNet")
 BASH_EXE   = Path(r"C:\msys64\usr\bin\bash.exe")
@@ -196,7 +200,7 @@ def run_galosh_gpu(noisy, w, h, uid, strength=1.0, ls=1.0, cs=1.0,
     out_path = OUTDIR / f"_tmp_{uid}_out.raw"
     noisy.astype(np.float32).tofile(str(in_path))
     cmd = [str(BASH_EXE), "-c",
-           f'"{GPU_EXE}" "{in_path}" "{out_path}" {w} {h} galosh '
+           f'"{GPU_RAW_EXE}" "{in_path}" "{out_path}" {w} {h} '
            f'{strength} {ls} {cs} {alpha} {sigma_sq} {cl_device}']
     t0 = time.time()
     try:
@@ -241,7 +245,7 @@ def run_galosh_yuv_gat_gpu(noisy_srgb, uid, strength_y=1.0, strength_c=1.0, cl_d
     out_path = OUTDIR / f"_tmp_{uid}_yuvgat_out.bin"
     noisy_srgb.astype(np.float32).tofile(str(in_path))
     cmd = [str(BASH_EXE), "-c",
-           f'"{GPU_EXE}" "{in_path}" "{out_path}" {W} {H} yuv_gat '
+           f'"{GPU_YUV_EXE}" "{in_path}" "{out_path}" {W} {H} '
            f'{strength_y} {strength_c} {cl_device}']
     t0 = time.time()
     try:
@@ -277,8 +281,8 @@ def run_galosh_yuv_gpu_old(noisy_srgb, uid, strength_y=1.0, strength_c=1.0, cl_d
         out_path = OUTDIR / f"_tmp_{uid}_{name}_out.raw"
         plane.astype(np.float32).tofile(str(in_path))
         cmd = [str(BASH_EXE), "-c",
-               f'"{GPU_EXE}" "{in_path}" "{out_path}" {W} {H} single '
-               f'{strength} 0 0 0 0 {cl_device}']
+               f'"{GPU_SINGLE_EXE}" "{in_path}" "{out_path}" {W} {H} '
+               f'{strength} {cl_device}']
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=120)
         except subprocess.TimeoutExpired:
