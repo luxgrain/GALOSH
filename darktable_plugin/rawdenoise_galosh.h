@@ -43,15 +43,6 @@
 #include <emmintrin.h>  /* SSE2 */
 #include <pmmintrin.h>  /* SSE3: _mm_hadd_ps */
 
-/* GALOSH_RAW_G: the canonical algorithm core lives in galosh_core.h
- * (synced verbatim from standalone/galosh_cpu.h).  The RAW IOP used to
- * embed its own copies of galosh_pass1 / pass2 / pass2_ex, but those
- * have been dropped in favor of the header versions which add MAD-based
- * BayesShrink (use_robust_shrink=1 path) and the block-size-parameterized
- * pass12_multiorient_blocked wrapper used by GALOSH_RAW_G. */
-#define GALOSH_DT_ENV
-#include "galosh_core.h"
-
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -718,6 +709,114 @@ static galosh_noise_params_t galosh_estimate_noise(const float *raw,
  * Ref: Chang, Yu & Vetterli (IEEE TIP 2000)
  * ==================================================================== */
 
+static void galosh_pass1(const float *restrict input,
+                         float *restrict output,
+                         const int width, const int height,
+                         const float sigma_strength,
+                         const int stride)
+{
+  const int rmax = height - GALOSH_BLOCK_SIZE;
+  const int cmax = width  - GALOSH_BLOCK_SIZE;
+  const int npix = width * height;
+
+  float *numer = (float *)dt_alloc_align(64, sizeof(float) * npix);
+  float *denom = (float *)dt_alloc_align(64, sizeof(float) * npix);
+  if(!numer || !denom)
+  {
+    if(numer) dt_free_align(numer);
+    if(denom) dt_free_align(denom);
+    memcpy(output, input, sizeof(float) * npix);
+    return;
+  }
+  memset(numer, 0, sizeof(float) * npix);
+  memset(denom, 0, sizeof(float) * npix);
+
+  const float sigma_sq = sigma_strength * sigma_strength;
+  const float lambda_max = sigma_strength * sqrtf(2.0f * logf((float)GALOSH_BLOCK_PIXELS));
+
+  #pragma omp parallel
+  {
+    float *my_numer = (float *)dt_alloc_align(64, sizeof(float) * npix);
+    float *my_denom = (float *)dt_alloc_align(64, sizeof(float) * npix);
+    if(my_numer && my_denom)
+    {
+    memset(my_numer, 0, sizeof(float) * npix);
+    memset(my_denom, 0, sizeof(float) * npix);
+
+    #pragma omp for schedule(dynamic, 4)
+    for(int ref_r = 0; ref_r <= rmax; ref_r += stride)
+    {
+      for(int ref_c = 0; ref_c <= cmax; ref_c += stride)
+      {
+        float block[GALOSH_BLOCK_PIXELS];
+        for(int dy = 0; dy < GALOSH_BLOCK_SIZE; dy++)
+          memcpy(block + dy * GALOSH_BLOCK_SIZE,
+                 input + (ref_r + dy) * width + ref_c,
+                 GALOSH_BLOCK_SIZE * sizeof(float));
+
+        galosh_wht2d_8x8(block, 0);
+
+        float sum_sq = 0.0f;
+        for(int i = 1; i < GALOSH_BLOCK_PIXELS; i++)
+          sum_sq += block[i] * block[i];
+        const float sigma_y_sq = sum_sq
+          / ((float)(GALOSH_BLOCK_PIXELS - 1) * (float)GALOSH_BLOCK_PIXELS);
+        const float sigma_x_sq = fmaxf(sigma_y_sq - sigma_sq, 0.0f);
+
+        float lambda;
+        if(sigma_x_sq < 1e-10f)
+          lambda = 1e30f;
+        else
+        {
+          lambda = (sigma_sq / sqrtf(sigma_x_sq)) * sqrtf((float)GALOSH_BLOCK_PIXELS);
+          const float lambda_max_unorm = lambda_max * sqrtf((float)GALOSH_BLOCK_PIXELS);
+          if(lambda > lambda_max_unorm) lambda = lambda_max_unorm;
+        }
+
+        int n_nonzero = 1;
+        for(int i = 1; i < GALOSH_BLOCK_PIXELS; i++)
+        {
+          if(fabsf(block[i]) < lambda)
+            block[i] = 0.0f;
+          else
+            n_nonzero++;
+        }
+
+        galosh_wht2d_8x8(block, 1);
+
+        const float weight = 1.0f / (float)n_nonzero;
+        for(int dy = 0; dy < GALOSH_BLOCK_SIZE; dy++)
+          for(int dx = 0; dx < GALOSH_BLOCK_SIZE; dx++)
+          {
+            const int pos = (ref_r + dy) * width + (ref_c + dx);
+            const float kw = galosh_kaiser_2d[dy * GALOSH_BLOCK_SIZE + dx];
+            my_numer[pos] += weight * kw * block[dy * GALOSH_BLOCK_SIZE + dx];
+            my_denom[pos] += weight * kw;
+          }
+      }
+    }
+
+    #pragma omp critical
+    {
+      for(int i = 0; i < npix; i++)
+      {
+        numer[i] += my_numer[i];
+        denom[i] += my_denom[i];
+      }
+    }
+    }
+    dt_free_align(my_numer);
+    dt_free_align(my_denom);
+  }
+
+  for(int i = 0; i < npix; i++)
+    output[i] = (denom[i] > 1e-10f) ? numer[i] / denom[i] : input[i];
+
+  dt_free_align(numer);
+  dt_free_align(denom);
+}
+
+
 /* ====================================================================
  * Section 10: GALOSH Pass 2 — Wiener shrinkage using pilot estimate
  *
@@ -726,6 +825,125 @@ static galosh_noise_params_t galosh_estimate_noise(const float *raw,
  *
  * Ref: Textbook James-Stein / empirical Wiener estimator
  * ==================================================================== */
+
+static void galosh_pass2_ex(const float *restrict noisy,
+                            const float *restrict pilot,
+                            float *restrict output,
+                            const int width, const int height,
+                            const float sigma_strength,
+                            const float wiener_floor,
+                            const int stride)
+{
+  const int rmax = height - GALOSH_BLOCK_SIZE;
+  const int cmax = width  - GALOSH_BLOCK_SIZE;
+  const int npix = width * height;
+
+  float *numer = (float *)dt_alloc_align(64, sizeof(float) * npix);
+  float *denom = (float *)dt_alloc_align(64, sizeof(float) * npix);
+  if(!numer || !denom)
+  {
+    if(numer) dt_free_align(numer);
+    if(denom) dt_free_align(denom);
+    memcpy(output, noisy, sizeof(float) * npix);
+    return;
+  }
+  memset(numer, 0, sizeof(float) * npix);
+  memset(denom, 0, sizeof(float) * npix);
+
+  const float sigma_sq_unorm = sigma_strength * sigma_strength
+                              * (float)GALOSH_BLOCK_PIXELS;
+
+  #pragma omp parallel
+  {
+    float *my_numer = (float *)dt_alloc_align(64, sizeof(float) * npix);
+    float *my_denom = (float *)dt_alloc_align(64, sizeof(float) * npix);
+    if(my_numer && my_denom)
+    {
+    memset(my_numer, 0, sizeof(float) * npix);
+    memset(my_denom, 0, sizeof(float) * npix);
+
+    #pragma omp for schedule(dynamic, 4)
+    for(int ref_r = 0; ref_r <= rmax; ref_r += stride)
+    {
+      for(int ref_c = 0; ref_c <= cmax; ref_c += stride)
+      {
+        float blk_noisy[GALOSH_BLOCK_PIXELS];
+        float blk_pilot[GALOSH_BLOCK_PIXELS];
+        for(int dy = 0; dy < GALOSH_BLOCK_SIZE; dy++)
+        {
+          memcpy(blk_noisy + dy * GALOSH_BLOCK_SIZE,
+                 noisy + (ref_r + dy) * width + ref_c,
+                 GALOSH_BLOCK_SIZE * sizeof(float));
+          memcpy(blk_pilot + dy * GALOSH_BLOCK_SIZE,
+                 pilot + (ref_r + dy) * width + ref_c,
+                 GALOSH_BLOCK_SIZE * sizeof(float));
+        }
+
+        galosh_wht2d_8x8(blk_noisy, 0);
+        galosh_wht2d_8x8(blk_pilot, 0);
+
+        float wiener_energy = 0.0f;
+        for(int i = 0; i < GALOSH_BLOCK_PIXELS; i++)
+        {
+          float w;
+          if(i == 0)
+            w = 1.0f;
+          else
+          {
+            const float s2 = blk_pilot[i] * blk_pilot[i];
+            w = s2 / (s2 + sigma_sq_unorm);
+            if(w < wiener_floor) w = wiener_floor;
+          }
+          blk_noisy[i] *= w;
+          wiener_energy += w * w;
+        }
+
+        galosh_wht2d_8x8(blk_noisy, 1);
+
+        const float weight = 1.0f / fmaxf(wiener_energy, 1e-6f);
+        for(int dy = 0; dy < GALOSH_BLOCK_SIZE; dy++)
+          for(int dx = 0; dx < GALOSH_BLOCK_SIZE; dx++)
+          {
+            const int pos = (ref_r + dy) * width + (ref_c + dx);
+            const float kw = galosh_kaiser_2d[dy * GALOSH_BLOCK_SIZE + dx];
+            my_numer[pos] += weight * kw * blk_noisy[dy * GALOSH_BLOCK_SIZE + dx];
+            my_denom[pos] += weight * kw;
+          }
+      }
+    }
+
+    #pragma omp critical
+    {
+      for(int i = 0; i < npix; i++)
+      {
+        numer[i] += my_numer[i];
+        denom[i] += my_denom[i];
+      }
+    }
+    }
+    dt_free_align(my_numer);
+    dt_free_align(my_denom);
+  }
+
+  for(int i = 0; i < npix; i++)
+    output[i] = (denom[i] > 1e-10f) ? numer[i] / denom[i] : noisy[i];
+
+  dt_free_align(numer);
+  dt_free_align(denom);
+}
+
+/* Convenience wrapper with standard Wiener floor */
+static void galosh_pass2(const float *restrict noisy,
+                         const float *restrict pilot,
+                         float *restrict output,
+                         const int width, const int height,
+                         const float sigma_strength,
+                         const int stride)
+{
+  galosh_pass2_ex(noisy, pilot, output, width, height,
+                  sigma_strength, GALOSH_WIENER_FLOOR, stride);
+}
+
 
 /* ====================================================================
  * Section 11: Full-res L computation from half-res L/C planes
@@ -987,18 +1205,15 @@ static void galosh_denoise(const float *const restrict in,
     if(!c1_pilot || !c2_pilot || !c3_pilot || !c1_out || !c2_out || !c3_out)
       goto galosh_cleanup;
 
-    const int chroma_stride = 2;  /* GALOSH_F: 75% overlap (kept for API; LOESS doesn't tile) */
-    (void)chroma_stride; (void)c1_pilot; (void)c2_pilot; (void)c3_pilot;
+    const int chroma_stride = 2;  /* GALOSH_F: 75% overlap */
 
-    /* GALOSH_RAW_G: chroma denoise via Y-guided LOESS (luma-guided
-     * locally-weighted regression) instead of independent WHT-LOSH on
-     * each chroma plane.  Two galosh_loess_chroma calls handle the 3
-     * planes (Cb/Cr per call): the kernel takes a (Cb, Cr) pair so the
-     * 3rd plane uses (C3, C3) with one of the outputs being a dummy. */
-    galosh_loess_chroma(luma, chroma1, chroma2, c1_out, c2_out,
-                        halfwidth, halfheight, chroma_strength);
-    galosh_loess_chroma(luma, chroma3, chroma3, c3_out, c3_pilot /*dummy*/,
-                        halfwidth, halfheight, chroma_strength);
+    galosh_pass1(chroma1, c1_pilot, halfwidth, halfheight, chroma_strength, chroma_stride);
+    galosh_pass1(chroma2, c2_pilot, halfwidth, halfheight, chroma_strength, chroma_stride);
+    galosh_pass1(chroma3, c3_pilot, halfwidth, halfheight, chroma_strength, chroma_stride);
+
+    galosh_pass2(chroma1, c1_pilot, c1_out, halfwidth, halfheight, chroma_strength, chroma_stride);
+    galosh_pass2(chroma2, c2_pilot, c2_out, halfwidth, halfheight, chroma_strength, chroma_stride);
+    galosh_pass2(chroma3, c3_pilot, c3_out, halfwidth, halfheight, chroma_strength, chroma_stride);
   }
 
   dt_free_align(c1_pilot); c1_pilot = NULL;
@@ -1017,16 +1232,8 @@ static void galosh_denoise(const float *const restrict in,
 
     const int halfres_stride = 2;  /* GALOSH_F: 75% overlap */
 
-    /* GALOSH_RAW_G: half-res luma via galosh_pass12_multiorient_blocked
-     * with MAD-based BayesShrink (use_robust_shrink=1) — the noise-cluster
-     * killing robust estimator that is part of the adopted pipeline.
-     * block_size=8 matches K15's 8×8 native scale; n_orient=1 collapses
-     * to the legacy pass1+pass2 sequence inside the wrapper. */
-    galosh_pass12_multiorient_blocked(luma, l_out, halfwidth, halfheight,
-                                       luma_strength, GALOSH_BLOCK_SIZE,
-                                       halfres_stride, /*n_orient=*/1,
-                                       /*use_robust_shrink=*/1);
-    (void)l_pilot;  /* internal pilot lives inside the wrapper now */
+    galosh_pass1(luma, l_pilot, halfwidth, halfheight, luma_strength, halfres_stride);
+    galosh_pass2(luma, l_pilot, l_out, halfwidth, halfheight, luma_strength, halfres_stride);
 
     /* Compute full-res L from noisy and denoised half-res L/C */
     const size_t fullsize = (size_t)width * height;
@@ -1055,64 +1262,34 @@ static void galosh_denoise(const float *const restrict in,
     dt_free_align(L_fr_pilot);
     dt_free_align(l_pilot);
 
-    /* GALOSH_RAW_G K16: chroma full-res reconstruction.
-     *   Upsample c1/c2/c3 to full-resolution via EWA Jinc-Lanczos-3
-     *   (galosh_upsample_2x_ewajl3 from galosh_core.h), then apply the
-     *   inverse 2x2 WHT per-pixel using the upsampled chroma + Bayer-
-     *   aware sign tables.  Replaces the legacy block-replicated chroma
-     *   inverse (which produced visible 2x2 stair-steps on diagonal
-     *   edges) without breaking the K11/K14/K15 var=1 noise invariance.
-     *   Hardcoded RGGB layout to match darktable's typical Bayer (the
-     *   FC()-derived per-channel offsets in galosh_bayer.h support
-     *   any pattern; left as a follow-up). */
+    /* Inverse 2×2 WHT: full-res L_den + half-res C_den → RGGB */
     {
-      const size_t fullsize = (size_t)width * height;
-      float *C1_full = dt_alloc_align_float(fullsize);
-      float *C2_full = dt_alloc_align_float(fullsize);
-      float *C3_full = dt_alloc_align_float(fullsize);
-      if(!C1_full || !C2_full || !C3_full)
-      {
-        dt_free_align(C1_full); dt_free_align(C2_full); dt_free_align(C3_full);
-        dt_free_align(L_fr_den); dt_free_align(l_out);
-        goto galosh_cleanup;
-      }
-
-      galosh_upsample_2x_ewajl3(c1_out, C1_full, halfwidth, halfheight);
-      galosh_upsample_2x_ewajl3(c2_out, C2_full, halfwidth, halfheight);
-      galosh_upsample_2x_ewajl3(c3_out, C3_full, halfwidth, halfheight);
-
-      /* RGGB channel-slot lookup: 0=R(TL), 1=Gb(BL), 2=Gr(TR), 3=B(BR). */
-      static const int ch_lut[2][2] = {
-        { 0, 2 },  /* row=0: col0=R, col1=Gr */
-        { 1, 3 },  /* row=1: col0=Gb, col1=B */
-      };
-      /* Inverse 2x2 WHT signs (R, Gb, Gr, B), applied per-pixel. */
-      static const float SIGNS[4][3] = {
-        { +1.0f, +1.0f, +1.0f },  /* R  */
-        { -1.0f, +1.0f, -1.0f },  /* Gb */
-        { +1.0f, -1.0f, -1.0f },  /* Gr */
-        { -1.0f, -1.0f, +1.0f },  /* B  */
-      };
-
-      const float sg = sigma_gat_ch[0];
-
+      const float sg = sigma_gat_ch[0]; /* unified_sigma */
       DT_OMP_FOR()
-      for(int fr = 0; fr < height; fr++)
-      {
-        for(int fc = 0; fc < width; fc++)
+      for(int hy = 0; hy < halfheight; hy++)
+        for(int hx = 0; hx < halfwidth; hx++)
         {
-          const int ch = ch_lut[fr & 1][fc & 1];
-          const size_t pos = (size_t)fr * width + fc;
-          const float val = 0.5f * (L_fr_den[pos]
-                                  + SIGNS[ch][0] * C1_full[pos]
-                                  + SIGNS[ch][1] * C2_full[pos]
-                                  + SIGNS[ch][2] * C3_full[pos])
-                          + ch_dark_ref[ch];
-          out[pos] = galosh_gat_inverse_exact(val * sg);
-        }
-      }
+          const size_t hi = (size_t)hy * halfwidth + hx;
+          const int fr = 2 * hy, fc = 2 * hx;
 
-      dt_free_align(C1_full); dt_free_align(C2_full); dt_free_align(C3_full);
+          const float c1 = c1_out[hi];
+          const float c2 = c2_out[hi];
+          const float c3 = c3_out[hi];
+
+          /* Block-aligned L only — avoids pixel shift from L/C spatial mismatch */
+          const float L_block = L_fr_den[(size_t)fr * width + fc];
+
+          /* Inverse WHT + dark_ref restore → sigma denorm → inverse GAT */
+          const float val_R  = (L_block + c1 + c2 + c3) * 0.5f + ch_dark_ref[0];
+          const float val_Gb = (L_block - c1 + c2 - c3) * 0.5f + ch_dark_ref[1];
+          const float val_Gr = (L_block + c1 - c2 - c3) * 0.5f + ch_dark_ref[2];
+          const float val_B  = (L_block - c1 - c2 + c3) * 0.5f + ch_dark_ref[3];
+
+          out[(size_t)fr       * width + fc]     = galosh_gat_inverse_exact(val_R  * sg);
+          out[(size_t)(fr + 1) * width + fc]     = galosh_gat_inverse_exact(val_Gb * sg);
+          out[(size_t)fr       * width + fc + 1] = galosh_gat_inverse_exact(val_Gr * sg);
+          out[(size_t)(fr + 1) * width + fc + 1] = galosh_gat_inverse_exact(val_B  * sg);
+        }
     }
 
     dt_free_align(L_fr_den);
