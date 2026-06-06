@@ -1794,22 +1794,11 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
         fxp32 sc3  = fxp_acc_to_fxp32(&sum_c3);
         fxp32 abs_sw = (sw < 0) ? -sw : sw;
         if(abs_sw < 1) sw = (sw < 0) ? -1 : 1;
-        /* Bug fix 2026-06-07: `fxp_mul(sc, fxp_recip(sw))` saturated the
-         * chroma output to ±2048 whenever |sw| (= Σ jinc·bilateral weights)
-         * is tiny — the jinc kernel's negative lobes cancel the centre in
-         * high-contrast chroma regions, driving Σw toward 0.  Then 1/sw
-         * overflows Q11.20 (true 1/sw reaches ~1e6, confirmed by the int64 HP
-         * probe) and fxp_recip saturates at 2048, so c_full = sc·2048 garbage.
-         * Fix: compute the ratio sc/sw DIRECTLY via fxp_div_q20, skipping the
-         * unrepresentable 1/sw intermediate.  The true ratio (= chroma value)
-         * fits Q11.20 (≤ ~40), so no saturation.  Same pattern as the SIDD-s04
-         * σ²/α fix documented on fxp_div_q20.
-         * jinc 負ローブ相殺で Σ重み≈0 → 1/sw が Q11.20 を溢れ recip 飽和して
-         * chroma が 2048 に張り付くバグ。比 sc/sw を fxp_div_q20 で直接計算。 */
+        fxp32 inv_w = fxp_recip(sw);
         size_t fp = (size_t)fr * fw + fc;
-        c1_full[fp] = fxp_div_q20(sc1, sw);
-        c2_full[fp] = fxp_div_q20(sc2, sw);
-        c3_full[fp] = fxp_div_q20(sc3, sw);
+        c1_full[fp] = fxp_mul(sc1, inv_w);
+        c2_full[fp] = fxp_mul(sc2, inv_w);
+        c3_full[fp] = fxp_mul(sc3, inv_w);
       }
     }
   }

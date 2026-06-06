@@ -38,7 +38,21 @@
 #include <math.h>
 #include <time.h>
 
-#include "galosh_cpu_int.h"
+#include "galosh_cpu_int_hp.h"
+
+/* HP_MAXTRACK: diagnostic max|real value| tracker for transient (un-dumped)
+ * intermediates, to find which buffers exceed Q11.20's ±2048 range. */
+#ifdef HP_MAXTRACK
+static double g_mt[8];
+static const char *g_mt_name[8];
+static inline void mt(int s, const char *nm, fxp32 v) {
+  double r = (double)(v < 0 ? -v : v) / (double)FXP_ONE;
+  g_mt_name[s] = nm; if(r > g_mt[s]) g_mt[s] = r;
+}
+#define MT(s, nm, v) mt((s), (nm), (v))
+#else
+#define MT(s, nm, v)
+#endif
 
 /* External LUT storage (declared in galosh_cpu_int.h).  Initialised once at
  * startup via INT-only Taylor / Mercator computations.
@@ -284,7 +298,7 @@ static int phase0a_block_stats(const fxp32 *in_q20,
 
         /* Mean over 64 pixels (block stride is 2 in full-res).
          * Plain int32 sum: max 64 × FXP_ONE × ~3 (real max) = ~2e8, fits. */
-        int32_t msum = 0;
+        fxp32 msum = 0;  /* HP: int64 (Q36 sum of 64 px overflows int32) */
         int np = 0;
         for(int y = y0; y < y0 + NE_BLOCK_SZ; y++) {
           for(int x = x0; x < x0 + NE_BLOCK_SZ; x++) {
@@ -440,7 +454,7 @@ static int phase0b_bin_envelope(const fxp32 *blk_mean, const fxp32 *blk_var,
          * vbin = frac * 128 = frac >> (FXP_FRAC - 7) = frac >> 13. */
         fxp32 dv = v - vmin;
         fxp32 frac = fxp_mul(dv, inv_vrange);
-        int vbin = (frac >= 0) ? ((int)frac >> 13) : 0;
+        int vbin = (frac >= 0) ? (int)(frac >> (FXP_FRAC - 7)) : 0;  /* HP: was >>13 */
         if(vbin < 0) vbin = 0;
         if(vbin >= NE_VAR_BINS) vbin = NE_VAR_BINS - 1;
         vhist[vbin]++;
@@ -562,7 +576,11 @@ static void wls_centered_pass(const fxp32 *bin_mean_arr,
   }
   /* Sanity check: Sw must be positive.  Sw_acc.hi positive AND lo > 0,
    * or hi == 0 and lo > 0. */
-  if(Sw_acc.hi < 0 || (Sw_acc.hi == 0 && Sw_acc.lo == 0)) {
+  if(getenv("HP_DBG")) {
+    int nv = 0; for(int b = 0; b < n_total_bins; b++) nv += bin_valid[b] ? 1 : 0;
+    fprintf(stderr, "  [wls-pre] n_valid=%d Sw>>36=%lld\n", nv, (long long)(Sw_acc >> 36));
+  }
+  if(Sw_acc <= 0) {   /* HP: __int128 (was paired-int32 hi/lo check) */
     *alpha_out = alpha_in; *sigma_sq_out = sigma_sq_in;
     return;
   }
@@ -600,12 +618,17 @@ static void wls_centered_pass(const fxp32 *bin_mean_arr,
    * (64-bit) so use fxp_acc_div_acc which shifts both equally to fit
    * int32 before dividing — preserves ratio + avoids fxp_recip overflow
    * on small Sxx_c.  See fxp_acc_div_acc doc-comment. */
-  if(Sxx_c_acc.hi > 0 || (Sxx_c_acc.hi == 0 && Sxx_c_acc.lo > 0)) {
+  if(Sxx_c_acc > 0) {   /* HP: __int128 (was paired-int32 hi/lo check) */
     fxp32 new_alpha = fxp_acc_div_acc(&Sxy_c_acc, &Sxx_c_acc);
     if(new_alpha > 0) alpha_est = new_alpha;
   }
   fxp32 new_sigma = mean_y - fxp_mul(alpha_est, mean_x);
   if(new_sigma >= 0) sigma_sq_est = new_sigma;
+  if(getenv("HP_DBG")) {
+    long long sxx = (long long)(Sxx_c_acc >> 36), sxy = (long long)(Sxy_c_acc >> 36);
+    fprintf(stderr, "  [wls] mean_x=%.6f mean_y=%.8f Sxx>>36=%lld Sxy>>36=%lld alpha_est=%.8f\n",
+            fxp_to_float(mean_x), fxp_to_float(mean_y), sxx, sxy, fxp_to_float(alpha_est));
+  }
   *alpha_out = alpha_est;
   *sigma_sq_out = sigma_sq_est;
 }
@@ -753,7 +776,7 @@ static void phase0d_dark_refine(const fxp32 *in_q20,
         /* bin = lap * 40960 >> 20.  Splitting to avoid INT32 overflow:
          *   40960 = 40 * 1024, so (lap*40960)>>20 = (lap*40)>>10.
          *   For lap_q max ~Q11.20 of 0.1 = 104857: 104857*40 = 4.2e6 fits. */
-        int b = (int)((lap * 40) >> 10);
+        int b = (int)((lap * 40960) >> FXP_FRAC);  /* HP: generic (was *40>>10) */
         if(b < 0) b = 0;
         if(b >= NE_DARK_HIST_BINS) b = NE_DARK_HIST_BINS - 1;
         lap_hist[b]++; total_lap++;
@@ -774,7 +797,7 @@ static void phase0d_dark_refine(const fxp32 *in_q20,
         /* bin = lap * 40960 >> 20.  Splitting to avoid INT32 overflow:
          *   40960 = 40 * 1024, so (lap*40960)>>20 = (lap*40)>>10.
          *   For lap_q max ~Q11.20 of 0.1 = 104857: 104857*40 = 4.2e6 fits. */
-        int b = (int)((lap * 40) >> 10);
+        int b = (int)((lap * 40960) >> FXP_FRAC);  /* HP: generic (was *40>>10) */
         if(b < 0) b = 0;
         if(b >= NE_DARK_HIST_BINS) b = NE_DARK_HIST_BINS - 1;
         lap_hist[b]++; total_lap++;
@@ -828,7 +851,7 @@ static int compute_block_stats(const fxp32 *in_q20, int width, int height,
   const int y0  = by * NE_BLOCK_SZ;
   const int x0  = bx * NE_BLOCK_SZ;
 
-  int32_t msum = 0;
+  fxp32 msum = 0;  /* HP: int64 (Q36 sum overflows int32) */
   int np = 0;
   for(int y = y0; y < y0 + NE_BLOCK_SZ; y++) {
     for(int x = x0; x < x0 + NE_BLOCK_SZ; x++) {
@@ -947,7 +970,7 @@ static void fxp_estimate_noise(const fxp32 *in_q20,
         if(!compute_block_stats(in_q20, width, height, ch, by, bx,
                                 &m, &v, var_scale_combined)) continue;
         if(m >= sat_threshold) continue;          /* skip saturated blocks */
-        int b = (int)(m >> 12);
+        int b = (int)(m >> (FXP_FRAC - 8));  /* HP: was >>12 (256-bin) */
         if(b < 0) b = 0;
         if(b >= PREPASS_BINS) b = PREPASS_BINS - 1;
         prepass_hist[b]++;
@@ -971,8 +994,8 @@ static void fxp_estimate_noise(const fxp32 *in_q20,
     }
   }
   /* Convert percentile bins to Q11.20: bin i covers [i*4096, (i+1)*4096). */
-  fxp32 mean_lo = (fxp32)p5_bin << 12;
-  fxp32 mean_hi = (fxp32)(p95_bin + 1) << 12;
+  fxp32 mean_lo = (fxp32)p5_bin << (FXP_FRAC - 8);        /* HP: was <<12 */
+  fxp32 mean_hi = (fxp32)(p95_bin + 1) << (FXP_FRAC - 8);  /* HP: was <<12 */
   /* Do NOT floor mean_lo at 0.003 — super-dark SIDD scenes (s14/s29/s34,
    * mean ~0.003) have actual block-mean range entirely below 0.003 and a
    * floor would exclude them all → "0 valid bins" → bad defaults.
@@ -1055,7 +1078,7 @@ static void fxp_estimate_noise(const fxp32 *in_q20,
         /* var sub-bin index */
         fxp32 dv = v - vmin_bin[b];
         fxp32 frac = fxp_mul(dv, inv_vrange_bin[b]);
-        int vbin = (int)(frac >> 13);
+        int vbin = (int)(frac >> (FXP_FRAC - 7));  /* HP: was >>13 */
         if(vbin < 0) vbin = 0;
         if(vbin >= NE_VAR_BINS) vbin = NE_VAR_BINS - 1;
         vhist[b][vbin]++;
@@ -1339,7 +1362,7 @@ static fxp32 fxp_estimate_gat_sigma_halfres_stream(const fxp32 *gat_q20,
       fxp32 v2 = gat_q20[(size_t)r * width + c2];
       fxp32 lap = v0 - (v1 << 1) + v2;
       if(lap < 0) lap = -lap;
-      int b = (int)(lap >> 11);
+      int b = (int)(lap >> (FXP_FRAC - 9));  /* HP: was >>11 (512/8 scale) */
       if(b < 0) b = 0;
       if(b >= NE_DARK_HIST_BINS) b = NE_DARK_HIST_BINS - 1;
       lap_hist[b]++; total++;
@@ -1357,7 +1380,7 @@ static fxp32 fxp_estimate_gat_sigma_halfres_stream(const fxp32 *gat_q20,
       fxp32 v2 = gat_q20[(size_t)r2 * width + c];
       fxp32 lap = v0 - (v1 << 1) + v2;
       if(lap < 0) lap = -lap;
-      int b = (int)(lap >> 11);
+      int b = (int)(lap >> (FXP_FRAC - 9));  /* HP: was >>11 (512/8 scale) */
       if(b < 0) b = 0;
       if(b >= NE_DARK_HIST_BINS) b = NE_DARK_HIST_BINS - 1;
       lap_hist[b]++; total++;
@@ -1372,8 +1395,9 @@ static fxp32 fxp_estimate_gat_sigma_halfres_stream(const fxp32 *gat_q20,
     cum += lap_hist[i];
     if(cum >= target) { med_bin = i; break; }
   }
-  /* mad_q = (med_bin + 0.5) << 11 in Q11.20 (since bin step = 1/2^11 in real). */
-  fxp32 mad_q = ((fxp32)med_bin << 11) + (1 << 10);
+  /* mad_q = (med_bin + 0.5) × bin_step, bin_step_real = 1/512.  HP-generic:
+   * FXP_ONE/512 == 2^11 and FXP_ONE/1024 == 2^10 at FXP_FRAC=20. */
+  fxp32 mad_q = ((fxp32)med_bin * (FXP_ONE / 512)) + (FXP_ONE / 1024);
   /* sigma = MAD / 1.6521 = MAD × 0.6053. */
   const fxp32 inv_1p6521 = fxp_from_float(1.0f / 1.6521f);
   fxp32 sigma = fxp_mul(mad_q, inv_1p6521);
@@ -1500,8 +1524,8 @@ static void phase3_forward_l_stride1(const fxp32 *in_gat_q20,
  * ========================================================================== */
 
 #define FXP_LOESS_RADIUS 7
-/* inv_2sigma_sq for BW=3.0: 1/(2·9) = 1/18 ≈ 0.0556 in Q11.20 = 58253. */
-#define FXP_LOESS_INV_2SIGMA_SQ  58253
+/* inv_2sigma_sq for BW=3.0: 1/(2·9) = 1/18.  HP-generic (FXP_ONE/18). */
+#define FXP_LOESS_INV_2SIGMA_SQ  (FXP_ONE / 18)
 /* eps_gat = strength_c² × GALOSH_LOESS_TAU_SQ_INV (=1.0).
  * For strength_c = 1.0, eps_gat = 1.0 (Q11.20 = FXP_ONE). */
 
@@ -1713,15 +1737,19 @@ static void fxp_loess_chroma_3ch_r(const fxp32 *y_guide,
       fxp32 a_c1 = fxp_mul(meanYC1 - fxp_mul(meanY, meanC1), inv_denom);
       fxp32 a_c2 = fxp_mul(meanYC2 - fxp_mul(meanY, meanC2), inv_denom);
       fxp32 a_c3 = fxp_mul(meanYC3 - fxp_mul(meanY, meanC3), inv_denom);
+      MT(3, "chroma_a", a_c1); MT(3, "chroma_a", a_c2); MT(3, "chroma_a", a_c3);
       fxp32 b_c1 = meanC1 - fxp_mul(a_c1, meanY);
       fxp32 b_c2 = meanC2 - fxp_mul(a_c2, meanY);
       fxp32 b_c3 = meanC3 - fxp_mul(a_c3, meanY);
 
       /* output_scaled = a · Y_c_scaled + b (= k * actual_output).
        * Unscale: output = output_scaled × 16 (= << 4). */
-      c1_out[cx] = (fxp_mul(a_c1, Y_c) + b_c1) << 4;
-      c2_out[cx] = (fxp_mul(a_c2, Y_c) + b_c2) << 4;
-      c3_out[cx] = (fxp_mul(a_c3, Y_c) + b_c3) << 4;
+      fxp32 _o1 = fxp_mul(a_c1, Y_c) + b_c1; MT(4, "chroma_preshift", _o1);
+      fxp32 _o2 = fxp_mul(a_c2, Y_c) + b_c2; MT(4, "chroma_preshift", _o2);
+      fxp32 _o3 = fxp_mul(a_c3, Y_c) + b_c3; MT(4, "chroma_preshift", _o3);
+      c1_out[cx] = _o1 << 4;
+      c2_out[cx] = _o2 << 4;
+      c3_out[cx] = _o3 << 4;
     }
   }
 }
@@ -1777,7 +1805,8 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
             if(arg > 0) arg = 0;
             fxp32 w_bilat = fxp_exp(arg);
 
-            fxp32 jw = fxp_k16_jw[si][dy + W][dx + W];
+            /* HP: table literals are Q11.20; rescale to Q(FXP_FRAC). */
+            fxp32 jw = fxp_k16_jw[si][dy + W][dx + W] << (FXP_FRAC - 20);
             fxp32 w  = fxp_mul(jw, w_bilat);
 
             size_t hp = (size_t)hyi * halfwidth + hxi;
@@ -1794,22 +1823,12 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
         fxp32 sc3  = fxp_acc_to_fxp32(&sum_c3);
         fxp32 abs_sw = (sw < 0) ? -sw : sw;
         if(abs_sw < 1) sw = (sw < 0) ? -1 : 1;
-        /* Bug fix 2026-06-07: `fxp_mul(sc, fxp_recip(sw))` saturated the
-         * chroma output to ±2048 whenever |sw| (= Σ jinc·bilateral weights)
-         * is tiny — the jinc kernel's negative lobes cancel the centre in
-         * high-contrast chroma regions, driving Σw toward 0.  Then 1/sw
-         * overflows Q11.20 (true 1/sw reaches ~1e6, confirmed by the int64 HP
-         * probe) and fxp_recip saturates at 2048, so c_full = sc·2048 garbage.
-         * Fix: compute the ratio sc/sw DIRECTLY via fxp_div_q20, skipping the
-         * unrepresentable 1/sw intermediate.  The true ratio (= chroma value)
-         * fits Q11.20 (≤ ~40), so no saturation.  Same pattern as the SIDD-s04
-         * σ²/α fix documented on fxp_div_q20.
-         * jinc 負ローブ相殺で Σ重み≈0 → 1/sw が Q11.20 を溢れ recip 飽和して
-         * chroma が 2048 に張り付くバグ。比 sc/sw を fxp_div_q20 で直接計算。 */
+        fxp32 inv_w = fxp_recip(sw);
+        MT(5, "k16_inv_w", inv_w); MT(6, "k16_sc1", sc1);
         size_t fp = (size_t)fr * fw + fc;
-        c1_full[fp] = fxp_div_q20(sc1, sw);
-        c2_full[fp] = fxp_div_q20(sc2, sw);
-        c3_full[fp] = fxp_div_q20(sc3, sw);
+        c1_full[fp] = fxp_mul(sc1, inv_w);
+        c2_full[fp] = fxp_mul(sc2, inv_w);
+        c3_full[fp] = fxp_mul(sc3, inv_w);
       }
     }
   }
@@ -1829,7 +1848,7 @@ static void phase6_l_pixel(const fxp32 *L_cs_den_q20,
   for(int fr = 0; fr < height; fr++) {
     for(int fc = 0; fc < width; fc++) {
       size_t p_tl = (size_t)fr * width + fc;
-      int32_t sum = L_cs_den_q20[p_tl];
+      fxp32 sum = L_cs_den_q20[p_tl];  /* HP: int64 (Q36 GAT-domain overflows int32) */
       int count = 1;
       if(fr > 0) {
         sum += L_cs_den_q20[(size_t)(fr - 1) * width + fc];
@@ -1967,6 +1986,7 @@ static void phase5_pass1_blocked(const fxp32 *input_q20,
 
       /* Forward WHT (unnormalized). */
       fxp_wht2d_8x8(block, 0);
+      for(int _i = 0; _i < 64; _i++) MT(0, "p5p1_wht_coef", block[_i]);
 
       /* σ_y² via MAD: median |AC coefs| / 0.6745, squared, divided by N. */
       fxp32 mad = fxp_partial_selection_median(block + 1, N - 1);
@@ -2118,6 +2138,8 @@ static void phase5_pass2_blocked(const fxp32 *noisy_q20,
 
       fxp_wht2d_8x8(blk_noisy, 0);
       fxp_wht2d_8x8(blk_pilot, 0);
+      for(int _i = 0; _i < 64; _i++) { MT(1, "p5p2_wht_noisy", blk_noisy[_i]);
+                                       MT(2, "p5p2_wht_pilot", blk_pilot[_i]); }
 
       /* wiener_energy = Σ w², accumulated in fxp_acc to avoid overflow. */
       fxp_acc we_acc = fxp_acc_zero();
@@ -2749,6 +2771,13 @@ int main(int argc, char **argv) {
   fclose(fout);
   fprintf(stderr, "  Output: %s (Phase 1 GAT-domain, clamped /4 for viewing)\n",
           output_file);
+
+#ifdef HP_MAXTRACK
+  for(int s = 0; s < 8; s++)
+    if(g_mt_name[s])
+      fprintf(stderr, "  [MAXTRACK] %-18s max|val| = %.1f  %s\n",
+              g_mt_name[s], g_mt[s], (g_mt[s] > 2048.0) ? "<<< EXCEEDS Q11.20 ±2048" : "");
+#endif
 
   free(in_f32); free(out_f32); free(in_q20); free(out_q20);
   return 0;
