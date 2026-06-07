@@ -1627,27 +1627,11 @@ static void fxp_loess_chroma_3ch_r(const fxp32 *y_guide,
       fxp32 Y_c_orig = y_guide[cx];
       fxp32 Y_c     = Y_c_orig >> 4;
 
-      /* Two-pass CENTERED guided filter (fix 2026-06-07).  The original
-       * single pass used var_Y = E[Y²]−meanY² and cov = E[Y·C]−meanY·meanC,
-       * each a difference of large near-equal weighted window sums.  For
-       * large GAT-domain luma the products Yi² / Yi·Ci are ~hundreds and the
-       * weighted window sums sumYY / sumYC approach/exceed the Q11.20 ±2048
-       * cap → fxp_acc_to_fxp32 SATURATES → meanYY too low → var_Y goes
-       * negative (clamped 0) and cov is corrupted, so the slope
-       * a = cov/(var+eps) blows up (measured a=1336 vs FP32 0.741) and the
-       * chroma output saturates at 2048 (foodstuff2-class catastrophe).
-       * Fix: PASS 1 computes the means only (Σw·Y, Σw·C stay small for Y/C in
-       * 1/16 scale); PASS 2 re-accumulates var/cov from the SMALL centred
-       * deviations (Y−meanY),(C−meanC) — these never approach 2048 and have
-       * no catastrophic cancellation — matching the FP32 reference.  Weights
-       * are cached from pass 1 so the costly fxp_exp is not recomputed.
-       * 大GAT輝度で sumYY/sumYC が ±2048 飽和 → var/cov 崩壊 → a 爆発のバグ修正。
-       * 1パス目で平均、2パス目で中央化偏差から var/cov を直接累算（飽和・打消し無）。 */
-      fxp32 w_buf[256], Y_buf[256], C1_buf[256], C2_buf[256], C3_buf[256];
-      int nb = 0;
       fxp_acc sumW = fxp_acc_zero();
       fxp_acc sumY = fxp_acc_zero();
+      fxp_acc sumYY = fxp_acc_zero();
       fxp_acc sumC1 = fxp_acc_zero(), sumC2 = fxp_acc_zero(), sumC3 = fxp_acc_zero();
+      fxp_acc sumYC1 = fxp_acc_zero(), sumYC2 = fxp_acc_zero(), sumYC3 = fxp_acc_zero();
 
       for(int dy = -R; dy <= R; dy++) {
         int yi = fxp_reflect_idx(y + dy, height);
@@ -1678,51 +1662,57 @@ static void fxp_loess_chroma_3ch_r(const fxp32 *y_guide,
           fxp32 C2i = C2i_orig >> 4;
           fxp32 C3i = C3i_orig >> 4;
 
-          w_buf[nb] = w; Y_buf[nb] = Yi;
-          C1_buf[nb] = C1i; C2_buf[nb] = C2i; C3_buf[nb] = C3i; nb++;
           fxp_acc_add_i32(&sumW, w);
-          fxp_acc_madd(&sumY,  w, Yi);
-          fxp_acc_madd(&sumC1, w, C1i);
-          fxp_acc_madd(&sumC2, w, C2i);
-          fxp_acc_madd(&sumC3, w, C3i);
+          fxp_acc_madd(&sumY,   w, Yi);
+          fxp_acc_madd(&sumC1,  w, C1i);
+          fxp_acc_madd(&sumC2,  w, C2i);
+          fxp_acc_madd(&sumC3,  w, C3i);
+          fxp32 Yi_sq = fxp_mul(Yi, Yi);
+          fxp_acc_madd(&sumYY,  w, Yi_sq);
+          fxp32 Y_C1 = fxp_mul(Yi, C1i);
+          fxp32 Y_C2 = fxp_mul(Yi, C2i);
+          fxp32 Y_C3 = fxp_mul(Yi, C3i);
+          fxp_acc_madd(&sumYC1, w, Y_C1);
+          fxp_acc_madd(&sumYC2, w, Y_C2);
+          fxp_acc_madd(&sumYC3, w, Y_C3);
         }
       }
 
-      /* PASS 1 result: means (Σw·Y, Σw·C stay < 2048 for Y/C in 1/16 scale). */
-      fxp32 sumW_q = fxp_acc_extract_q20(&sumW);
+      /* Extract Q11.20 sums (sumW via no-shift, products via shift). */
+      fxp32 sumW_q   = fxp_acc_extract_q20(&sumW);
+      fxp32 sumY_q   = fxp_acc_to_fxp32(&sumY);
+      fxp32 sumYY_q  = fxp_acc_to_fxp32(&sumYY);
+      fxp32 sumC1_q  = fxp_acc_to_fxp32(&sumC1);
+      fxp32 sumC2_q  = fxp_acc_to_fxp32(&sumC2);
+      fxp32 sumC3_q  = fxp_acc_to_fxp32(&sumC3);
+      fxp32 sumYC1_q = fxp_acc_to_fxp32(&sumYC1);
+      fxp32 sumYC2_q = fxp_acc_to_fxp32(&sumYC2);
+      fxp32 sumYC3_q = fxp_acc_to_fxp32(&sumYC3);
+
       if(sumW_q < 1) sumW_q = 1;
       fxp32 invW = fxp_recip(sumW_q);
-      fxp32 meanY   = fxp_mul(fxp_acc_to_fxp32(&sumY),  invW);
-      fxp32 meanC1  = fxp_mul(fxp_acc_to_fxp32(&sumC1), invW);
-      fxp32 meanC2  = fxp_mul(fxp_acc_to_fxp32(&sumC2), invW);
-      fxp32 meanC3  = fxp_mul(fxp_acc_to_fxp32(&sumC3), invW);
+      fxp32 meanY   = fxp_mul(sumY_q,   invW);
+      fxp32 meanYY  = fxp_mul(sumYY_q,  invW);
+      fxp32 meanC1  = fxp_mul(sumC1_q,  invW);
+      fxp32 meanC2  = fxp_mul(sumC2_q,  invW);
+      fxp32 meanC3  = fxp_mul(sumC3_q,  invW);
+      fxp32 meanYC1 = fxp_mul(sumYC1_q, invW);
+      fxp32 meanYC2 = fxp_mul(sumYC2_q, invW);
+      fxp32 meanYC3 = fxp_mul(sumYC3_q, invW);
 
-      /* PASS 2: centred variance/covariance from small deviations.
-       * var_Y/cov stay in 1/256 scale (= same as the old E[Y²]−meanY² form);
-       * a dimensionless, b in 1/16 scale, output ×16 (<<4). */
-      fxp_acc sumVarY = fxp_acc_zero();
-      fxp_acc sumCov1 = fxp_acc_zero(), sumCov2 = fxp_acc_zero(), sumCov3 = fxp_acc_zero();
-      for(int i = 0; i < nb; i++) {
-        fxp32 wi = w_buf[i];
-        fxp32 dYc = Y_buf[i] - meanY;
-        fxp_acc_madd(&sumVarY, wi, fxp_mul(dYc, dYc));
-        fxp_acc_madd(&sumCov1, wi, fxp_mul(dYc, C1_buf[i] - meanC1));
-        fxp_acc_madd(&sumCov2, wi, fxp_mul(dYc, C2_buf[i] - meanC2));
-        fxp_acc_madd(&sumCov3, wi, fxp_mul(dYc, C3_buf[i] - meanC3));
-      }
-      fxp32 var_Y = fxp_mul(fxp_acc_to_fxp32(&sumVarY), invW);
+      /* All means are in 1/16 scale.  var_Y, eps_gat, denom in 1/256 scale.
+       * a is DIMENSIONLESS (ratio of /16² / /16² = unchanged scale).
+       * b is in 1/16 scale. */
+      fxp32 meanY_sq = fxp_mul(meanY, meanY);
+      fxp32 var_Y = meanYY - meanY_sq;
       if(var_Y < 0) var_Y = 0;
-      fxp32 cov1 = fxp_mul(fxp_acc_to_fxp32(&sumCov1), invW);
-      fxp32 cov2 = fxp_mul(fxp_acc_to_fxp32(&sumCov2), invW);
-      fxp32 cov3 = fxp_mul(fxp_acc_to_fxp32(&sumCov3), invW);
-
       fxp32 denom = var_Y + eps_gat_scaled;
       if(denom < 1) denom = 1;
       fxp32 inv_denom = fxp_recip(denom);
 
-      fxp32 a_c1 = fxp_mul(cov1, inv_denom);
-      fxp32 a_c2 = fxp_mul(cov2, inv_denom);
-      fxp32 a_c3 = fxp_mul(cov3, inv_denom);
+      fxp32 a_c1 = fxp_mul(meanYC1 - fxp_mul(meanY, meanC1), inv_denom);
+      fxp32 a_c2 = fxp_mul(meanYC2 - fxp_mul(meanY, meanC2), inv_denom);
+      fxp32 a_c3 = fxp_mul(meanYC3 - fxp_mul(meanY, meanC3), inv_denom);
       fxp32 b_c1 = meanC1 - fxp_mul(a_c1, meanY);
       fxp32 b_c2 = meanC2 - fxp_mul(a_c2, meanY);
       fxp32 b_c3 = meanC3 - fxp_mul(a_c3, meanY);
