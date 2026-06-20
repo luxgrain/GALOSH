@@ -2597,6 +2597,19 @@ int main(int argc, char **argv) {
       fclose(df);
     }
   }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024]; snprintf(path, sizeof(path), "%s/p6.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) {
+        fwrite(L_pixel_q20, sizeof(fxp32), npixels, df);
+        fwrite(L_h_den_q20, sizeof(fxp32), chsize, df);
+        fclose(df);
+      }
+      fprintf(stderr, "  P6_RAW npix=%d chsize=%d\n", (int)npixels, (int)chsize);
+    }
+  }
 
   /* ========== Phase 7 actual: LOESS chroma pyramid + K16 upsample ========== */
   const int cq_w = halfwidth / 2;

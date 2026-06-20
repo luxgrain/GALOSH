@@ -102,8 +102,9 @@ int main(int argc, char **argv) {
   const char *files[] = { "galosh_int.clh", "galosh_int_tbl.clh", "galosh_int_p0.clh",
                           "galosh_int_p1.clh", "galosh_int_p5.clh",
                           "galosh_int_p0.cl", "galosh_int_p1.cl", "galosh_int_p2.cl",
-                          "galosh_int_p3.cl", "galosh_int_p4.cl", "galosh_int_p5.cl" };
-  const int nfiles = 11;
+                          "galosh_int_p3.cl", "galosh_int_p4.cl", "galosh_int_p5.cl",
+                          "galosh_int_p6.cl" };
+  const int nfiles = 12;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -227,6 +228,7 @@ int main(int argc, char **argv) {
   }
 
   /* ---- P5: BayesShrink pilot + Wiener (pixel-parallel gather) ---- */
+  cl_mem b_lden = 0;
   if(phase >= 5) {
     fxp_kaiser_init();
     int32_t kaiser[64]; memcpy(kaiser, fxp_kaiser_2d, sizeof kaiser);
@@ -240,7 +242,7 @@ int main(int argc, char **argv) {
     P5.wiener_floor = FXP_ONE / 8;
     cl_mem b_P5 = mkbuf(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof P5, &P5);
     cl_mem b_pilot = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
-    cl_mem b_lden = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
+    b_lden = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
     cl_kernel kp1 = mkkern("k_p5_pass1");
     setm(kp1,0,&b_lcs); setm(kp1,1,&b_pilot); seti(kp1,2,width); seti(kp1,3,height);
     setm(kp1,4,&b_T); setm(kp1,5,&b_kai); setm(kp1,6,&b_P5);
@@ -249,14 +251,37 @@ int main(int argc, char **argv) {
     setm(kp2,0,&b_lcs); setm(kp2,1,&b_pilot); setm(kp2,2,&b_lden);
     seti(kp2,3,width); seti(kp2,4,height); setm(kp2,5,&b_kai); setm(kp2,6,&b_P5);
     run1(kp2, npix);
-    int32_t *pbuf = malloc(npix * 4);
-    clEnqueueReadBuffer(queue, b_lden, CL_TRUE, 0, npix * 4, pbuf, 0, NULL, NULL);
+    if(phase == 5) {
+      int32_t *pbuf = malloc(npix * 4);
+      clEnqueueReadBuffer(queue, b_lden, CL_TRUE, 0, npix * 4, pbuf, 0, NULL, NULL);
+      clFinish(queue);
+      FILE *pf = fopen(out_path, "wb"); if(pf) { fwrite(pbuf, 4, npix, pf); fclose(pf); }
+      int32_t lo = 0x7FFFFFFF, hi = (int32_t)0x80000000;
+      for(size_t i = 0; i < npix; i++) { if(pbuf[i] < lo) lo = pbuf[i]; if(pbuf[i] > hi) hi = pbuf[i]; }
+      printf("P5_RAW lo=%d hi=%d\n", lo, hi);
+      return 0;
+    }
+  }
+
+  /* ---- P6: L_pixel (2x2 overlap-avg) + L_h_den (subsample) from L_cs_den ---- */
+  if(phase == 6) {
+    int halfw = (width + 1) / 2, halfh = (height + 1) / 2;
+    size_t chsize = (size_t)halfw * halfh;
+    cl_mem b_lpix = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
+    cl_mem b_lhden = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_kernel k6a = mkkern("k_p6_l_pixel");
+    setm(k6a,0,&b_lden); setm(k6a,1,&b_lpix); seti(k6a,2,width); seti(k6a,3,height);
+    run1(k6a, npix);
+    cl_kernel k6b = mkkern("k_p6_l_h_den");
+    setm(k6b,0,&b_lden); setm(k6b,1,&b_lhden); seti(k6b,2,width); seti(k6b,3,height);
+    seti(k6b,4,halfw); seti(k6b,5,halfh);
+    run1(k6b, chsize);
+    int32_t *c6 = malloc((npix + chsize) * 4);
+    clEnqueueReadBuffer(queue, b_lpix, CL_TRUE, 0, npix * 4, c6, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, b_lhden, CL_TRUE, 0, chsize * 4, c6 + npix, 0, NULL, NULL);
     clFinish(queue);
-    FILE *pf = fopen(out_path, "wb"); if(pf) { fwrite(pbuf, 4, npix, pf); fclose(pf); }
-    int32_t lo = 0x7FFFFFFF, hi = (int32_t)0x80000000;
-    for(size_t i = 0; i < npix; i++) { if(pbuf[i] < lo) lo = pbuf[i]; if(pbuf[i] > hi) hi = pbuf[i]; }
-    printf("P5_RAW lo=%d hi=%d\n", lo, hi);
-    fprintf(stderr, "[gpu] phase=5 done\n");
+    FILE *fo6 = fopen(out_path, "wb"); if(fo6) { fwrite(c6, 4, npix + chsize, fo6); fclose(fo6); }
+    printf("P6_RAW npix=%d chsize=%d\n", (int)npix, (int)chsize);
     return 0;
   }
 
