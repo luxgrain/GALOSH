@@ -2373,6 +2373,22 @@ int main(int argc, char **argv) {
           elapsed, fxp_to_float(unified_sigma_q),
           fxp_to_float(sigma_gat_ch[0]), fxp_to_float(sigma_gat_ch[1]),
           fxp_to_float(sigma_gat_ch[2]), fxp_to_float(sigma_gat_ch[3]));
+  /* Raw Q11.20 dump for bit-exact GPU (i16) per-phase validation.  Guarded by
+   * a SEPARATE env var (GALOSH_INT_RAW_DUMP_DIR) from the FP32-divergence float
+   * dumps (GALOSH_INT_DUMP_DIR) because GAT-domain values exceed 2^24 and lose
+   * bits through fxp_to_float — raw int32 is required for a bit-exact compare. */
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/p1_ingat.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) { fwrite(out_q20, sizeof(fxp32), npixels, df); fclose(df); }
+      fprintf(stderr, "  P1_RAW unified_sigma=%d sigma_ch=%d,%d,%d,%d\n",
+              unified_sigma_q, sigma_gat_ch[0], sigma_gat_ch[1],
+              sigma_gat_ch[2], sigma_gat_ch[3]);
+    }
+  }
 
   /* ========== Phase 2: dark_ref IRLS + per-pixel CFA-aware subtract ========== */
   fxp32 ch_dark_ref[4];
