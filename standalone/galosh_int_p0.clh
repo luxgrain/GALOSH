@@ -1,0 +1,312 @@
+/* ============================================================================
+ *  galosh_int_p0.clh  — Phase 0 (blind noise estimation) device functions.
+ *
+ *  OpenCL twin of the Phase-0 path in galosh_raw_cpu_int.c:
+ *    compute_block_stats / wls_centered_pass / phase0c_wls_solve /
+ *    phase0d_dark_refine, plus the fxp_estimate_noise reduction (which lives
+ *    in the k_p0_estimate kernel, galosh_int_p0.cl).
+ *
+ *  Faithful bit-mirror of the r32 CPU reference: the only changes are
+ *    - explicit __global qualifiers where the CPU read a raw image pointer,
+ *    - float-derived constants (fxp_from_float(...)) are computed ONCE on the
+ *      HOST and passed in via `fxp_p0_consts` (keeps the GPU kernels FP-free,
+ *      ISP-honest: these are the per-image parameter registers),
+ *    - the CPU's static histogram arrays become __global scratch buffers
+ *      (single-work-item estimate kernel; correctness-first, not perf-tuned).
+ *
+ *  Depends on galosh_int.clh (+ galosh_int_tbl.clh not required here).
+ * ========================================================================== */
+#ifndef GALOSH_INT_P0_CLH
+#define GALOSH_INT_P0_CLH
+
+#define NE_NBINS          32     /* number of mean-bins */
+#define NE_BLOCK_SZ       8      /* block size for stats (per CFA channel) */
+#define NE_VAR_BINS       128    /* var sub-bins inside each mean-bin */
+#define NE_DARK_HIST_BINS 4096   /* dark refine histogram resolution */
+
+/* Per-image float-derived constants (host computes via fxp_from_float). */
+typedef struct fxp_p0_consts {
+  int var_scale_combined;   /* fxp_from_float(1.482f * 13.064f) ~= 19.359 */
+  int sat_threshold;        /* fxp_from_float(0.97f) */
+  int huber_factor_q;       /* fxp_from_float(1.345f / 0.6745f) */
+  int dark_offset_002;      /* fxp_from_float(0.02f) */
+  int alpha_init;           /* fxp_from_float(1e-4f) = 105 */
+} fxp_p0_consts;
+
+/* ----------------------------------------------------------------------------
+ * compute_block_stats — one block's (mean, var). Returns 0 if invalid.
+ * var is returned 1024x scaled (= MAD-derived sigma_lap^2 * 1024).
+ * -------------------------------------------------------------------------- */
+inline int compute_block_stats(__global const int *in_q20, int width, int height,
+                               int ch, int by, int bx,
+                               int *out_mean, int *out_var,
+                               int var_scale_combined) {
+  const int dy0 = (ch >> 1) & 1;   /* offsets {0,0},{0,1},{1,0},{1,1} */
+  const int dx0 = ch & 1;
+  const int y0  = by * NE_BLOCK_SZ;
+  const int x0  = bx * NE_BLOCK_SZ;
+
+  int msum = 0;
+  int np = 0;
+  for(int y = y0; y < y0 + NE_BLOCK_SZ; y++) {
+    for(int x = x0; x < x0 + NE_BLOCK_SZ; x++) {
+      int rr = 2*y + dy0, cc = 2*x + dx0;
+      if(rr < height && cc < width) {
+        msum += in_q20[(size_t)rr * width + cc];
+        np++;
+      }
+    }
+  }
+  if(np <= 0) return 0;
+  *out_mean = (np == 64) ? (msum >> 6) : (msum / np);
+
+  int laps[256];
+  int nl = 0;
+  for(int y = y0; y < y0 + NE_BLOCK_SZ; y++) {
+    for(int x = x0; x < x0 + NE_BLOCK_SZ - 2; x++) {
+      int r = 2*y + dy0;
+      int c0 = 2*x + dx0, c1 = 2*(x+1) + dx0, c2 = 2*(x+2) + dx0;
+      if(c2 >= width || r >= height) continue;
+      int v0 = in_q20[(size_t)r * width + c0];
+      int v1 = in_q20[(size_t)r * width + c1];
+      int v2 = in_q20[(size_t)r * width + c2];
+      int lap = v0 - (v1 << 1) + v2;
+      laps[nl++] = (lap < 0) ? -lap : lap;
+      if(nl >= 256) goto stat_lap_done;
+    }
+  }
+  for(int y = y0; y < y0 + NE_BLOCK_SZ - 2; y++) {
+    for(int x = x0; x < x0 + NE_BLOCK_SZ; x++) {
+      int c = 2*x + dx0;
+      int r0 = 2*y + dy0, r1 = 2*(y+1) + dy0, r2 = 2*(y+2) + dy0;
+      if(r2 >= height || c >= width) continue;
+      int v0 = in_q20[(size_t)r0 * width + c];
+      int v1 = in_q20[(size_t)r1 * width + c];
+      int v2 = in_q20[(size_t)r2 * width + c];
+      int lap = v0 - (v1 << 1) + v2;
+      laps[nl++] = (lap < 0) ? -lap : lap;
+      if(nl >= 256) goto stat_lap_done;
+    }
+  }
+stat_lap_done:
+  if(nl <= 10) return 0;
+  int med = fxp_partial_selection_median(laps, nl);
+  int sigma_lap_scaled = fxp_mul(med, var_scale_combined);
+  *out_var = fxp_mul(sigma_lap_scaled, sigma_lap_scaled);   /* var x 1024 */
+  return 1;
+}
+
+/* ----------------------------------------------------------------------------
+ * wls_centered_pass — one centered Huber-WLS pass (private bin arrays).
+ * -------------------------------------------------------------------------- */
+inline void wls_centered_pass(const int *bin_mean_arr,
+                              const int *bin_var_arr,
+                              const int *bin_cnt_arr,
+                              const int *bin_valid,
+                              int n_total_bins,
+                              int alpha_in, int sigma_sq_in,
+                              int huber_k_q,
+                              int *alpha_out, int *sigma_sq_out) {
+  fxp_acc Sx_acc = fxp_acc_zero();
+  fxp_acc Sy_acc = fxp_acc_zero();
+  fxp_acc Sw_acc = fxp_acc_zero();
+  for(int b = 0; b < n_total_bins; b++) {
+    if(!bin_valid[b]) continue;
+    int w_int = bin_cnt_arr[b];
+    int w_q = w_int * FXP_ONE;
+    if(huber_k_q < FXP_MAX_INT) {
+      int pred = fxp_mul(alpha_in, bin_mean_arr[b]) + sigma_sq_in;
+      int r = bin_var_arr[b] - pred;
+      int abs_r = (r < 0) ? -r : r;
+      if(abs_r > huber_k_q) {
+        int ratio = fxp_mul(huber_k_q, fxp_recip(abs_r));
+        w_q = fxp_mul(w_q, ratio);
+      }
+    }
+    fxp_acc_add_i32(&Sw_acc, w_q);
+    fxp_acc_add_i32(&Sx_acc, fxp_mul(w_q, bin_mean_arr[b]));
+    fxp_acc_add_i32(&Sy_acc, fxp_mul(w_q, bin_var_arr[b]));
+  }
+  if(Sw_acc.hi < 0 || (Sw_acc.hi == 0 && Sw_acc.lo == 0)) {
+    *alpha_out = alpha_in; *sigma_sq_out = sigma_sq_in;
+    return;
+  }
+  int mean_x = fxp_acc_div_acc(&Sx_acc, &Sw_acc);
+  int mean_y = fxp_acc_div_acc(&Sy_acc, &Sw_acc);
+
+  fxp_acc Sxx_c_acc = fxp_acc_zero();
+  fxp_acc Sxy_c_acc = fxp_acc_zero();
+  for(int b = 0; b < n_total_bins; b++) {
+    if(!bin_valid[b]) continue;
+    int w_int = bin_cnt_arr[b];
+    int w_q = w_int * FXP_ONE;
+    if(huber_k_q < FXP_MAX_INT) {
+      int pred = fxp_mul(alpha_in, bin_mean_arr[b]) + sigma_sq_in;
+      int r = bin_var_arr[b] - pred;
+      int abs_r = (r < 0) ? -r : r;
+      if(abs_r > huber_k_q) {
+        int ratio = fxp_mul(huber_k_q, fxp_recip(abs_r));
+        w_q = fxp_mul(w_q, ratio);
+      }
+    }
+    int xc = bin_mean_arr[b] - mean_x;
+    int yc = bin_var_arr[b] - mean_y;
+    int w_xc = fxp_mul(w_q, xc);
+    fxp_acc_madd(&Sxx_c_acc, w_xc, xc);
+    fxp_acc_madd(&Sxy_c_acc, w_xc, yc);
+  }
+
+  int alpha_est = alpha_in, sigma_sq_est = sigma_sq_in;
+  if(Sxx_c_acc.hi > 0 || (Sxx_c_acc.hi == 0 && Sxx_c_acc.lo > 0)) {
+    int new_alpha = fxp_acc_div_acc(&Sxy_c_acc, &Sxx_c_acc);
+    if(new_alpha > 0) alpha_est = new_alpha;
+  }
+  int new_sigma = mean_y - fxp_mul(alpha_est, mean_x);
+  if(new_sigma >= 0) sigma_sq_est = new_sigma;
+  *alpha_out = alpha_est;
+  *sigma_sq_out = sigma_sq_est;
+}
+
+/* ----------------------------------------------------------------------------
+ * phase0c_wls_solve — 5-iter Huber-weighted centered WLS (private bin arrays).
+ * -------------------------------------------------------------------------- */
+inline void phase0c_wls_solve(const int *bin_mean_arr,
+                              const int *bin_var_arr,
+                              const int *bin_cnt_arr,
+                              const int *bin_valid,
+                              int n_total_bins,
+                              int alpha_init, int huber_factor_q,
+                              int *alpha_out, int *sigma_sq_out) {
+  int alpha_est = alpha_init;     /* fxp_from_float(1e-4f) */
+  int sigma_sq_est = 1;
+
+  for(int iter = 0; iter < 5; iter++) {
+    int huber_k_q = FXP_MAX_INT;
+    if(iter > 0) {
+      int resids[NE_NBINS];
+      int nr = 0;
+      for(int b = 0; b < n_total_bins; b++) {
+        if(!bin_valid[b]) continue;
+        int pred = fxp_mul(alpha_est, bin_mean_arr[b]) + sigma_sq_est;
+        int r = bin_var_arr[b] - pred;
+        resids[nr++] = (r < 0) ? -r : r;
+      }
+      if(nr < 2) break;
+      int mad = fxp_partial_selection_median(resids, nr);
+      huber_k_q = fxp_mul(huber_factor_q, mad);
+      if(huber_k_q < 1) huber_k_q = 1;
+    }
+    int new_alpha, new_sigma_sq;
+    wls_centered_pass(bin_mean_arr, bin_var_arr, bin_cnt_arr, bin_valid,
+                      n_total_bins, alpha_est, sigma_sq_est, huber_k_q,
+                      &new_alpha, &new_sigma_sq);
+    if(new_alpha > 0) alpha_est = new_alpha;
+    if(new_sigma_sq >= 0) sigma_sq_est = new_sigma_sq;
+  }
+
+  alpha_est    = alpha_est    >> 10;     /* unscale /1024 */
+  sigma_sq_est = sigma_sq_est >> 10;
+  if(alpha_est < 1) alpha_est = 1;
+  *alpha_out    = alpha_est;
+  *sigma_sq_out = sigma_sq_est;
+}
+
+/* ----------------------------------------------------------------------------
+ * phase0d_dark_refine — dark-percentile sigma^2 refinement (global scratch).
+ * -------------------------------------------------------------------------- */
+inline void phase0d_dark_refine(__global const int *in_q20,
+                                int width, int height,
+                                int alpha_in,
+                                int *sigma_sq_out,
+                                __global int *thresh_hist,
+                                __global int *lap_hist,
+                                int var_scale_combined,
+                                int dark_offset_002) {
+  const int halfwidth  = (width  + 1) / 2;
+  const int halfheight = (height + 1) / 2;
+
+  for(int i = 0; i < NE_DARK_HIST_BINS; i++) thresh_hist[i] = 0;
+  int total_thresh = 0;
+  for(int ch = 0; ch < 4; ch++) {
+    int dy0 = (ch >> 1) & 1, dx0 = ch & 1;
+    for(int y = 0; y < halfheight; y += 3) {
+      for(int x = 0; x < halfwidth; x += 3) {
+        int rr = 2*y + dy0, cc = 2*x + dx0;
+        if(rr >= height || cc >= width) continue;
+        int v = in_q20[(size_t)rr * width + cc];
+        int b = (int)(v >> (FXP_FRAC - 12));
+        if(b < 0) b = 0;
+        if(b >= NE_DARK_HIST_BINS) b = NE_DARK_HIST_BINS - 1;
+        thresh_hist[b]++;
+        total_thresh++;
+      }
+    }
+  }
+  int target = total_thresh / 10;
+  int cum = 0, dark_bin = 0;
+  for(int i = 0; i < NE_DARK_HIST_BINS; i++) {
+    cum += thresh_hist[i];
+    if(cum >= target) { dark_bin = i; break; }
+  }
+  int dark_thresh = (int)((dark_bin << (FXP_FRAC - 12)) + (1 << (FXP_FRAC - 13)));
+  int dark_max = dark_thresh + dark_offset_002;
+
+  for(int i = 0; i < NE_DARK_HIST_BINS; i++) lap_hist[i] = 0;
+  int total_lap = 0;
+  for(int ch = 0; ch < 4; ch++) {
+    int dy0 = (ch >> 1) & 1, dx0 = ch & 1;
+    for(int y = 0; y < halfheight; y++) {
+      for(int x = 0; x < halfwidth - 2; x++) {
+        int r = 2*y + dy0;
+        int c0 = 2*x + dx0, c1 = 2*(x+1) + dx0, c2 = 2*(x+2) + dx0;
+        if(r >= height || c2 >= width) continue;
+        int v0 = in_q20[(size_t)r * width + c0];
+        int v1 = in_q20[(size_t)r * width + c1];
+        int v2 = in_q20[(size_t)r * width + c2];
+        if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+        int lap = v0 - (v1 << 1) + v2;
+        if(lap < 0) lap = -lap;
+        int b = (int)((lap * 40) >> 10);
+        if(b < 0) b = 0;
+        if(b >= NE_DARK_HIST_BINS) b = NE_DARK_HIST_BINS - 1;
+        lap_hist[b]++; total_lap++;
+      }
+    }
+    for(int y = 0; y < halfheight - 2; y++) {
+      for(int x = 0; x < halfwidth; x++) {
+        int c = 2*x + dx0;
+        int r0 = 2*y + dy0, r1 = 2*(y+1) + dy0, r2 = 2*(y+2) + dy0;
+        if(r2 >= height || c >= width) continue;
+        int v0 = in_q20[(size_t)r0 * width + c];
+        int v1 = in_q20[(size_t)r1 * width + c];
+        int v2 = in_q20[(size_t)r2 * width + c];
+        if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+        int lap = v0 - (v1 << 1) + v2;
+        if(lap < 0) lap = -lap;
+        int b = (int)((lap * 40) >> 10);
+        if(b < 0) b = 0;
+        if(b >= NE_DARK_HIST_BINS) b = NE_DARK_HIST_BINS - 1;
+        lap_hist[b]++; total_lap++;
+      }
+    }
+  }
+  if(total_lap < 100) return;
+
+  int target_med = total_lap / 2;
+  int cum_l = 0, med_bin = 0;
+  for(int i = 0; i < NE_DARK_HIST_BINS; i++) {
+    cum_l += lap_hist[i];
+    if(cum_l >= target_med) { med_bin = i; break; }
+  }
+  int mad_q = ((int)med_bin * (FXP_ONE / 40960)) + (FXP_ONE / 81920);
+  int sigma_lap_scaled = fxp_mul(mad_q, var_scale_combined);
+  int dark_var_scaled  = fxp_mul(sigma_lap_scaled, sigma_lap_scaled);
+  int dark_mean = dark_thresh >> 1;
+  int alpha_scaled = (alpha_in <= (FXP_MAX_INT >> 10)) ? (alpha_in << 10)
+                                                       : FXP_MAX_INT;
+  int dyn_scaled = dark_var_scaled - fxp_mul(alpha_scaled, dark_mean);
+  if(dyn_scaled < 0) dyn_scaled = 0;
+  *sigma_sq_out = dyn_scaled >> 10;
+}
+
+#endif  /* GALOSH_INT_P0_CLH */

@@ -1,0 +1,183 @@
+/* ============================================================================
+ *  galosh_int_tbl.clh  — table-driven INT primitives (Stage F1-B).
+ *
+ *  OpenCL twin of the transcendental / GAT / Poisson layer of
+ *  galosh_cpu_int.h.  Depends on galosh_int.clh (must be concatenated AFTER
+ *  it).  Faithful bit-mirror: only type names changed.
+ *
+ *  Tables that the CPU builds at runtime (exp(-k), ln2, factorial-log) are
+ *  computed ONCE on the host with the exact CPU code and uploaded in
+ *  `fxp_tables` (a __constant buffer), so these functions inherit
+ *  bit-identical tables.  Per-image GAT constants are computed on the host
+ *  (fxp_gat_precompute) and uploaded in `fxp_gat_params`.
+ * ========================================================================== */
+#ifndef GALOSH_INT_TBL_CLH
+#define GALOSH_INT_TBL_CLH
+
+/* Uploaded constant tables (host fills via galosh_cpu_int.h init fns). */
+typedef struct fxp_tables {
+  int ln2_q20;                 /* fxp_ln2_q20 */
+  int exp_neg_pow2[17];        /* fxp_exp_neg_pow2_table[k] = exp(-k), k=0..16 */
+  int factorial_log[400];      /* fxp_factorial_log[k] = log(k!) */
+} fxp_tables;
+
+/* ---- exp(-r), r in [0,1], 8-term Taylor (compile-time const factorials) ---- */
+__constant int FXP_INV_FACT8[8] = {
+  FXP_ONE, FXP_ONE, 524288, 174762, 43690, 8738, 1456, 208
+};
+
+inline fxp32 fxp_exp_neg_taylor_unit(fxp32 r) {
+  fxp32 r_pow = FXP_ONE;
+  fxp32 sum = FXP_INV_FACT8[0];
+  int sign = -1;
+  for(int k = 1; k < 8; k++) {
+    r_pow = fxp_mul(r_pow, r);
+    fxp32 term = fxp_mul(r_pow, FXP_INV_FACT8[k]);
+    if(sign < 0) sum -= term; else sum += term;
+    sign = -sign;
+  }
+  return sum;
+}
+
+#define FXP_EXP_DOMAIN_LO  (-16 * FXP_ONE)
+
+inline fxp32 fxp_exp(fxp32 x, __constant const fxp_tables *T) {
+  if(x <= FXP_EXP_DOMAIN_LO) return 0;
+  if(x >= 0) return FXP_ONE;
+  fxp32 neg_x = -x;
+  int k = (int)(neg_x >> FXP_FRAC);
+  if(k > 16) k = 16;
+  fxp32 frac = neg_x - ((fxp32)k << FXP_FRAC);
+  fxp32 e_frac = fxp_exp_neg_taylor_unit(frac);
+  fxp32 e_k = T->exp_neg_pow2[k];
+  return fxp_mul(e_k, e_frac);
+}
+
+/* ---- log via Mercator-Gregory (compile-time const odd reciprocals) ---- */
+__constant int FXP_INV_ODD10[10] = {
+  349525, 209715, 149797, 116508, 95325, 80661, 69905, 61680, 55188, 49932
+};
+
+inline fxp32 fxp_ln_via_mercator(fxp32 u) {
+  fxp32 u_sq = fxp_mul(u, u);
+  fxp32 power = u;
+  fxp32 sum = u;
+  for(int k = 0; k < 10; k++) {
+    power = fxp_mul(power, u_sq);
+    sum  += fxp_mul(power, FXP_INV_ODD10[k]);
+  }
+  return sum + sum;
+}
+
+inline fxp32 fxp_log_in_octave(fxp32 m_q20) {
+  fxp32 num = m_q20 - FXP_ONE;
+  fxp32 den = m_q20 + FXP_ONE;
+  fxp32 u = fxp_mul(num, fxp_recip(den));
+  return fxp_ln_via_mercator(u);
+}
+
+inline fxp32 fxp_log(fxp32 x, __constant const fxp_tables *T) {
+  if(x <= 0) return -16 * FXP_ONE;
+  int b = 0;
+  uint v = (uint)x;
+  while(v >>= 1) b++;
+  int exponent_real = b - FXP_FRAC;
+  fxp32 mantissa;
+  if(b >= FXP_FRAC) mantissa = x >> (b - FXP_FRAC);
+  else              mantissa = x << (FXP_FRAC - b);
+  fxp32 log_mantissa = fxp_log_in_octave(mantissa);
+  return exponent_real * T->ln2_q20 + log_mantissa;
+}
+
+/* ---- sqrt: Newton on rsqrt for x>=1, exp(log(x)/2) for x<1 ---- */
+inline fxp32 fxp_sqrt(fxp32 x, __constant const fxp_tables *T) {
+  if(x <= 0) return 0;
+  if(x < FXP_ONE) {
+    fxp32 lx = fxp_log(x, T);
+    fxp32 half_lx = lx >> 1;
+    return fxp_exp(half_lx, T);
+  }
+  int b = 0;
+  uint v = (uint)x;
+  while(v >>= 1) b++;
+  int shift = (3 * FXP_FRAC - b) / 2;
+  fxp32 r = (shift >= 0 && shift < 31) ? ((fxp32)1 << shift)
+            : (shift < 0 ? 1 : FXP_MAX_INT);
+  if(r <= 0) r = 1;
+  for(int it = 0; it < 5; it++) {
+    fxp32 rr = fxp_mul(r, r);
+    fxp32 xrr = fxp_mul(x, rr);
+    fxp32 t = (3 * FXP_ONE - xrr) >> 1;
+    r = fxp_mul(r, t);
+    if(r <= 0) r = 1;
+  }
+  return fxp_mul(x, r);
+}
+
+/* ---- GAT forward / algebraic inverse ---- */
+typedef struct fxp_gat_params {
+  int alpha;
+  int sigma_sq;
+  int sigma_raw;
+  int inv_2sqrt_alpha;
+  int three_alpha_8;
+  int sigma_sq_over_alpha;
+  int y_break;
+  int t_break;
+  int inv_sigma_raw;
+} fxp_gat_params;
+
+inline fxp32 fxp_gat_forward(fxp32 x_q20, const fxp_gat_params *p,
+                             __constant const fxp_tables *T) {
+  if(x_q20 >= p->y_break) {
+    fxp32 u = x_q20 + p->three_alpha_8 + p->sigma_sq_over_alpha;
+    if(u < 0) u = 0;
+    return fxp_mul(p->inv_2sqrt_alpha, fxp_sqrt(u, T));
+  } else {
+    fxp32 dx = x_q20 - p->y_break;
+    return p->t_break + fxp_mul(dx, p->inv_sigma_raw);
+  }
+}
+
+inline fxp32 fxp_gat_inverse_algebraic(fxp32 d_q20, const fxp_gat_params *p) {
+  if(d_q20 >= p->t_break) {
+    fxp32 alpha_over_4 = p->alpha >> 2;
+    fxp32 ad = fxp_mul(alpha_over_4, d_q20);
+    fxp32 ad2 = fxp_mul(ad, d_q20);
+    return ad2 - p->three_alpha_8 - p->sigma_sq_over_alpha;
+  } else {
+    fxp32 dd = d_q20 - p->t_break;
+    return p->y_break + fxp_mul(p->sigma_raw, dd);
+  }
+}
+
+/* ---- Poisson log-pdf (exact for lambda<100, Gauss CLT otherwise) ---- */
+#define FXP_LOG_2PI_Q20 1926744
+
+inline fxp32 fxp_poisson_log_pdf(fxp32 lambda_q20, int k,
+                                 __constant const fxp_tables *T) {
+  if(lambda_q20 <= 0) return (k == 0) ? 0 : FXP_MIN_INT;
+  if(k == 0) return -lambda_q20;
+
+  if(lambda_q20 < (fxp32)100 * FXP_ONE) {
+    if(k >= 400) return FXP_MIN_INT;
+    fxp32 log_lambda = fxp_log(lambda_q20, T);
+    fxp_acc t = fxp_acc_zero();
+    fxp_acc_madd(&t, k, log_lambda);
+    fxp32 k_log_lambda = fxp_acc_extract_q20(&t);
+    return -lambda_q20 + k_log_lambda - T->factorial_log[k];
+  }
+
+  int lambda_int = lambda_q20 >> FXP_FRAC;
+  if(lambda_int < 1) lambda_int = 1;
+  int km_int = k - lambda_int;
+  int km_sq_int = km_int * km_int;
+  fxp_acc num_acc = fxp_acc_zero();
+  fxp_acc_madd(&num_acc, km_sq_int, FXP_ONE);
+  fxp32 sq_over_lambda_q20 = fxp_acc_div_i32(&num_acc, lambda_int);
+  fxp32 log_lambda = fxp_log(lambda_q20, T);
+  fxp32 log_2pi_lambda_half = (FXP_LOG_2PI_Q20 + log_lambda) >> 1;
+  return -(sq_over_lambda_q20 >> 1) - log_2pi_lambda_half;
+}
+
+#endif  /* GALOSH_INT_TBL_CLH */

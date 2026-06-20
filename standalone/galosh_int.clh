@@ -1,0 +1,337 @@
+/* ============================================================================
+ *  galosh_int.clh
+ *
+ *  OpenCL port of the GALOSH-RAW INT fixed-point primitives (Q11.20).
+ *  Faithful bit-mirror of galosh_cpu_int.h (the r32 CPU reference).
+ *
+ *  i16 GPU port — Stage F1 (primitive layer).  This header is the OpenCL
+ *  twin of galosh_cpu_int.h: every function below is a line-by-line port of
+ *  its CPU namesake, with ONLY the integer type names changed
+ *  (int32_t -> int, uint32_t -> uint) and `static inline` -> `inline`.
+ *
+ *  Why a bit-exact port is achievable:
+ *    - All primitives are pure INT32 ALU.  No INT64 type appears; 64-bit
+ *      intermediates use paired (hi32,lo32) emulation (fxp_acc), which maps
+ *      identically to OpenCL C.
+ *    - OpenCL C guarantees two's-complement integers and ARITHMETIC right
+ *      shift for signed `>>` (OpenCL 1.2 §6.3.j) — matching gcc on the CPU.
+ *      So `acc->hi >> FXP_FRAC`, `lx >> 1`, etc. produce identical bits.
+ *    - uint wraparound is modulo-2^32 in both → paired-int carry logic matches.
+ *
+ *  Tables (exp(-k), ln2, kaiser, factorial-log, GAT params) are NOT built
+ *  here — they are computed once on the HOST with the exact CPU code in
+ *  galosh_cpu_int.h and uploaded as __constant buffers, guaranteeing the
+ *  table-driven functions (fxp_log/exp/sqrt/gat/poisson) inherit bit-identical
+ *  tables.  Those functions live in Stage F1-B (galosh_int_tbl.clh).
+ *
+ *  STAGE F1-A (this file): no-table core only.
+ *    acc ops, fxp_mul, fxp_add_sat, fxp_sub_sat, fxp_div_q20, fxp_recip,
+ *    fxp_acc_div_i32, fxp_acc_div_acc, fxp_partial_selection_median,
+ *    fxp_wht8, fxp_wht2d_8x8.
+ *
+ *  Bit-exactness target: galosh_raw_cpu_int (r32 CPU reference).
+ *  Validation harness: galosh_int_test.c + galosh_int_test.cl.
+ * ========================================================================== */
+#ifndef GALOSH_INT_CLH
+#define GALOSH_INT_CLH
+
+/* ------------------------------------------------------------------ */
+/* Q-format definitions (Q11.20) — identical to galosh_cpu_int.h.       */
+/* ------------------------------------------------------------------ */
+typedef int  fxp32;                  /* Q11.20 fixed-point (OpenCL int = 32-bit) */
+
+#define FXP_FRAC       20
+#define FXP_ONE        ((fxp32)1 << FXP_FRAC)            /* = 1048576 */
+#define FXP_HALF       ((fxp32)1 << (FXP_FRAC - 1))      /* = 524288  */
+#define FXP_FRAC_MASK  (FXP_ONE - 1)
+#define FXP_MAX_INT    ((fxp32)0x7FFFFFFF)               /* +max */
+#define FXP_MIN_INT    ((fxp32)0x80000000)               /* -max */
+
+/* ------------------------------------------------------------------ */
+/* Multi-precision accumulator (fxp_acc) — INT64 emulation via paired   */
+/* INT32.  value = (int)hi * 2^32 + (uint)lo, sign-extended via hi.      */
+/* ------------------------------------------------------------------ */
+typedef struct fxp_acc {
+  int  hi;
+  uint lo;
+} fxp_acc;
+
+inline fxp_acc fxp_acc_zero(void) { fxp_acc a; a.hi = 0; a.lo = 0u; return a; }
+
+inline fxp_acc fxp_acc_from_int32(int v) {
+  fxp_acc a;
+  a.lo = (uint)v;
+  a.hi = (v < 0) ? -1 : 0;
+  return a;
+}
+
+/* acc += v   (signed add of int sign-extended into 64-bit). */
+inline void fxp_acc_add_i32(fxp_acc *a, int v) {
+  uint lo_old = a->lo;
+  uint v_lo = (uint)v;
+  a->lo = lo_old + v_lo;
+  int v_hi = (v < 0) ? -1 : 0;
+  uint carry = (a->lo < lo_old) ? 1u : 0u;
+  a->hi += v_hi + (int)carry;
+}
+
+/* acc -= v */
+inline void fxp_acc_sub_i32(fxp_acc *a, int v) {
+  uint lo_old = a->lo;
+  uint v_lo = (uint)v;
+  a->lo = lo_old - v_lo;
+  int v_hi = (v < 0) ? -1 : 0;
+  uint borrow = (a->lo > lo_old) ? 1u : 0u;
+  a->hi -= v_hi + (int)borrow;
+}
+
+/* acc += a*b   (full 64-bit mul-add via 16-bit split, INT64 NEVER used). */
+inline void fxp_acc_madd(fxp_acc *acc, int a, int b) {
+  int sign = ((a < 0) ^ (b < 0)) ? -1 : 1;
+  uint ua = (uint)((a < 0) ? -a : a);
+  uint ub = (uint)((b < 0) ? -b : b);
+
+  uint a_hi = ua >> 16, a_lo = ua & 0xFFFFu;
+  uint b_hi = ub >> 16, b_lo = ub & 0xFFFFu;
+
+  uint hh = a_hi * b_hi;
+  uint hl = a_hi * b_lo;
+  uint lh = a_lo * b_hi;
+  uint ll = a_lo * b_lo;
+
+  uint mid = hl + lh;
+  uint mid_carry_to_hi = (mid < hl) ? 1u : 0u;
+
+  uint lo_part = ll + (mid << 16);
+  uint lo_carry = (lo_part < ll) ? 1u : 0u;
+
+  uint hi_part = hh + (mid >> 16) + (mid_carry_to_hi << 16) + lo_carry;
+
+  if(sign < 0) {
+    lo_part = ~lo_part + 1u;
+    hi_part = ~hi_part + ((lo_part == 0u) ? 1u : 0u);
+  }
+
+  uint old_lo = acc->lo;
+  acc->lo = old_lo + lo_part;
+  uint add_carry = (acc->lo < old_lo) ? 1u : 0u;
+  acc->hi += (int)hi_part + (int)add_carry;
+}
+
+/* Convert acc -> fxp32 WITHOUT shifting (sum of Q-format additions). */
+inline fxp32 fxp_acc_extract_q20(const fxp_acc *acc) {
+  int expected_hi = ((int)acc->lo < 0) ? -1 : 0;
+  if(acc->hi != expected_hi) return (acc->hi < 0) ? FXP_MIN_INT : FXP_MAX_INT;
+  return (fxp32)acc->lo;
+}
+
+/* Convert acc -> fxp32 by >>FXP_FRAC and saturating (sum of products). */
+inline fxp32 fxp_acc_to_fxp32(const fxp_acc *acc) {
+  uint lo_shift = (acc->lo >> FXP_FRAC) | ((uint)acc->hi << (32 - FXP_FRAC));
+  int  hi_shift = acc->hi >> FXP_FRAC;       /* arithmetic shift */
+  int  expected_hi = ((int)lo_shift < 0) ? -1 : 0;
+  if(hi_shift != expected_hi) {
+    return (acc->hi < 0) ? FXP_MIN_INT : FXP_MAX_INT;
+  }
+  return (fxp32)lo_shift;
+}
+
+/* Forward decl. */
+inline fxp32 fxp_div_q20(fxp32 num, fxp32 den);
+
+/* fxp_acc_div_i32 — divide paired-int32 accumulator by an int divisor. */
+inline int fxp_acc_div_i32(const fxp_acc *acc, int div) {
+  if(div == 0) return (acc->hi < 0) ? FXP_MIN_INT : FXP_MAX_INT;
+  int sign = (((acc->hi < 0) ? 1 : 0) ^ ((div < 0) ? 1 : 0)) ? -1 : 1;
+
+  uint hi_abs, lo_abs;
+  if(acc->hi < 0) {
+    hi_abs = ~(uint)acc->hi;
+    lo_abs = ~acc->lo + 1u;
+    if(lo_abs == 0) hi_abs += 1;
+  } else {
+    hi_abs = (uint)acc->hi;
+    lo_abs = acc->lo;
+  }
+  uint div_abs = (div < 0) ? (~(uint)div + 1u) : (uint)div;
+
+  uint r = 0, q_hi = 0, q_lo = 0;
+  for(int i = 0; i < 64; i++) {
+    uint top = hi_abs >> 31;
+    hi_abs = (hi_abs << 1) | (lo_abs >> 31);
+    lo_abs = lo_abs << 1;
+    r = (r << 1) | top;
+    q_hi = (q_hi << 1) | (q_lo >> 31);
+    q_lo = q_lo << 1;
+    if(r >= div_abs) {
+      r -= div_abs;
+      q_lo |= 1u;
+    }
+  }
+  if(q_hi != 0 || q_lo > (uint)FXP_MAX_INT) {
+    return (sign < 0) ? FXP_MIN_INT : FXP_MAX_INT;
+  }
+  return (sign < 0) ? -(int)q_lo : (int)q_lo;
+}
+
+/* fxp_acc_div_acc — paired numerator / paired denominator -> Q11.20. */
+inline fxp32 fxp_acc_div_acc(const fxp_acc *num, const fxp_acc *den) {
+  fxp_acc na = *num, da = *den;
+  int sign = (((na.hi < 0) ? 1 : 0) ^ ((da.hi < 0) ? 1 : 0)) ? -1 : 1;
+  if(na.hi < 0) {
+    uint lo2 = ~na.lo + 1u;
+    na.hi = (int)(~(uint)na.hi + (lo2 == 0 ? 1 : 0));
+    na.lo = lo2;
+  }
+  if(da.hi < 0) {
+    uint lo2 = ~da.lo + 1u;
+    da.hi = (int)(~(uint)da.hi + (lo2 == 0 ? 1 : 0));
+    da.lo = lo2;
+  }
+  int k = 0;
+  while(k < 63) {
+    uint na_hi_u = (uint)na.hi;
+    uint da_hi_u = (uint)da.hi;
+    if(na_hi_u == 0 && da_hi_u == 0 &&
+       !(na.lo & 0x80000000u) && !(da.lo & 0x80000000u)) break;
+    na.lo = (na.lo >> 1) | ((uint)na.hi << 31);
+    na.hi = (int)((uint)na.hi >> 1);
+    da.lo = (da.lo >> 1) | ((uint)da.hi << 31);
+    da.hi = (int)((uint)da.hi >> 1);
+    k++;
+  }
+  int num_i = (int)na.lo;
+  int den_i = (int)da.lo;
+  if(den_i == 0) return (sign < 0) ? FXP_MIN_INT : FXP_MAX_INT;
+  fxp32 q = fxp_div_q20(num_i, den_i);
+  return (sign < 0) ? -q : q;
+}
+
+/* fxp_mul — Q11.20 multiplication with no INT64. */
+inline fxp32 fxp_mul(fxp32 a, fxp32 b) {
+  fxp_acc acc = fxp_acc_zero();
+  fxp_acc_madd(&acc, a, b);
+  return fxp_acc_to_fxp32(&acc);
+}
+
+/* Saturating add / sub. */
+inline fxp32 fxp_add_sat(fxp32 a, fxp32 b) {
+  fxp32 r = a + b;
+  if(((a ^ r) & (b ^ r)) < 0) return (a < 0) ? FXP_MIN_INT : FXP_MAX_INT;
+  return r;
+}
+
+inline fxp32 fxp_sub_sat(fxp32 a, fxp32 b) {
+  fxp32 r = a - b;
+  if(((a ^ b) & (a ^ r)) < 0) return (a < 0) ? FXP_MIN_INT : FXP_MAX_INT;
+  return r;
+}
+
+/* fxp_recip — reciprocal 1/x in Q11.20 (no INT64), Newton-Raphson.
+ * NOTE: needs fxp_mul only (no tables), so it lives in Stage A. */
+inline fxp32 fxp_recip(fxp32 x) {
+  if(x == 0) return FXP_MAX_INT;
+  int sign = (x < 0) ? -1 : 1;
+  fxp32 ax = (x < 0) ? -x : x;
+  int b = 0;
+  uint v = (uint)ax;
+  while(v >>= 1) b++;
+  int shift = 2 * FXP_FRAC - b - 1;
+  fxp32 r = (shift >= 0 && shift < 31) ? (1 << shift) : 1;
+  for(int it = 0; it < 6; it++) {
+    fxp32 xr = fxp_mul(ax, r);
+    fxp32 delta = (FXP_ONE << 1) - xr;
+    r = fxp_mul(r, delta);
+    if(r <= 0) r = 1;
+  }
+  return (sign < 0) ? -r : r;
+}
+
+/* fxp_div_q20 — Q11.20 division a/b skipping the 1/b intermediate. */
+inline fxp32 fxp_div_q20(fxp32 num, fxp32 den) {
+  if(den == 0) return (num >= 0) ? FXP_MAX_INT : -FXP_MAX_INT;
+  int sign = ((num < 0) ^ (den < 0)) ? -1 : 1;
+  uint num_abs = (num < 0) ? (~(uint)num + 1u) : (uint)num;
+  uint den_abs = (den < 0) ? (~(uint)den + 1u) : (uint)den;
+
+  uint hi = num_abs;
+  uint lo = 0;
+  uint r = 0, q = 0;
+  int overflow = 0;
+
+  for(int i = 0; i < 52; i++) {
+    uint top = hi >> 31;
+    hi = (hi << 1) | (lo >> 31);
+    lo = lo << 1;
+    r  = (r << 1) | top;
+    q  = q << 1;
+    if(r >= den_abs) { r -= den_abs; q |= 1u; }
+    if(i == 19 && q != 0) overflow = 1;
+  }
+
+  if(overflow || q > (uint)FXP_MAX_INT)
+    return (sign < 0) ? -FXP_MAX_INT : FXP_MAX_INT;
+  return (sign < 0) ? -(int)q : (int)q;
+}
+
+/* ------------------------------------------------------------------ */
+/* Median via partial selection sort (no tables).                      */
+/* ------------------------------------------------------------------ */
+inline fxp32 fxp_partial_selection_median(const fxp32 *arr, int n) {
+  fxp32 tmp[64];
+  if(n > 64) n = 64;
+  for(int i = 0; i < n; i++) {
+    tmp[i] = (arr[i] < 0) ? -arr[i] : arr[i];
+  }
+  const int target = n / 2;
+  for(int rank = 0; rank <= target; rank++) {
+    int min_idx = rank;
+    fxp32 min_val = tmp[rank];
+    for(int j = rank + 1; j < n; j++) {
+      if(tmp[j] < min_val) { min_val = tmp[j]; min_idx = j; }
+    }
+    if(min_idx != rank) {
+      fxp32 t = tmp[rank];
+      tmp[rank] = tmp[min_idx];
+      tmp[min_idx] = t;
+    }
+  }
+  return tmp[target];
+}
+
+/* ------------------------------------------------------------------ */
+/* WHT 8x8 forward (no tables).                                        */
+/* ------------------------------------------------------------------ */
+#define FXP_GALOSH_BLOCK_SIZE   8
+#define FXP_GALOSH_BLOCK_PIXELS 64
+
+inline void fxp_wht8(fxp32 *x) {
+  fxp32 t0, t1;
+  t0 = x[0] + x[1]; t1 = x[0] - x[1]; x[0] = t0; x[1] = t1;
+  t0 = x[2] + x[3]; t1 = x[2] - x[3]; x[2] = t0; x[3] = t1;
+  t0 = x[4] + x[5]; t1 = x[4] - x[5]; x[4] = t0; x[5] = t1;
+  t0 = x[6] + x[7]; t1 = x[6] - x[7]; x[6] = t0; x[7] = t1;
+  t0 = x[0] + x[2]; t1 = x[0] - x[2]; x[0] = t0; x[2] = t1;
+  t0 = x[1] + x[3]; t1 = x[1] - x[3]; x[1] = t0; x[3] = t1;
+  t0 = x[4] + x[6]; t1 = x[4] - x[6]; x[4] = t0; x[6] = t1;
+  t0 = x[5] + x[7]; t1 = x[5] - x[7]; x[5] = t0; x[7] = t1;
+  t0 = x[0] + x[4]; t1 = x[0] - x[4]; x[0] = t0; x[4] = t1;
+  t0 = x[1] + x[5]; t1 = x[1] - x[5]; x[1] = t0; x[5] = t1;
+  t0 = x[2] + x[6]; t1 = x[2] - x[6]; x[2] = t0; x[6] = t1;
+  t0 = x[3] + x[7]; t1 = x[3] - x[7]; x[3] = t0; x[7] = t1;
+}
+
+inline void fxp_wht2d_8x8(fxp32 *block, int normalize) {
+  for(int r = 0; r < 8; r++) fxp_wht8(block + r * 8);
+  for(int c = 0; c < 8; c++) {
+    fxp32 col[8];
+    for(int r = 0; r < 8; r++) col[r] = block[r * 8 + c];
+    fxp_wht8(col);
+    for(int r = 0; r < 8; r++) block[r * 8 + c] = col[r];
+  }
+  if(normalize) {
+    for(int i = 0; i < 64; i++) block[i] >>= 6;
+  }
+}
+
+#endif  /* GALOSH_INT_CLH */
