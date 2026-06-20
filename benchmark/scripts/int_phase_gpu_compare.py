@@ -19,6 +19,8 @@ SUBENV["PATH"] = r"C:\msys64\ucrt64\bin;" + SUBENV.get("PATH", "")
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
+PHASE_FILE = {1: "p1_ingat.bin", 2: "p2_ingat.bin", 3: "p3_lcs.bin"}
+
 GALOSH   = Path(r"C:\Users\luxgrain\GALOSH")
 CPU_EXE  = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 GPU_EXE  = GALOSH / "standalone" / "galosh_int_pipe_test.exe"
@@ -70,7 +72,7 @@ def main():
         gpu_b = TMP / f"s{si}_p{pi}_gpu.bin"
         noisy.astype(np.float32).tofile(str(in_p))
         c = run_cpu(in_p, out_p, w, h, ph)
-        cpu_b = TMP / f"p{ph}_ingat.bin"
+        cpu_b = TMP / PHASE_FILE.get(ph, f"p{ph}_ingat.bin")
         g = run_gpu(in_p, w, h, ph, gpu_b)
         if c is None or g is None or not cpu_b.exists() or not gpu_b.exists():
             n_fail += 1; print(f"  s{si}_p{pi}: FAIL (cpu={c} gpu={g})")

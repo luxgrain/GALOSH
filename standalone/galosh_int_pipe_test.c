@@ -100,8 +100,8 @@ int main(int argc, char **argv) {
 
   const char *files[] = { "galosh_int.clh", "galosh_int_tbl.clh", "galosh_int_p0.clh",
                           "galosh_int_p1.clh", "galosh_int_p0.cl", "galosh_int_p1.cl",
-                          "galosh_int_p2.cl" };
-  const int nfiles = 7;
+                          "galosh_int_p2.cl", "galosh_int_p3.cl" };
+  const int nfiles = 8;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -193,18 +193,32 @@ int main(int argc, char **argv) {
     clFinish(queue);
   }
 
-  /* ---- dump working in_gat after <phase> ---- */
-  int32_t *gat = malloc(npix * 4);
-  clEnqueueReadBuffer(queue, b_gat, CL_TRUE, 0, npix * 4, gat, 0, NULL, NULL);
+  /* ---- P3: forward L (stride-1 WHT) -> L_cs ---- */
+  cl_mem b_lcs = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
+  if(phase >= 3) {
+    cl_kernel kl = mkkern("k_p3_forward_l");
+    setm(kl,0,&b_gat); setm(kl,1,&b_lcs); seti(kl,2,width); seti(kl,3,height);
+    run1(kl, npix);
+  }
+
+  /* ---- dump the phase-output buffer (L_cs for phase>=3, else in_gat) ---- */
+  cl_mem dump_target = (phase >= 3) ? b_lcs : b_gat;
+  int32_t *buf = malloc(npix * 4);
+  clEnqueueReadBuffer(queue, dump_target, CL_TRUE, 0, npix * 4, buf, 0, NULL, NULL);
   clFinish(queue);
   FILE *fo = fopen(out_path, "wb");
-  if(fo) { fwrite(gat, 4, npix, fo); fclose(fo); }
+  if(fo) { fwrite(buf, 4, npix, fo); fclose(fo); }
 
   if(phase == 1)
     printf("P1_RAW unified_sigma=%d sigma_ch=%d,%d,%d,%d\n",
            unified, sig_ch[0], sig_ch[1], sig_ch[2], sig_ch[3]);
   else if(phase == 2)
     printf("P2_RAW ch_dark_ref=%d,%d,%d,%d\n", ch_ref[0], ch_ref[1], ch_ref[2], ch_ref[3]);
+  else if(phase == 3) {
+    int32_t lo = 0x7FFFFFFF, hi = (int32_t)0x80000000;
+    for(size_t i = 0; i < npix; i++) { if(buf[i] < lo) lo = buf[i]; if(buf[i] > hi) hi = buf[i]; }
+    printf("P3_RAW lo=%d hi=%d\n", lo, hi);
+  }
   fprintf(stderr, "[gpu] alpha=%d sigma=%d uni=%d phase=%d\n", alpha, sigma, unified, phase);
   return 0;
 }

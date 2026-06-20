@@ -2440,6 +2440,16 @@ int main(int argc, char **argv) {
       fclose(df);
     }
   }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/p3_lcs.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) { fwrite(L_cs_q20, sizeof(fxp32), npixels, df); fclose(df); }
+      fprintf(stderr, "  P3_RAW lo=%d hi=%d\n", lo, hi);
+    }
+  }
 
   /* ========== Phase 4: half-res chroma extraction ========== */
   const int halfwidth  = (width  + 1) / 2;
