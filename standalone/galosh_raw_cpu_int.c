@@ -2518,6 +2518,20 @@ int main(int argc, char **argv) {
       fclose(df);
     }
   }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024]; snprintf(path, sizeof(path), "%s/p5_pilot.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) { fwrite(L_cs_pilot_q20, sizeof(fxp32), npixels, df); fclose(df); }
+      fxp32 plo = FXP_MAX_INT, phi = FXP_MIN_INT;
+      for(size_t i = 0; i < npixels; i++) {
+        if(L_cs_pilot_q20[i] < plo) plo = L_cs_pilot_q20[i];
+        if(L_cs_pilot_q20[i] > phi) phi = L_cs_pilot_q20[i];
+      }
+      fprintf(stderr, "  P5PILOT_RAW lo=%d hi=%d\n", plo, phi);
+    }
+  }
   phase5_pass2_blocked(L_cs_q20, L_cs_pilot_q20, L_cs_den_q20,
                        width, height, luma_str_q20, wiener_floor_q20);
   double dt5 = (double)(clock() - tp5) / CLOCKS_PER_SEC;
@@ -2537,6 +2551,15 @@ int main(int argc, char **argv) {
         fwrite(&v, sizeof(float), 1, df);
       }
       fclose(df);
+    }
+  }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024]; snprintf(path, sizeof(path), "%s/p5_den.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) { fwrite(L_cs_den_q20, sizeof(fxp32), npixels, df); fclose(df); }
+      fprintf(stderr, "  P5_RAW lo=%d hi=%d\n", d_lo, d_hi);
     }
   }
 

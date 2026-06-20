@@ -32,6 +32,7 @@ int   fxp_factorial_log_initialized = 0;
 typedef struct { int32_t var_scale_combined, sat_threshold, huber_factor_q,
                          dark_offset_002, alpha_init; } host_p0_consts;
 typedef struct { int32_t ln2_q20; int32_t exp_neg_pow2[17]; int32_t factorial_log[400]; } host_tables;
+typedef struct { int32_t sigma_sq, lambda_max_unorm, inv_06745, sigma_sq_x64, wiener_floor; } host_p5_consts;
 
 static char *load_file(const char *p, size_t *l) {
   FILE *f = fopen(p, "rb"); if(!f) return NULL;
@@ -99,9 +100,10 @@ int main(int argc, char **argv) {
   queue = clCreateCommandQueue(ctx, device, 0, &err); CLCHK(err, "q");
 
   const char *files[] = { "galosh_int.clh", "galosh_int_tbl.clh", "galosh_int_p0.clh",
-                          "galosh_int_p1.clh", "galosh_int_p0.cl", "galosh_int_p1.cl",
-                          "galosh_int_p2.cl", "galosh_int_p3.cl", "galosh_int_p4.cl" };
-  const int nfiles = 9;
+                          "galosh_int_p1.clh", "galosh_int_p5.clh",
+                          "galosh_int_p0.cl", "galosh_int_p1.cl", "galosh_int_p2.cl",
+                          "galosh_int_p3.cl", "galosh_int_p4.cl", "galosh_int_p5.cl" };
+  const int nfiles = 11;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -221,6 +223,40 @@ int main(int argc, char **argv) {
     if(fo) { fwrite(cbuf, 4, chsize * 3, fo); fclose(fo); }
     printf("P4_RAW n=%d\n", (int)chsize);
     fprintf(stderr, "[gpu] alpha=%d sigma=%d uni=%d phase=4\n", alpha, sigma, unified);
+    return 0;
+  }
+
+  /* ---- P5: BayesShrink pilot + Wiener (pixel-parallel gather) ---- */
+  if(phase >= 5) {
+    fxp_kaiser_init();
+    int32_t kaiser[64]; memcpy(kaiser, fxp_kaiser_2d, sizeof kaiser);
+    cl_mem b_kai = mkbuf(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 64 * 4, kaiser);
+    int32_t ss = fxp_from_float(1.0f);   /* luma_str = 1.0 (bench argv[7] default) */
+    host_p5_consts P5;
+    P5.sigma_sq = fxp_mul(ss, ss);
+    P5.lambda_max_unorm = fxp_mul(fxp_mul(ss, fxp_from_float(2.8838f)), 8 * FXP_ONE);
+    P5.inv_06745 = fxp_from_float(1.0f / 0.6745f);
+    P5.sigma_sq_x64 = fxp_mul(ss, ss) * 64;
+    P5.wiener_floor = FXP_ONE / 8;
+    cl_mem b_P5 = mkbuf(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof P5, &P5);
+    cl_mem b_pilot = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
+    cl_mem b_lden = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
+    cl_kernel kp1 = mkkern("k_p5_pass1");
+    setm(kp1,0,&b_lcs); setm(kp1,1,&b_pilot); seti(kp1,2,width); seti(kp1,3,height);
+    setm(kp1,4,&b_T); setm(kp1,5,&b_kai); setm(kp1,6,&b_P5);
+    run1(kp1, npix);
+    cl_kernel kp2 = mkkern("k_p5_pass2");
+    setm(kp2,0,&b_lcs); setm(kp2,1,&b_pilot); setm(kp2,2,&b_lden);
+    seti(kp2,3,width); seti(kp2,4,height); setm(kp2,5,&b_kai); setm(kp2,6,&b_P5);
+    run1(kp2, npix);
+    int32_t *pbuf = malloc(npix * 4);
+    clEnqueueReadBuffer(queue, b_lden, CL_TRUE, 0, npix * 4, pbuf, 0, NULL, NULL);
+    clFinish(queue);
+    FILE *pf = fopen(out_path, "wb"); if(pf) { fwrite(pbuf, 4, npix, pf); fclose(pf); }
+    int32_t lo = 0x7FFFFFFF, hi = (int32_t)0x80000000;
+    for(size_t i = 0; i < npix; i++) { if(pbuf[i] < lo) lo = pbuf[i]; if(pbuf[i] > hi) hi = pbuf[i]; }
+    printf("P5_RAW lo=%d hi=%d\n", lo, hi);
+    fprintf(stderr, "[gpu] phase=5 done\n");
     return 0;
   }
 
