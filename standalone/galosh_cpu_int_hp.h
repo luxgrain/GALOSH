@@ -667,9 +667,11 @@ static inline void fxp_wht8(fxp32 *x) {
   t0 = x[1] + x[5]; t1 = x[1] - x[5]; x[1] = t0; x[5] = t1;
   t0 = x[2] + x[6]; t1 = x[2] - x[6]; x[2] = t0; x[6] = t1;
   t0 = x[3] + x[7]; t1 = x[3] - x[7]; x[3] = t0; x[7] = t1;
-#ifdef HP_CLAMP_REAL
+#if defined(HP_CLAMP_REAL) && !defined(HP_WHT_WIDE)
   /* Diagnostic: simulate int32 ±range on WHT coefs (raw add path, bypasses
-   * _sat128) to test whether the int32 gap is WHT-coefficient range overflow. */
+   * _sat128) to test whether the int32 gap is WHT-coefficient range overflow.
+   * Define HP_WHT_WIDE to EXCLUDE the WHT from the clamp (= "WHT wide, rest
+   * narrow" → tests whether widening only the WHT recovers the luma gap). */
   { const fxp32 _lim = (fxp32)HP_CLAMP_REAL << FXP_FRAC;
     for(int _i = 0; _i < 8; _i++) {
       if(x[_i] >  _lim) x[_i] =  _lim; else if(x[_i] < -_lim) x[_i] = -_lim; } }

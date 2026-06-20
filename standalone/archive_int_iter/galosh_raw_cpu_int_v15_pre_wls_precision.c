@@ -589,19 +589,10 @@ static void wls_centered_pass(const fxp32 *bin_mean_arr,
     }
     fxp32 xc = bin_mean_arr[b] - mean_x;
     fxp32 yc = bin_var_arr[b] - mean_y;
-    /* Fix 2026-06-09 (super-clean tiny-α WLS slope): accumulate the centred
-     * cross / square products WITHOUT the intermediate Q11.20 truncation.
-     * For super-clean content the variance-vs-mean deviation yc is tiny
-     * (~5e-4) so the cross-product xc·yc ≈ 5e-6 — fxp_mul(xc,yc) keeps only
-     * ~2-3 significant bits, collapsing Sxy_c and halving the regression
-     * slope (α came out 6e-6 vs FP32 1.3e-5 on sewingmachine).  fxp_acc_madd
-     * keeps the full Q40 raw product; div_acc divides the two Q40 sums (same
-     * scale) → correct slope.  This is stats-engine precision (per-image,
-     * not the per-pixel MAC) so wider intermediate is ISP-faithful.
-     * 超クリーンで分散偏差の積が極小 → fxp_mul truncate で slope 半減のバグ修正。 */
-    fxp32 w_xc = fxp_mul(w_q, xc);
-    fxp_acc_madd(&Sxx_c_acc, w_xc, xc);   /* (w·xc)·xc — no xc² truncation */
-    fxp_acc_madd(&Sxy_c_acc, w_xc, yc);   /* (w·xc)·yc — no xc·yc truncation */
+    fxp32 xc_sq = fxp_mul(xc, xc);
+    fxp32 xc_yc = fxp_mul(xc, yc);
+    fxp_acc_add_i32(&Sxx_c_acc, fxp_mul(w_q, xc_sq));
+    fxp_acc_add_i32(&Sxy_c_acc, fxp_mul(w_q, xc_yc));
   }
 
   fxp32 alpha_est = alpha_in, sigma_sq_est = sigma_sq_in;

@@ -32,10 +32,10 @@ RAWNIND = Path(r"E:\rawnind_bench")
 TMP = GALOSH / "benchmark" / "results" / "int_short_bench_tmp"
 TMP.mkdir(parents=True, exist_ok=True)
 
-# canonical baseline (2026-06-07: after chroma-recip + guided-filter two-pass fixes)
+# canonical baseline (2026-06-09: after chroma-recip + guided-filter two-pass + WLS-precision fixes)
 BASELINE = {
-    "SIDD_val_full_1280": 49.131,
-    "RawNIND_full_1493": 29.815,
+    "SIDD_val_full_1280": 49.396,
+    "RawNIND_full_1493": 29.904,
 }
 
 SEED = 42

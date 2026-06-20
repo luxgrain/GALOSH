@@ -54,6 +54,41 @@ static inline void mt(int s, const char *nm, fxp32 v) {
 #define MT(s, nm, v)
 #endif
 
+/* LUMA_FRAC: Phase B probe — round luma line buffers to N fractional bits
+ * (round-to-nearest) to simulate an INT16 Q(int).N line buffer while compute
+ * stays int64.  Sweep N to find the luma data-path precision actually needed. */
+#ifdef LUMA_FRAC
+static inline void qluma(fxp32 *buf, size_t n) {
+  const int sh = FXP_FRAC - (LUMA_FRAC);
+  if(sh <= 0) return;
+  const fxp32 half = (fxp32)1 << (sh - 1);
+  for(size_t i = 0; i < n; i++) {
+    fxp32 v = buf[i];
+    buf[i] = (v >= 0) ? (((v + half) >> sh) << sh)
+                      : -((((-v) + half) >> sh) << sh);
+  }
+}
+#define QLUMA(b,n) qluma((b),(n))
+#else
+#define QLUMA(b,n)
+#endif
+
+#ifdef CHROMA_FRAC
+static inline void qchroma(fxp32 *buf, size_t n) {
+  const int sh = FXP_FRAC - (CHROMA_FRAC);
+  if(sh <= 0) return;
+  const fxp32 half = (fxp32)1 << (sh - 1);
+  for(size_t i = 0; i < n; i++) {
+    fxp32 v = buf[i];
+    buf[i] = (v >= 0) ? (((v + half) >> sh) << sh)
+                      : -((((-v) + half) >> sh) << sh);
+  }
+}
+#define QCHROMA(b,n) qchroma((b),(n))
+#else
+#define QCHROMA(b,n)
+#endif
+
 /* External LUT storage (declared in galosh_cpu_int.h).  Initialised once at
  * startup via INT-only Taylor / Mercator computations.
  *
@@ -620,6 +655,12 @@ static void wls_centered_pass(const fxp32 *bin_mean_arr,
    * on small Sxx_c.  See fxp_acc_div_acc doc-comment. */
   if(Sxx_c_acc > 0) {   /* HP: __int128 (was paired-int32 hi/lo check) */
     fxp32 new_alpha = fxp_acc_div_acc(&Sxy_c_acc, &Sxx_c_acc);
+    if(getenv("WLS_DBG")) {
+      double sxy = (double)Sxy_c_acc, sxx = (double)Sxx_c_acc;
+      fprintf(stderr, "  [wls-HP] mx=%.6f my=%.8f | slope(Sxy/Sxx)=%.4e  alpha(real)=%.4e\n",
+              fxp_to_float(mean_x), fxp_to_float(mean_y),
+              (sxx != 0.0) ? (sxy / sxx) : 0.0, fxp_to_float(new_alpha));
+    }
     if(new_alpha > 0) alpha_est = new_alpha;
   }
   fxp32 new_sigma = mean_y - fxp_mul(alpha_est, mean_x);
@@ -643,6 +684,12 @@ static void phase0c_wls_solve(const fxp32 *bin_mean_arr,
    * (= plain WLS); iter 1-4 use huber_k = 1.345 · MAD(residuals) / 0.6745. */
   fxp32 alpha_est = fxp_from_float(1e-4f);
   fxp32 sigma_sq_est = 1;
+  if(getenv("BIN_DBG")) {
+    for(int b = 0; b < n_total_bins; b++)
+      if(bin_valid[b])
+        fprintf(stderr, "  [bin %2d] mean=%.6f var=%.8e cnt=%d\n",
+                b, fxp_to_float(bin_mean_arr[b]), fxp_to_float(bin_var_arr[b]), bin_cnt_arr[b]);
+  }
 
   /* CENTERED-FORMULATION WLS (avoids cancellation in normal equations) +
    * 5-iter Huber re-weighting (= matches FP32 reference).
@@ -2430,6 +2477,7 @@ int main(int argc, char **argv) {
   clock_t tp4 = clock();
   phase4_chroma_halfres(out_q20, C1_h_q20, C2_h_q20, C3_h_q20,
                         width, height, halfwidth, halfheight);
+  QCHROMA(C1_h_q20, chsize); QCHROMA(C2_h_q20, chsize); QCHROMA(C3_h_q20, chsize);
   double dt4 = (double)(clock() - tp4) / CLOCKS_PER_SEC;
   fprintf(stderr, "  Phase 4 chroma extract (%.3f s): C1/2/3 half-res %dx%d\n",
           dt4, halfwidth, halfheight);
@@ -2457,7 +2505,9 @@ int main(int argc, char **argv) {
   fxp32 luma_str_q20 = fxp_from_float(luma_str);
   fxp32 wiener_floor_q20 = FXP_ONE / 8;     /* 1/B = 1/8 */
   clock_t tp5 = clock();
+  QLUMA(L_cs_q20, npixels);          /* luma line buffer (Phase 3 out) as INT16 */
   phase5_pass1_blocked(L_cs_q20, L_cs_pilot_q20, width, height, luma_str_q20);
+  QLUMA(L_cs_pilot_q20, npixels);    /* pilot line buffer as INT16 */
   if(dump_dir) {
     char path[1024]; snprintf(path, sizeof(path), "%s/p5_pilot.bin", dump_dir);
     FILE *df = fopen(path, "wb");
@@ -2471,6 +2521,7 @@ int main(int argc, char **argv) {
   }
   phase5_pass2_blocked(L_cs_q20, L_cs_pilot_q20, L_cs_den_q20,
                        width, height, luma_str_q20, wiener_floor_q20);
+  QLUMA(L_cs_den_q20, npixels);      /* denoised luma line buffer as INT16 */
   double dt5 = (double)(clock() - tp5) / CLOCKS_PER_SEC;
   fxp32 d_lo = FXP_MAX_INT, d_hi = FXP_MIN_INT;
   for(size_t i = 0; i < npixels; i++) {
@@ -2502,6 +2553,8 @@ int main(int argc, char **argv) {
   clock_t tp6 = clock();
   phase6_l_pixel(L_cs_den_q20, L_pixel_q20, width, height);
   phase6_l_h_den(L_cs_den_q20, L_h_den_q20, width, height, halfwidth, halfheight);
+  QLUMA(L_pixel_q20, npixels);       /* luma pixel-domain line buffer as INT16 */
+  QLUMA(L_h_den_q20, chsize);        /* luma half-res line buffer as INT16 */
   double dt6 = (double)(clock() - tp6) / CLOCKS_PER_SEC;
   fprintf(stderr, "  Phase 6 L_pixel + L_h_den (%.3f s)\n", dt6);
   if(dump_dir) {
@@ -2705,6 +2758,7 @@ int main(int argc, char **argv) {
   fxp_k16_jinc_upsample(C1_h_den_q20, C2_h_den_q20, C3_h_den_q20, L_pixel_q20,
                         C1_aligned_q20, C2_aligned_q20, C3_aligned_q20,
                         halfwidth, halfheight, inv_2sigma_sq_k16);
+  QCHROMA(C1_aligned_q20, npixels); QCHROMA(C2_aligned_q20, npixels); QCHROMA(C3_aligned_q20, npixels);
   double dt9 = (double)(clock() - tp9) / CLOCKS_PER_SEC;
   fprintf(stderr, "  Phase 9 K16 upsample → full-res (%.3f s)\n", dt9);
   if(dump_dir) {
