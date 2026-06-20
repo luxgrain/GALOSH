@@ -19,7 +19,7 @@ SUBENV["PATH"] = r"C:\msys64\ucrt64\bin;" + SUBENV.get("PATH", "")
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
-PHASE_FILE = {1: "p1_ingat.bin", 2: "p2_ingat.bin", 3: "p3_lcs.bin"}
+PHASE_FILE = {1: "p1_ingat.bin", 2: "p2_ingat.bin", 3: "p3_lcs.bin", 4: "p4_chroma.bin"}
 
 GALOSH   = Path(r"C:\Users\luxgrain\GALOSH")
 CPU_EXE  = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"

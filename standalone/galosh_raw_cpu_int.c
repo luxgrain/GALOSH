@@ -2483,6 +2483,21 @@ int main(int argc, char **argv) {
       }
     }
   }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/p4_chroma.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) {
+        fwrite(C1_h_q20, sizeof(fxp32), chsize, df);
+        fwrite(C2_h_q20, sizeof(fxp32), chsize, df);
+        fwrite(C3_h_q20, sizeof(fxp32), chsize, df);
+        fclose(df);
+      }
+      fprintf(stderr, "  P4_RAW n=%d\n", (int)chsize);
+    }
+  }
 
   /* ========== Phase 5: BayesShrink Pass1 (pilot) + Pass2 (Wiener) ========== */
   fxp32 *L_cs_pilot_q20 = (fxp32 *)malloc(npixels * sizeof(fxp32));

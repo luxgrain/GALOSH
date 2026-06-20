@@ -100,8 +100,8 @@ int main(int argc, char **argv) {
 
   const char *files[] = { "galosh_int.clh", "galosh_int_tbl.clh", "galosh_int_p0.clh",
                           "galosh_int_p1.clh", "galosh_int_p0.cl", "galosh_int_p1.cl",
-                          "galosh_int_p2.cl", "galosh_int_p3.cl" };
-  const int nfiles = 8;
+                          "galosh_int_p2.cl", "galosh_int_p3.cl", "galosh_int_p4.cl" };
+  const int nfiles = 9;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -201,7 +201,30 @@ int main(int argc, char **argv) {
     run1(kl, npix);
   }
 
-  /* ---- dump the phase-output buffer (L_cs for phase>=3, else in_gat) ---- */
+  /* ---- P4: half-res chroma (parallel; consumes P2 in_gat, not L_cs) ---- */
+  if(phase == 4) {
+    int halfw = (width + 1) / 2, halfh = (height + 1) / 2;
+    size_t chsize = (size_t)halfw * halfh;
+    cl_mem b_c1 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_mem b_c2 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_mem b_c3 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_kernel kc = mkkern("k_p4_chroma_halfres");
+    setm(kc,0,&b_gat); setm(kc,1,&b_c1); setm(kc,2,&b_c2); setm(kc,3,&b_c3);
+    seti(kc,4,width); seti(kc,5,height); seti(kc,6,halfw); seti(kc,7,halfh);
+    run1(kc, chsize);
+    int32_t *cbuf = malloc(chsize * 4 * 3);
+    clEnqueueReadBuffer(queue, b_c1, CL_TRUE, 0, chsize*4, cbuf, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, b_c2, CL_TRUE, 0, chsize*4, cbuf + chsize, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, b_c3, CL_TRUE, 0, chsize*4, cbuf + 2*chsize, 0, NULL, NULL);
+    clFinish(queue);
+    FILE *fo = fopen(out_path, "wb");
+    if(fo) { fwrite(cbuf, 4, chsize * 3, fo); fclose(fo); }
+    printf("P4_RAW n=%d\n", (int)chsize);
+    fprintf(stderr, "[gpu] alpha=%d sigma=%d uni=%d phase=4\n", alpha, sigma, unified);
+    return 0;
+  }
+
+  /* ---- dump the phase-output buffer (L_cs for phase==3, else in_gat) ---- */
   cl_mem dump_target = (phase >= 3) ? b_lcs : b_gat;
   int32_t *buf = malloc(npix * 4);
   clEnqueueReadBuffer(queue, dump_target, CL_TRUE, 0, npix * 4, buf, 0, NULL, NULL);
