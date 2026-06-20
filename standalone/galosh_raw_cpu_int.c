@@ -2401,6 +2401,17 @@ int main(int argc, char **argv) {
           dt2,
           fxp_to_float(ch_dark_ref[0]), fxp_to_float(ch_dark_ref[1]),
           fxp_to_float(ch_dark_ref[2]), fxp_to_float(ch_dark_ref[3]));
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/p2_ingat.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) { fwrite(out_q20, sizeof(fxp32), npixels, df); fclose(df); }
+      fprintf(stderr, "  P2_RAW ch_dark_ref=%d,%d,%d,%d\n",
+              ch_dark_ref[0], ch_dark_ref[1], ch_dark_ref[2], ch_dark_ref[3]);
+    }
+  }
 
   /* ========== Phase 3: forward L stride=1 cycle-spinning WHT ========== */
   fxp32 *L_cs_q20 = (fxp32 *)malloc(npixels * sizeof(fxp32));
