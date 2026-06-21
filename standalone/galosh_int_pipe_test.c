@@ -85,6 +85,54 @@ static void p7_k16(cl_mem i1, cl_mem i2, cl_mem i3, cl_mem g,
   run1(k,n); clReleaseKernel(k);
 }
 
+/* Foi-exact inverse GAT LUT builder (host) — verbatim port of
+ * fxp_gat_build_inverse_table; fills a caller table.  Uploaded to the P10
+ * kernel as __constant.  Uses galosh_cpu_int.h primitives. */
+static void build_foi_lut(const fxp_gat_params *gat_p, fxp_gat_inv_table_t *tbl) {
+  if(gat_p->alpha < fxp_from_float(1e-4f)) { tbl->valid = 0; return; }
+  fxp_factorial_log_init();
+  fxp32 sqrt2_sigma = fxp_mul(FXP_SQRT2_Q20, gat_p->sigma_raw);
+  fxp32 z_table[8];
+  for(int g = 0; g < 8; g++) z_table[g] = fxp_mul(sqrt2_sigma, fxp_gh_nodes_q20[g + 1]);
+  for(int i = 0; i < FXP_GAT_INV_TABLE_SIZE; i++) {
+    fxp_acc xtmp = fxp_acc_zero();
+    fxp_acc_madd(&xtmp, i, FXP_ONE);
+    fxp32 x_val = fxp_acc_div_i32(&xtmp, FXP_GAT_INV_TABLE_SIZE - 1);
+    fxp32 alpha_safe = (gat_p->alpha < 1) ? 1 : gat_p->alpha;
+    fxp32 lambda = fxp_div_q20(x_val, alpha_safe);
+    int lambda_int = lambda >> FXP_FRAC;
+    fxp32 sqrt_lambda = (lambda > 0) ? fxp_sqrt(lambda) : 0;
+    int sqrt_lambda_int = sqrt_lambda >> FXP_FRAC;
+    int k_max = lambda_int + 6 * sqrt_lambda_int + 10;
+    fxp_acc expected_gat = fxp_acc_zero();
+    const fxp32 break_thresh = fxp_from_float(-16.0f);
+    for(int k = 0; k <= k_max; k++) {
+      fxp32 log_prob = fxp_poisson_log_pdf(lambda, k);
+      if(log_prob < break_thresh && k > lambda_int + 1) break;
+      fxp32 prob = fxp_exp(log_prob);
+      if(prob <= 0) continue;
+      fxp_acc eg_acc = fxp_acc_zero();
+      fxp32 k_alpha = (fxp32)k * gat_p->alpha;
+      for(int g = 0; g < 8; g++) {
+        fxp32 noisy_y = k_alpha + z_table[g];
+        fxp32 T = fxp_gat_forward(noisy_y, gat_p);
+        fxp_acc_madd(&eg_acc, fxp_gh_weights_q20[g + 1], T);
+      }
+      fxp32 eg_q = fxp_mul(FXP_INV_SQRT_PI_Q20, fxp_acc_to_fxp32(&eg_acc));
+      fxp_acc_madd(&expected_gat, prob, eg_q);
+    }
+    tbl->d[i] = fxp_acc_to_fxp32(&expected_gat);
+    tbl->x[i] = x_val;
+  }
+  tbl->d_min = tbl->d[0];
+  tbl->d_max = tbl->d[FXP_GAT_INV_TABLE_SIZE - 1];
+  tbl->alpha = gat_p->alpha;
+  tbl->sigma_raw = gat_p->sigma_raw;
+  tbl->y_break = gat_p->y_break;
+  tbl->t_break = gat_p->t_break;
+  tbl->valid = 1;
+}
+
 int main(int argc, char **argv) {
   if(argc < 6) { fprintf(stderr, "usage: %s <in.bin> <w> <h> <phase> <out.bin> [dev]\n", argv[0]); return 1; }
   const char *in_path = argv[1];
@@ -128,10 +176,12 @@ int main(int argc, char **argv) {
 
   const char *files[] = { "galosh_int.clh", "galosh_int_tbl.clh", "galosh_int_p0.clh",
                           "galosh_int_p1.clh", "galosh_int_p5.clh", "galosh_int_p7.clh",
+                          "galosh_int_p10.clh",
                           "galosh_int_p0.cl", "galosh_int_p1.cl", "galosh_int_p2.cl",
                           "galosh_int_p3.cl", "galosh_int_p4.cl", "galosh_int_p5.cl",
-                          "galosh_int_p6.cl", "galosh_int_p7.cl" };
-  const int nfiles = 14;
+                          "galosh_int_p6.cl", "galosh_int_p7.cl", "galosh_int_p8.cl",
+                          "galosh_int_p10.cl" };
+  const int nfiles = 17;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -312,10 +362,10 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  /* ---- P7 (full): 3-scale chroma pyramid LOESS + K16 jinc upsample ----
+  /* ---- P7..P10 (full chroma tail) ----
    * Prereqs computed inline: chroma @half (P2 in_gat) + L_h_den (P5 L_cs_den).
-   * Output = the 3 half-res chroma estimates C_loess_h | C_q_up | C_e_up. */
-  if(phase == 7) {
+   * P7 -> 3 half-res estimates; P8 smoothstep; P9 K16 to full-res; P10 inverse. */
+  if(phase >= 7) {
     int halfw = (width + 1) / 2, halfh = (height + 1) / 2;
     int cqw = halfw / 2, cqh = halfh / 2, cew = cqw / 2, ceh = cqh / 2;
     size_t chs = (size_t)halfw * halfh, cqs = (size_t)cqw * cqh, ces = (size_t)cew * ceh;
@@ -358,13 +408,79 @@ int main(int argc, char **argv) {
     cl_mem c1eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
     p7_k16(c1eq, c2eq, c3eq, lhden, c1eup, c2eup, c3eup, cqw, cqh, inv2s_k16, b_T, chs);
 
-    cl_mem outs[9] = { c1lh, c2lh, c3lh, c1qup, c2qup, c3qup, c1eup, c2eup, c3eup };
-    int32_t *o7 = malloc(chs * 4 * 9);
-    for(int k = 0; k < 9; k++)
-      clEnqueueReadBuffer(queue, outs[k], CL_TRUE, 0, chs*4, o7 + (size_t)k*chs, 0, NULL, NULL);
+    if(phase == 7) {
+      cl_mem outs[9] = { c1lh, c2lh, c3lh, c1qup, c2qup, c3qup, c1eup, c2eup, c3eup };
+      int32_t *o7 = malloc(chs * 4 * 9);
+      for(int k = 0; k < 9; k++)
+        clEnqueueReadBuffer(queue, outs[k], CL_TRUE, 0, chs*4, o7 + (size_t)k*chs, 0, NULL, NULL);
+      clFinish(queue);
+      FILE *fo7 = fopen(out_path, "wb"); if(fo7) { fwrite(o7, 4, chs*9, fo7); fclose(fo7); }
+      printf("P7_RAW chs=%d\n", (int)chs);
+      return 0;
+    }
+
+    /* ---- P8: smoothstep blend (chroma_str=1.0 -> segment 0: A=C_h, B=C_loess_h) ---- */
+    int t_raw = fxp_from_float(1.0f);          /* chroma_str = 1.0 -> t_raw = s_q */
+    int t_sq = fxp_mul(t_raw, t_raw);
+    int t8 = fxp_mul(t_sq, 3 * FXP_ONE - (t_raw << 1));
+    int oneMt = FXP_ONE - t8;
+    cl_mem h1 = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), h2 = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), h3 = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
+    { cl_kernel k8 = mkkern("k_p8_smoothstep");
+      setm(k8,0,&c1h); setm(k8,1,&c2h); setm(k8,2,&c3h);
+      setm(k8,3,&c1lh); setm(k8,4,&c2lh); setm(k8,5,&c3lh);
+      setm(k8,6,&h1); setm(k8,7,&h2); setm(k8,8,&h3);
+      seti(k8,9,(int)chs); seti(k8,10,oneMt); seti(k8,11,t8);
+      run1(k8, chs); clReleaseKernel(k8); }
+    if(phase == 8) {
+      int32_t *o8 = malloc(chs*4*3);
+      clEnqueueReadBuffer(queue, h1, CL_TRUE, 0, chs*4, o8, 0, NULL, NULL);
+      clEnqueueReadBuffer(queue, h2, CL_TRUE, 0, chs*4, o8 + chs, 0, NULL, NULL);
+      clEnqueueReadBuffer(queue, h3, CL_TRUE, 0, chs*4, o8 + 2*chs, 0, NULL, NULL);
+      clFinish(queue);
+      FILE *fo8 = fopen(out_path, "wb"); if(fo8) { fwrite(o8, 4, chs*3, fo8); fclose(fo8); }
+      printf("P8_RAW chs=%d\n", (int)chs);
+      return 0;
+    }
+
+    /* ---- L_pixel (P6) + P9 K16 upsample to full-res ---- */
+    cl_mem lpix = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL);
+    { cl_kernel k6a = mkkern("k_p6_l_pixel");
+      setm(k6a,0,&b_lden); setm(k6a,1,&lpix); seti(k6a,2,width); seti(k6a,3,height);
+      run1(k6a, npix); clReleaseKernel(k6a); }
+    cl_mem a1 = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL), a2 = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL), a3 = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL);
+    p7_k16(h1, h2, h3, lpix, a1, a2, a3, halfw, halfh, inv2s_k16, b_T, npix);
+    if(phase == 9) {
+      int32_t *o9 = malloc(npix*4*3);
+      clEnqueueReadBuffer(queue, a1, CL_TRUE, 0, npix*4, o9, 0, NULL, NULL);
+      clEnqueueReadBuffer(queue, a2, CL_TRUE, 0, npix*4, o9 + npix, 0, NULL, NULL);
+      clEnqueueReadBuffer(queue, a3, CL_TRUE, 0, npix*4, o9 + 2*npix, 0, NULL, NULL);
+      clFinish(queue);
+      FILE *fo9 = fopen(out_path, "wb"); if(fo9) { fwrite(o9, 4, npix*3, fo9); fclose(fo9); }
+      printf("P9_RAW npix=%d\n", (int)npix);
+      return 0;
+    }
+
+    /* ---- P10: inverse WHT + dark restore + denorm + Foi-exact inverse GAT ---- */
+    fxp_gat_inv_table_t lut;
+    build_foi_lut(&gp, &lut);
+    cl_mem b_lut = mkbuf(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof lut, &lut);
+    int32_t chref[4] = {0,0,0,0};
+    clEnqueueReadBuffer(queue, b_chref, CL_TRUE, 0, 16, chref, 0, NULL, NULL);
+    int32_t uni = 0;
+    clEnqueueReadBuffer(queue, b_uni, CL_TRUE, 0, 4, &uni, 0, NULL, NULL);
     clFinish(queue);
-    FILE *fo7 = fopen(out_path, "wb"); if(fo7) { fwrite(o7, 4, chs*9, fo7); fclose(fo7); }
-    printf("P7_RAW chs=%d\n", (int)chs);
+    cl_mem b_out = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL);
+    { cl_kernel k10 = mkkern("k_p10_reconstruct");
+      setm(k10,0,&a1); setm(k10,1,&a2); setm(k10,2,&a3); setm(k10,3,&lpix); setm(k10,4,&b_out);
+      seti(k10,5,width); seti(k10,6,height);
+      seti(k10,7,chref[0]); seti(k10,8,chref[1]); seti(k10,9,chref[2]); seti(k10,10,chref[3]);
+      seti(k10,11,uni); setm(k10,12,&b_gp); setm(k10,13,&b_lut);
+      run1(k10, npix); clReleaseKernel(k10); }
+    int32_t *o10 = malloc(npix*4);
+    clEnqueueReadBuffer(queue, b_out, CL_TRUE, 0, npix*4, o10, 0, NULL, NULL);
+    clFinish(queue);
+    FILE *fo10 = fopen(out_path, "wb"); if(fo10) { fwrite(o10, 4, npix, fo10); fclose(fo10); }
+    printf("P10_RAW npix=%d\n", (int)npix);
     return 0;
   }
 

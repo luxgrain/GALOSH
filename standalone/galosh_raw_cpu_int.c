@@ -2810,6 +2810,20 @@ int main(int argc, char **argv) {
       }
     }
   }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024]; snprintf(path, sizeof(path), "%s/p8.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) {
+        fwrite(C1_h_den_q20, sizeof(fxp32), chsize, df);
+        fwrite(C2_h_den_q20, sizeof(fxp32), chsize, df);
+        fwrite(C3_h_den_q20, sizeof(fxp32), chsize, df);
+        fclose(df);
+      }
+      fprintf(stderr, "  P8_RAW chs=%d\n", (int)chsize);
+    }
+  }
 
   /* ========== Phase 9: K16 joint bilateral upsample → full-res aligned ========== */
   fxp32 *C1_aligned_q20 = (fxp32 *)malloc(npixels * sizeof(fxp32));
@@ -2829,6 +2843,20 @@ int main(int argc, char **argv) {
     if(df) {
       for(size_t i = 0; i < npixels; i++) { float v = fxp_to_float(C1_aligned_q20[i]); fwrite(&v, sizeof(float), 1, df); }
       fclose(df);
+    }
+  }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024]; snprintf(path, sizeof(path), "%s/p9.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) {
+        fwrite(C1_aligned_q20, sizeof(fxp32), npixels, df);
+        fwrite(C2_aligned_q20, sizeof(fxp32), npixels, df);
+        fwrite(C3_aligned_q20, sizeof(fxp32), npixels, df);
+        fclose(df);
+      }
+      fprintf(stderr, "  P9_RAW npix=%d\n", (int)npixels);
     }
   }
 
@@ -2869,6 +2897,15 @@ int main(int argc, char **argv) {
     if(df) {
       for(size_t i = 0; i < npixels; i++) { float v = fxp_to_float(out_q20[i]); fwrite(&v, sizeof(float), 1, df); }
       fclose(df);
+    }
+  }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024]; snprintf(path, sizeof(path), "%s/p10.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) { fwrite(out_q20, sizeof(fxp32), npixels, df); fclose(df); }
+      fprintf(stderr, "  P10_RAW npix=%d\n", (int)npixels);
     }
   }
 

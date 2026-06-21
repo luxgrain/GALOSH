@@ -1,0 +1,50 @@
+/* ============================================================================
+ *  galosh_int_p10.clh  — Phase 10 device support (Foi-exact inverse GAT LUT).
+ *
+ *  The LUT (Poisson x Gauss-Hermite expected-GAT table) is built ONCE per image
+ *  on the host (identical CPU code) and uploaded as `fxp_gat_inv_table_t`.
+ *  p10_gat_inverse_exact mirrors fxp_gat_inverse_exact: binary search + linear
+ *  interp inside [d_min,d_max], linear branch below, algebraic above.
+ *
+ *  Depends on galosh_int.clh + galosh_int_tbl.clh (fxp_gat_inverse_algebraic).
+ * ========================================================================== */
+#ifndef GALOSH_INT_P10_CLH
+#define GALOSH_INT_P10_CLH
+
+#define FXP_GAT_INV_TABLE_SIZE 1024
+
+typedef struct fxp_gat_inv_table {
+  int d[FXP_GAT_INV_TABLE_SIZE];
+  int x[FXP_GAT_INV_TABLE_SIZE];
+  int d_min, d_max, alpha, sigma_raw, y_break, t_break;
+  int valid;
+} fxp_gat_inv_table_t;
+
+inline int p10_gat_inverse_exact(int D, const fxp_gat_params *p,
+                                 __constant const fxp_gat_inv_table_t *T) {
+  if(!T->valid) return fxp_gat_inverse_algebraic(D, p);
+  if(D <= T->d_min) {
+    int dd = D - T->t_break;
+    return T->y_break + fxp_mul(T->sigma_raw, dd);
+  }
+  if(D >= T->d_max) return fxp_gat_inverse_algebraic(D, p);
+  int lo = 0, hi = FXP_GAT_INV_TABLE_SIZE - 1;
+  while(lo < hi - 1) {
+    int mid = (lo + hi) >> 1;
+    if(T->d[mid] <= D) lo = mid;
+    else hi = mid;
+  }
+  int d0 = T->d[lo], d1 = T->d[hi];
+  int x0 = T->x[lo], x1 = T->x[hi];
+  int dd_diff = d1 - d0;
+  if(dd_diff <= 0) return x0;
+  int t = fxp_div_q20(D - d0, dd_diff);
+  return x0 + fxp_mul(t, x1 - x0);
+}
+
+/* CFA inverse-WHT sign pattern by 2x2 slot (R, Gb, Gr, B). */
+__constant int P10_SIGNS[4][3] = {
+  { 1, 1, 1 }, { -1, 1, -1 }, { 1, -1, -1 }, { -1, -1, 1 }
+};
+
+#endif  /* GALOSH_INT_P10_CLH */
