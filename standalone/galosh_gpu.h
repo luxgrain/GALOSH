@@ -93,7 +93,17 @@ static float cl_half_to_float(cl_half h)
 /* GALOSH constants — must match galosh_fused.cl */
 #define GALOSH_BS          8
 #define GALOSH_BP         64
-#define GALOSH_STRIDE      4
+/* BUG FIX 2026-05-10: GALOSH_STRIDE was 4 (= host build_opts -D pass to
+ * OpenCL kernel) which overrode galosh.cl's default `#define GALOSH_STRIDE 2`.
+ * CPU `galosh_pass1_blocked` is called with stride=2 (hardcoded parameter
+ * in galosh_pass12_multiorient_blocked).  Mismatch caused GPU's pass12_o32
+ * to iterate with stride=4 → ~half block coverage per pixel (4 vs 16
+ * contributions for interior pixels) → degraded Phase 5 BayesShrink
+ * averaging → ~1.5 dB SIDD val PSNR gap vs CPU O.  Verified via diagnostic
+ * printf in pass1_o32_dump showing GPU iterates by * 4 = ref_r ∈ {0, 4, 8,
+ * ...} instead of CPU's by * 2 = ref_r ∈ {0, 2, 4, ...}.  HALO formula
+ * `8 - GALOSH_STRIDE` followed suit (= 4 vs CPU-equivalent 6). */
+#define GALOSH_STRIDE      2
 #define TILE_SIZE         48
 #define HIST_BINS       4096
 #define HIST_MAX        16.0f
