@@ -517,10 +517,32 @@ static void wls_centered_pass(const fxp32 *bin_mean_arr,
   fxp_acc Sx_acc = fxp_acc_zero();
   fxp_acc Sy_acc = fxp_acc_zero();
   fxp_acc Sw_acc = fxp_acc_zero();    /* Σw_q11.20, may include Huber fractions */
+
+  /* Weight down-scale (root fix 2026-06-22): on a full frame the per-bin block
+   * count reaches ~1e5, so w_q = count × FXP_ONE overflows int32 once count >
+   * 2047 → garbage weights → Sxx_c (Σ w·xc²) overflows to NEGATIVE → the slope
+   * solve below is skipped → α stays at its unscaled init and the later /1024
+   * unscale drives it to ~0 → all-black output on bright full-frame scenes
+   * (SIDD 23/80, RawNIND 121/1288; 512² crops mostly escaped).  WLS is scale-
+   * invariant in the weight, so right-shift every count by a common wshift that
+   * keeps the largest weight inside Q11.20 (count >> wshift < 1024); the Huber
+   * fractional re-weighting still applies on the scaled w_q, and the var-domain
+   * /1024 unscale is independent of the weight so stays correct.
+   * full-frame で bin count 大 → w=count×2²⁰ が int32 overflow → Sxx_c 負 →
+   * slope skip → α collapse。重みは scale 不変なので共通 shift で縮小。 */
+  int wshift = 0;
+  {
+    int max_cnt = 0;
+    for(int b = 0; b < n_total_bins; b++)
+      if(bin_valid[b] && bin_cnt_arr[b] > max_cnt) max_cnt = bin_cnt_arr[b];
+    while((max_cnt >> wshift) >= 1024) wshift++;
+  }
+
   /* Pass 1: weighted Sw, Sx, Sy. */
   for(int b = 0; b < n_total_bins; b++) {
     if(!bin_valid[b]) continue;
-    int w_int = bin_cnt_arr[b];
+    int w_int = bin_cnt_arr[b] >> wshift;
+    if(w_int < 1) w_int = 1;
     fxp32 w_q = (fxp32)w_int * FXP_ONE;          /* Q11.20 of integer weight */
     /* Huber down-weighting (= no-op if huber_k_q = FXP_MAX_INT). */
     if(huber_k_q < FXP_MAX_INT) {
@@ -553,7 +575,8 @@ static void wls_centered_pass(const fxp32 *bin_mean_arr,
   fxp_acc Sxy_c_acc = fxp_acc_zero();
   for(int b = 0; b < n_total_bins; b++) {
     if(!bin_valid[b]) continue;
-    int w_int = bin_cnt_arr[b];
+    int w_int = bin_cnt_arr[b] >> wshift;
+    if(w_int < 1) w_int = 1;
     fxp32 w_q = (fxp32)w_int * FXP_ONE;
     if(huber_k_q < FXP_MAX_INT) {
       fxp32 pred = fxp_mul(alpha_in, bin_mean_arr[b]) + sigma_sq_in;
