@@ -32,3 +32,20 @@ __kernel void k_p7_loess(__global const int *y_guide,
                  eps_gat_scaled, inv_2sigma_sq, T, &o1, &o2, &o3);
   c1_out[idx] = o1; c2_out[idx] = o2; c3_out[idx] = o3;
 }
+
+/* K16 jinc bilateral upsample.  One work-item per full-res output pixel
+ * (output grid = 2*halfwidth x 2*halfheight). */
+__kernel void k_p7_k16(__global const int *c1_h, __global const int *c2_h,
+                       __global const int *c3_h, __global const int *L_pixel,
+                       __global int *c1_full, __global int *c2_full,
+                       __global int *c3_full, int halfwidth, int halfheight,
+                       int inv_2sigma_sq, __constant fxp_tables *T) {
+  int fw = 2 * halfwidth, fh = 2 * halfheight;
+  int fp = get_global_id(0);
+  if(fp >= fw * fh) return;
+  int fr = fp / fw, fc = fp - fr * fw;
+  int o1, o2, o3;
+  p7_k16_pixel(c1_h, c2_h, c3_h, L_pixel, halfwidth, halfheight, fr, fc,
+               inv_2sigma_sq, T, &o1, &o2, &o3);
+  c1_full[fp] = o1; c2_full[fp] = o2; c3_full[fp] = o3;
+}

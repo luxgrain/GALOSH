@@ -2717,7 +2717,8 @@ int main(int argc, char **argv) {
   {
     const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
     if(raw_dir) {
-      char path[1024]; snprintf(path, sizeof(path), "%s/p7_loess_h.bin", raw_dir);
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/p7_loess_h.bin", raw_dir);
       FILE *df = fopen(path, "wb");
       if(df) {
         fwrite(C1_loess_h, sizeof(fxp32), chsize, df);
@@ -2725,7 +2726,22 @@ int main(int argc, char **argv) {
         fwrite(C3_loess_h, sizeof(fxp32), chsize, df);
         fclose(df);
       }
-      fprintf(stderr, "  P7_RAW loess_h n=%d\n", (int)chsize);
+      /* Full P7 output: the 3 half-res chroma estimates that feed P8. */
+      snprintf(path, sizeof(path), "%s/p7_full.bin", raw_dir);
+      df = fopen(path, "wb");
+      if(df) {
+        fwrite(C1_loess_h, sizeof(fxp32), chsize, df);
+        fwrite(C2_loess_h, sizeof(fxp32), chsize, df);
+        fwrite(C3_loess_h, sizeof(fxp32), chsize, df);
+        fwrite(C1_q_up, sizeof(fxp32), chsize, df);
+        fwrite(C2_q_up, sizeof(fxp32), chsize, df);
+        fwrite(C3_q_up, sizeof(fxp32), chsize, df);
+        fwrite(C1_e_up, sizeof(fxp32), chsize, df);
+        fwrite(C2_e_up, sizeof(fxp32), chsize, df);
+        fwrite(C3_e_up, sizeof(fxp32), chsize, df);
+        fclose(df);
+      }
+      fprintf(stderr, "  P7_RAW chs=%d\n", (int)chsize);
     }
   }
 

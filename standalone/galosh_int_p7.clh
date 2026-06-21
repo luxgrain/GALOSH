@@ -109,4 +109,68 @@ inline void p7_loess_pixel(__global const int *y_guide,
   *o3 = (fxp_mul(a_c3, Y_c) + b_c3) << 4;
 }
 
+/* K16 jinc-windowed-jinc weights (Q11.20), 4 sub-pixel offsets x 5x5 window.
+ * Verbatim copy of the CPU fxp_k16_jw[4][5][5] constant. */
+__constant int fxp_k16_jw[4][5][5] = {
+  { {0,0,0,0,0}, {0,14475,-38508,14475,0}, {0,-38508,1048576,-38508,0}, {0,14475,-38508,14475,0}, {0,0,0,0,0} },
+  { {0,0,0,0,0}, {0,0,376,376,0},          {0,0,165113,165113,0},       {0,0,376,376,0},          {0,0,0,0,0} },
+  { {0,0,0,0,0}, {0,0,0,0,0},              {0,376,165113,376,0},        {0,376,165113,376,0},     {0,0,0,0,0} },
+  { {0,0,0,0,0}, {0,0,0,0,0},              {0,0,-76175,-76175,0},       {0,0,-76175,-76175,0},    {0,0,0,0,0} },
+};
+
+/* K16 joint bilateral upsample — one full-res output pixel (fr,fc).
+ * Output grid is 2*halfwidth x 2*halfheight; L_pixel guide is at output res. */
+inline void p7_k16_pixel(__global const int *c1_h, __global const int *c2_h,
+                         __global const int *c3_h, __global const int *L_pixel,
+                         int halfwidth, int halfheight, int fr, int fc,
+                         int inv_2sigma_sq, __constant const fxp_tables *T,
+                         int *o1, int *o2, int *o3) {
+  const int fw = 2 * halfwidth, fh = 2 * halfheight;
+  const int W = 2;
+  int hy = fr / 2, hx = fc / 2;
+  int si = (fr & 1) * 2 + (fc & 1);
+  int L_c = L_pixel[(size_t)fr * fw + fc];
+
+  fxp_acc sum_w = fxp_acc_zero();
+  fxp_acc sum_c1 = fxp_acc_zero(), sum_c2 = fxp_acc_zero(), sum_c3 = fxp_acc_zero();
+  for(int dy = -W; dy <= W; dy++) {
+    int hyi = hy + dy;
+    if(hyi < 0) hyi = 0;
+    if(hyi >= halfheight) hyi = halfheight - 1;
+    for(int dx = -W; dx <= W; dx++) {
+      int hxi = hx + dx;
+      if(hxi < 0) hxi = 0;
+      if(hxi >= halfwidth) hxi = halfwidth - 1;
+      int fri = 2 * hyi, fci = 2 * hxi;
+      if(fri >= fh) fri = fh - 1;
+      if(fci >= fw) fci = fw - 1;
+      int L_i = L_pixel[(size_t)fri * fw + fci];
+      int dL = L_i - L_c;
+      fxp_acc dL_sq_acc = fxp_acc_zero();
+      fxp_acc_madd(&dL_sq_acc, dL, dL);
+      int dL_sq = fxp_acc_to_fxp32(&dL_sq_acc);
+      int arg = -fxp_mul(dL_sq, inv_2sigma_sq);
+      if(arg < -16 * FXP_ONE) arg = -16 * FXP_ONE;
+      if(arg > 0) arg = 0;
+      int w_bilat = fxp_exp(arg, T);
+      int jw = fxp_k16_jw[si][dy + W][dx + W];
+      int w = fxp_mul(jw, w_bilat);
+      size_t hp = (size_t)hyi * halfwidth + hxi;
+      fxp_acc_add_i32(&sum_w, w);
+      fxp_acc_madd(&sum_c1, w, c1_h[hp]);
+      fxp_acc_madd(&sum_c2, w, c2_h[hp]);
+      fxp_acc_madd(&sum_c3, w, c3_h[hp]);
+    }
+  }
+  int sw  = fxp_acc_extract_q20(&sum_w);
+  int sc1 = fxp_acc_to_fxp32(&sum_c1);
+  int sc2 = fxp_acc_to_fxp32(&sum_c2);
+  int sc3 = fxp_acc_to_fxp32(&sum_c3);
+  int abs_sw = (sw < 0) ? -sw : sw;
+  if(abs_sw < 1) sw = (sw < 0) ? -1 : 1;
+  *o1 = fxp_div_q20(sc1, sw);
+  *o2 = fxp_div_q20(sc2, sw);
+  *o3 = fxp_div_q20(sc3, sw);
+}
+
 #endif  /* GALOSH_INT_P7_CLH */

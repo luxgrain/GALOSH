@@ -58,6 +58,33 @@ static void run1(cl_kernel k, size_t gws) {
 static void seti(cl_kernel k, int i, int v) { clSetKernelArg(k, i, sizeof(int), &v); }
 static void setm(cl_kernel k, int i, cl_mem *m) { clSetKernelArg(k, i, sizeof(cl_mem), m); }
 
+/* P7 invocation helpers (fresh kernel object per call = safe arg snapshot). */
+static cl_kernel mkkern(const char *n);  /* fwd */
+static void run1(cl_kernel k, size_t gws);
+static void p7_box_down(cl_mem src, cl_mem dst, int sw, int sh, size_t n) {
+  cl_kernel k = mkkern("k_p7_box_down");
+  setm(k,0,&src); setm(k,1,&dst); seti(k,2,sw); seti(k,3,sh); run1(k,n);
+  clReleaseKernel(k);
+}
+static void p7_loess(cl_mem g, cl_mem i1, cl_mem i2, cl_mem i3,
+                     cl_mem o1, cl_mem o2, cl_mem o3, int w, int h,
+                     int eps, int inv2s, cl_mem T, size_t n) {
+  cl_kernel k = mkkern("k_p7_loess");
+  setm(k,0,&g);setm(k,1,&i1);setm(k,2,&i2);setm(k,3,&i3);
+  setm(k,4,&o1);setm(k,5,&o2);setm(k,6,&o3);
+  seti(k,7,w);seti(k,8,h);seti(k,9,eps);seti(k,10,inv2s);setm(k,11,&T);
+  run1(k,n); clReleaseKernel(k);
+}
+static void p7_k16(cl_mem i1, cl_mem i2, cl_mem i3, cl_mem g,
+                   cl_mem o1, cl_mem o2, cl_mem o3, int hw, int hh,
+                   int inv2s, cl_mem T, size_t n) {
+  cl_kernel k = mkkern("k_p7_k16");
+  setm(k,0,&i1);setm(k,1,&i2);setm(k,2,&i3);setm(k,3,&g);
+  setm(k,4,&o1);setm(k,5,&o2);setm(k,6,&o3);
+  seti(k,7,hw);seti(k,8,hh);seti(k,9,inv2s);setm(k,10,&T);
+  run1(k,n); clReleaseKernel(k);
+}
+
 int main(int argc, char **argv) {
   if(argc < 6) { fprintf(stderr, "usage: %s <in.bin> <w> <h> <phase> <out.bin> [dev]\n", argv[0]); return 1; }
   const char *in_path = argv[1];
@@ -285,42 +312,59 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  /* ---- P7 sub-step: LOESS @ half-res (validate fxp_loess_chroma_3ch_r) ----
-   * Computes the prerequisites inline (chroma from P2 in_gat, L_h_den from the
-   * P5 L_cs_den) so this stays self-contained without a full pipeline rewire. */
+  /* ---- P7 (full): 3-scale chroma pyramid LOESS + K16 jinc upsample ----
+   * Prereqs computed inline: chroma @half (P2 in_gat) + L_h_den (P5 L_cs_den).
+   * Output = the 3 half-res chroma estimates C_loess_h | C_q_up | C_e_up. */
   if(phase == 7) {
     int halfw = (width + 1) / 2, halfh = (height + 1) / 2;
-    size_t chsize = (size_t)halfw * halfh;
-    cl_mem b_c1h = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
-    cl_mem b_c2h = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
-    cl_mem b_c3h = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
-    cl_kernel kc = mkkern("k_p4_chroma_halfres");
-    setm(kc,0,&b_gat); setm(kc,1,&b_c1h); setm(kc,2,&b_c2h); setm(kc,3,&b_c3h);
-    seti(kc,4,width); seti(kc,5,height); seti(kc,6,halfw); seti(kc,7,halfh);
-    run1(kc, chsize);
-    cl_mem b_lhden = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
-    cl_kernel k6b = mkkern("k_p6_l_h_den");
-    setm(k6b,0,&b_lden); setm(k6b,1,&b_lhden); seti(k6b,2,width); seti(k6b,3,height);
-    seti(k6b,4,halfw); seti(k6b,5,halfh);
-    run1(k6b, chsize);
-    int32_t eps_gat_scaled = fxp_mul(FXP_ONE, FXP_ONE) >> 8;
-    int32_t inv_2sigma_sq = 58253;   /* FXP_LOESS_INV_2SIGMA_SQ */
-    cl_mem b_l1 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
-    cl_mem b_l2 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
-    cl_mem b_l3 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
-    cl_kernel kl = mkkern("k_p7_loess");
-    setm(kl,0,&b_lhden); setm(kl,1,&b_c1h); setm(kl,2,&b_c2h); setm(kl,3,&b_c3h);
-    setm(kl,4,&b_l1); setm(kl,5,&b_l2); setm(kl,6,&b_l3);
-    seti(kl,7,halfw); seti(kl,8,halfh); seti(kl,9,eps_gat_scaled);
-    seti(kl,10,inv_2sigma_sq); setm(kl,11,&b_T);
-    run1(kl, chsize);
-    int32_t *c7 = malloc(chsize * 4 * 3);
-    clEnqueueReadBuffer(queue, b_l1, CL_TRUE, 0, chsize*4, c7, 0, NULL, NULL);
-    clEnqueueReadBuffer(queue, b_l2, CL_TRUE, 0, chsize*4, c7 + chsize, 0, NULL, NULL);
-    clEnqueueReadBuffer(queue, b_l3, CL_TRUE, 0, chsize*4, c7 + 2*chsize, 0, NULL, NULL);
+    int cqw = halfw / 2, cqh = halfh / 2, cew = cqw / 2, ceh = cqh / 2;
+    size_t chs = (size_t)halfw * halfh, cqs = (size_t)cqw * cqh, ces = (size_t)cew * ceh;
+    int eps = fxp_mul(FXP_ONE, FXP_ONE) >> 8;
+    int inv2s = 58253;                        /* FXP_LOESS_INV_2SIGMA_SQ */
+    int inv2s_k16 = fxp_from_float(2.0f / 9.0f);
+
+    cl_mem c1h = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2h = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3h = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
+    { cl_kernel kc = mkkern("k_p4_chroma_halfres");
+      setm(kc,0,&b_gat); setm(kc,1,&c1h); setm(kc,2,&c2h); setm(kc,3,&c3h);
+      seti(kc,4,width); seti(kc,5,height); seti(kc,6,halfw); seti(kc,7,halfh);
+      run1(kc, chs); clReleaseKernel(kc); }
+    cl_mem lhden = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
+    { cl_kernel k6 = mkkern("k_p6_l_h_den");
+      setm(k6,0,&b_lden); setm(k6,1,&lhden); seti(k6,2,width); seti(k6,3,height);
+      seti(k6,4,halfw); seti(k6,5,halfh); run1(k6, chs); clReleaseKernel(k6); }
+
+    /* L + C pyramids */
+    cl_mem lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL);
+    p7_box_down(lhden, lq, halfw, halfh, cqs);
+    p7_box_down(lq, le, cqw, cqh, ces);
+    cl_mem c1q = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c2q = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c3q = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL);
+    p7_box_down(c1h, c1q, halfw, halfh, cqs); p7_box_down(c2h, c2q, halfw, halfh, cqs); p7_box_down(c3h, c3q, halfw, halfh, cqs);
+    cl_mem c1e = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c2e = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c3e = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL);
+    p7_box_down(c1q, c1e, cqw, cqh, ces); p7_box_down(c2q, c2e, cqw, cqh, ces); p7_box_down(c3q, c3e, cqw, cqh, ces);
+
+    /* LOESS @ each scale */
+    cl_mem c1lh = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2lh = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3lh = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
+    p7_loess(lhden, c1h, c2h, c3h, c1lh, c2lh, c3lh, halfw, halfh, eps, inv2s, b_T, chs);
+    cl_mem c1lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c2lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c3lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL);
+    p7_loess(lq, c1q, c2q, c3q, c1lq, c2lq, c3lq, cqw, cqh, eps, inv2s, b_T, cqs);
+    cl_mem c1le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c2le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c3le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL);
+    p7_loess(le, c1e, c2e, c3e, c1le, c2le, c3le, cew, ceh, eps, inv2s, b_T, ces);
+
+    /* K16 upsample: quarter->half, eighth->quarter, (eighth)quarter->half */
+    cl_mem c1qup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2qup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3qup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
+    p7_k16(c1lq, c2lq, c3lq, lhden, c1qup, c2qup, c3qup, cqw, cqh, inv2s_k16, b_T, chs);
+    cl_mem c1eq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c2eq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c3eq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL);
+    p7_k16(c1le, c2le, c3le, lq, c1eq, c2eq, c3eq, cew, ceh, inv2s_k16, b_T, cqs);
+    cl_mem c1eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
+    p7_k16(c1eq, c2eq, c3eq, lhden, c1eup, c2eup, c3eup, cqw, cqh, inv2s_k16, b_T, chs);
+
+    cl_mem outs[9] = { c1lh, c2lh, c3lh, c1qup, c2qup, c3qup, c1eup, c2eup, c3eup };
+    int32_t *o7 = malloc(chs * 4 * 9);
+    for(int k = 0; k < 9; k++)
+      clEnqueueReadBuffer(queue, outs[k], CL_TRUE, 0, chs*4, o7 + (size_t)k*chs, 0, NULL, NULL);
     clFinish(queue);
-    FILE *fo7 = fopen(out_path, "wb"); if(fo7) { fwrite(c7, 4, chsize * 3, fo7); fclose(fo7); }
-    printf("P7_RAW loess_h n=%d\n", (int)chsize);
+    FILE *fo7 = fopen(out_path, "wb"); if(fo7) { fwrite(o7, 4, chs*9, fo7); fclose(fo7); }
+    printf("P7_RAW chs=%d\n", (int)chs);
     return 0;
   }
 
