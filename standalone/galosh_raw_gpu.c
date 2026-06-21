@@ -1,4 +1,4 @@
-/* galosh_raw_gpu.c  --  GALOSH_RAW_G GPU pipeline driver.
+/* galosh_raw_gpu.c  --  GALOSH RAW: GPU FP32 pipeline driver (mirror of CPU O).
  *
  * Bayer RAW float32 input.  Pipeline (all on GPU compute):
  *   K0a-K0e blind noise estimation (Foi-Alenius MAD on raw)
@@ -2181,12 +2181,9 @@ int main(int argc, char **argv)
         fprintf(stderr,
             "Usage: %s <in.bin> <out.bin> <W> <H>\n"
             "       <strength> <luma_str> <chroma_str>\n"
-            "       <alpha> <sigma_sq> [cl_dev] [--variant=o32|g]\n"
-            "Variants (GALOSH RAW V2):\n"
-            "  o32  CANONICAL GPU FP32 (default) — full-pipeline Phase 0-10 mirror of\n"
-            "       CPU --variant=o (= GALOSH_RAW_O).  This is the paper GPU FP32.\n"
-            "  g    [DEPRECATED] GALOSH_RAW_G (half-res LOSH + EWA-JL3) — chroma fringe,\n"
-            "       superseded by o32; kept bench-only.\n",
+            "       <alpha> <sigma_sq> [cl_dev]\n"
+            "  GALOSH RAW GPU (FP32): fully-blind RAW Bayer denoise (mirror of CPU FP32).\n"
+            "  raw float32 Bayer in [0,1]; alpha=sigma=0 -> blind estimation.\n",
             argv[0]);
         return 1;
     }
@@ -2200,37 +2197,15 @@ int main(int argc, char **argv)
     const float alpha       = (float)atof(argv[8]);
     const float sigma_sq    = (float)atof(argv[9]);
 
-    /* Optional positional [cl_dev] and named [--variant=g|o32]. */
+    /* Optional positional [cl_dev]. */
     int dev = 0;
-    int variant = 32;  /* GALOSH RAW V2: default = o32 (GPU canonical). 0 = g (DEPRECATED) */
+    const int variant = 32;  /* GALOSH RAW: GPU FP32 — the single pipeline (mirror of CPU O) */
     for(int i = 10; i < argc; i++) {
-        if(strncmp(argv[i], "--variant=", 10) == 0) {
-            const char *v = argv[i] + 10;
-            if(strcmp(v, "o32") == 0)      variant = 32;
-            else if(strcmp(v, "o16") == 0) {
-                fprintf(stderr, "[GPU] ERROR: --variant=o16 not yet implemented "
-                                "(o16 = FP16 derivative of o32, port pending)\n");
-                return 1;
-            }
-            else if(strcmp(v, "g") == 0 || strcmp(v, "G") == 0) variant = 0;
-            else if(strcmp(v, "o") == 0 || strcmp(v, "O") == 0) {
-                fprintf(stderr, "[GPU] ERROR: --variant=o was removed (broken RAW O "
-                                "archived to archived_o-broke/).  Use --variant=o32 "
-                                "for the in-progress FP32 port.\n");
-                return 1;
-            }
-            else {
-                fprintf(stderr, "[GPU] ERROR: unknown --variant=%s "
-                                "(valid: g, o32)\n", v);
-                return 1;
-            }
-        } else {
+        if(strncmp(argv[i], "--variant=", 10) == 0)
+            ;  /* accepted and ignored — this build is the canonical GPU FP32 pipeline */
+        else
             dev = atoi(argv[i]);
-        }
     }
-    fprintf(stderr, "[GPU] variant = %s\n",
-            variant == 32 ? "o32 (CPU O FP32 port; Phase 0-10 full pipeline as of 2026-05-09)"
-                          : "G (GALOSH_RAW_G half-res LOSH + K14/K15/K16 chromaup)");
     return run_galosh_raw_gpu(input_file, output_file, width, height,
                               strength, luma_str, chroma_str,
                               alpha, sigma_sq, dev, variant);
