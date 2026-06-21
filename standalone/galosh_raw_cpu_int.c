@@ -1,37 +1,13 @@
-/* ============================================================================
- *  galosh_raw_cpu_int.c
+/* galosh_raw_cpu_int.c — GALOSH RAW: INT32 fixed-point (Q11.20) CPU reference.
  *
- *  GALOSH-RAW CPU integer reference pipeline (Stage 1 = r32, Q11.20).
+ * Bit-faithful integer port of the FP32 pipeline (galosh_raw_cpu.c): no float,
+ * no FP64 — 64-bit intermediates use paired-int32 emulation (fxp_acc).  This is
+ * the canonical INT reference; the GPU INT16 port (galosh_int_*.cl) is bit-exact
+ * to it.  Q11.20 storage (range +-2048).  See README_RAW_V2.md.
  *
- *  Mirrors galosh_raw_cpu.c (FP32) but uses INT32 storage and INT64-free
- *  arithmetic throughout.  See galosh_cpu_int.h for primitive functions.
- *
- *  Variants:
- *    --variant=r32  (default; CPU INT32/64 reference, Q11.20 storage,
- *                    INT64 emulated via paired INT32, ISP-portable)
- *    --variant=r16  (Stage 2 future: per-variable Q-format on INT16 storage)
- *
- *  Build (ucrt64 gcc):
- *    gcc -O2 -fopenmp galosh_raw_cpu_int.c -lm -o galosh_raw_cpu_int.exe
- *
- *  Usage (parallels galosh_raw_cpu.exe):
- *    galosh_raw_cpu_int.exe input.bin output.bin width height
- *      [method=galosh] [strength=1.0] [luma_str=0.5] [chroma_str=1.0]
- *      [alpha=0] [sigma_sq=0]   (when both > 0, skip Phase 0 estimation)
- *      [--variant=r32]
- *
- *  Status (Stage 1b — 2026-05-10):
- *    - Phase 1 GAT forward: implemented in fxp_gat_forward (galosh_cpu_int.h).
- *    - Phase 0 noise estimation: STUB (requires alpha + sigma_sq passed via
- *      CLI; if zero, uses crude MAD-derived defaults).  Full P-G estimation
- *      to be ported in Stage 1c.
- *    - Phase 2-10 (denoising + chroma + inverse GAT): NOT YET IMPLEMENTED.
- *      Current pipeline runs Phase 1 forward, no denoising, then linearly
- *      maps GAT output back to [0, 1] for output (= for smoke testing only).
- *
- *  Verification (Stage 1b smoke test):
- *    GAT_int(x) compared vs GAT_fp32(x) for x ∈ [0, 1]: target ≥40 dB PSNR.
- * ========================================================================== */
+ * Usage: galosh_raw_cpu_int in.bin out.bin W H galosh <strength> <luma> <chroma> <alpha> <sigma_sq>
+ *   I/O = raw float32 Bayer in [0,1].  alpha=sigma=0 -> blind.  GALOSH_VERBOSE=1 -> progress.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +15,8 @@
 #include <time.h>
 
 #include "galosh_cpu_int.h"
+
+static int g_verbose = 0;  /* GALOSH_VERBOSE env */
 
 /* External LUT storage (declared in galosh_cpu_int.h).  Initialised once at
  * startup via INT-only Taylor / Mercator computations.
@@ -72,7 +50,7 @@ static fxp_gat_inv_table_t g_gat_inv_table = { .valid = 0 };
 static void fxp_gat_build_inverse_table(const fxp_gat_params *gat_p) {
   if(gat_p->alpha < fxp_from_float(1e-4f)) {
     g_gat_inv_table.valid = 0;
-    fprintf(stderr, "  Foi LUT skipped (α=%.6f below threshold, will use algebraic)\n",
+    if(g_verbose) fprintf(stderr, "  Foi LUT skipped (α=%.6f below threshold, will use algebraic)\n",
             fxp_to_float(gat_p->alpha));
     return;
   }
@@ -155,7 +133,7 @@ static void fxp_gat_build_inverse_table(const fxp_gat_params *gat_p) {
   g_gat_inv_table.t_break = gat_p->t_break;
   g_gat_inv_table.valid = 1;
 
-  fprintf(stderr, "  Phase 10 Foi LUT built: D range [%.4f, %.4f] (%d entries)\n",
+  if(g_verbose) fprintf(stderr, "  Phase 10 Foi LUT built: D range [%.4f, %.4f] (%d entries)\n",
           fxp_to_float(g_gat_inv_table.d_min), fxp_to_float(g_gat_inv_table.d_max),
           FXP_GAT_INV_TABLE_SIZE);
 }
@@ -192,7 +170,6 @@ static inline fxp32 fxp_gat_inverse_exact(fxp32 D, const fxp_gat_params *gat_p) 
 }
 
 /* Variant selection (single char, mirrors FP32 main). */
-static char g_variant = '\0';   /* 0 = default = r32 */
 
 /* ============================================================================
  * Phase 0 — noise estimation (Foi-Alenius blind α/σ² for Poisson-Gauss).
@@ -995,7 +972,7 @@ static void fxp_estimate_noise(const fxp32 *in_q20,
   const fxp32 mean_bw = (mean_hi - mean_lo) / NE_NBINS;
   if(mean_bw < 1) {
     /* Adaptive range collapsed (single-bin input).  Fall back to defaults. */
-    fprintf(stderr, "  [phase0] adaptive range collapsed, using defaults\n");
+    if(g_verbose) fprintf(stderr, "  [phase0] adaptive range collapsed, using defaults\n");
     return;
   }
   /* NOTE: bin index = (m - mean_lo) / mean_bw computed via direct int32
@@ -1116,7 +1093,7 @@ static void fxp_estimate_noise(const fxp32 *in_q20,
   }
 
   if(n_valid < 4) {
-    fprintf(stderr, "  [phase0] too few valid bins (%d), using defaults\n", n_valid);
+    if(g_verbose) fprintf(stderr, "  [phase0] too few valid bins (%d), using defaults\n", n_valid);
     return;
   }
 
@@ -2247,16 +2224,14 @@ static void phase4_chroma_halfres(const fxp32 *in_gat_q20,
  * GAT_int matches GAT_fp32 within precision.
  * ========================================================================== */
 int main(int argc, char **argv) {
+  g_verbose = (getenv("GALOSH_VERBOSE") != NULL);
   /* Strip --variant flag from argv. */
   int new_argc = 0;
   char *positional[32];
   for(int i = 0; i < argc; i++) {
     const char *a = argv[i];
     if(strncmp(a, "--variant=", 10) == 0) {
-      const char *v = a + 10;
-      if(strcmp(v, "r32") == 0)      g_variant = 'r';
-      else if(strcmp(v, "r16") == 0) g_variant = 's';   /* future */
-      else g_variant = 'r';     /* default */
+      /* accepted and ignored — this build is the canonical INT32 reference */
     } else if(new_argc < 32) {
       positional[new_argc++] = (char *)a;
     }
@@ -2269,10 +2244,7 @@ int main(int argc, char **argv) {
       "Usage: %s input.bin output.bin width height\n"
       "       [method=galosh] [strength=1.0] [luma_str=0.5] [chroma_str=1.0]\n"
       "       [alpha=0] [sigma_sq=0]   (positive = skip Phase 0 estimation)\n"
-      "       [--variant=r32|r16]      (default r32 = INT32/64 reference)\n"
-      "\n"
-      "  Stage 1b status: Phase 1 GAT forward only; Phase 2-10 are stubs.\n"
-      "  Output is GAT-domain values clamped to [0, 1] for smoke testing.\n",
+      "       (raw float32 Bayer in [0,1]; alpha=sigma=0 -> blind estimation)\n",
       argv[0]);
     return 1;
   }
@@ -2293,10 +2265,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  fprintf(stderr, "GALOSH-RAW INT (Stage 1b) variant=%c\n",
-          (g_variant == 's') ? 'r' : 'r');
-  fprintf(stderr, "  Input:  %s (%dx%d)\n", input_file, width, height);
-  fprintf(stderr, "  Q-format: Q11.20 (range +-2048, precision %.3e)\n",
+  if(g_verbose) fprintf(stderr, "GALOSH-RAW INT (Q11.20 fixed-point, blind)\n");
+  if(g_verbose) fprintf(stderr, "  Input:  %s (%dx%d)\n", input_file, width, height);
+  if(g_verbose) fprintf(stderr, "  Q-format: Q11.20 (range +-2048, precision %.3e)\n",
           1.0f / (float)FXP_ONE);
 
   /* Initialize transcendental LUTs + Kaiser window. */
@@ -2337,13 +2308,13 @@ int main(int argc, char **argv) {
     /* Override via CLI (= bench harness pass-through). */
     alpha_q20    = fxp_from_float(alpha_in);
     sigma_sq_q20 = fxp_from_float(sigma_sq_in);
-    fprintf(stderr, "  Phase 0 (CLI override): alpha=%.6f sigma_sq=%.10f\n",
+    if(g_verbose) fprintf(stderr, "  Phase 0 (CLI override): alpha=%.6f sigma_sq=%.10f\n",
             fxp_to_float(alpha_q20), fxp_to_float(sigma_sq_q20));
   } else {
     clock_t tp0 = clock();
     fxp_estimate_noise(in_q20, width, height, &alpha_q20, &sigma_sq_q20);
     double dt0 = (double)(clock() - tp0) / CLOCKS_PER_SEC;
-    fprintf(stderr, "  Phase 0 (INT estimate, %.3f s): alpha=%.6f sigma_sq=%.10f "
+    if(g_verbose) fprintf(stderr, "  Phase 0 (INT estimate, %.3f s): alpha=%.6f sigma_sq=%.10f "
             "(Q11.20: %d, %d)\n",
             dt0, fxp_to_float(alpha_q20), fxp_to_float(sigma_sq_q20),
             alpha_q20, sigma_sq_q20);
@@ -2352,7 +2323,7 @@ int main(int argc, char **argv) {
   /* ========== Phase 1: GAT forward + per-CFA σ + unified_sigma normalize ========== */
   fxp_gat_params gat_p;
   fxp_gat_precompute(&gat_p, alpha_q20, sigma_sq_q20);
-  fprintf(stderr, "  GAT params: inv_2sqrt_alpha=%.4f, 3a/8=%.6f, s²/a=%.6f, y_break=%.6f\n",
+  if(g_verbose) fprintf(stderr, "  GAT params: inv_2sqrt_alpha=%.4f, 3a/8=%.6f, s²/a=%.6f, y_break=%.6f\n",
           fxp_to_float(gat_p.inv_2sqrt_alpha),
           fxp_to_float(gat_p.three_alpha_8),
           fxp_to_float(gat_p.sigma_sq_over_alpha),
@@ -2362,14 +2333,14 @@ int main(int argc, char **argv) {
    * Build cost ~0.5 s/image. */
   clock_t t_lut0 = clock();
   fxp_gat_build_inverse_table(&gat_p);
-  fprintf(stderr, "  Foi LUT build time: %.3f s\n",
+  if(g_verbose) fprintf(stderr, "  Foi LUT build time: %.3f s\n",
           (double)(clock() - t_lut0) / CLOCKS_PER_SEC);
   fxp32 unified_sigma_q, sigma_gat_ch[4];
   clock_t t0 = clock();
   phase1_gat_full(in_q20, out_q20, width, height, &gat_p,
                   &unified_sigma_q, sigma_gat_ch);
   double elapsed = (double)(clock() - t0) / CLOCKS_PER_SEC;
-  fprintf(stderr, "  Phase 1 (%.3f s): unified_sigma=%.4f (per-ch: %.4f %.4f %.4f %.4f)\n",
+  if(g_verbose) fprintf(stderr, "  Phase 1 (%.3f s): unified_sigma=%.4f (per-ch: %.4f %.4f %.4f %.4f)\n",
           elapsed, fxp_to_float(unified_sigma_q),
           fxp_to_float(sigma_gat_ch[0]), fxp_to_float(sigma_gat_ch[1]),
           fxp_to_float(sigma_gat_ch[2]), fxp_to_float(sigma_gat_ch[3]));
@@ -2384,7 +2355,7 @@ int main(int argc, char **argv) {
       snprintf(path, sizeof(path), "%s/p1_ingat.bin", raw_dir);
       FILE *df = fopen(path, "wb");
       if(df) { fwrite(out_q20, sizeof(fxp32), npixels, df); fclose(df); }
-      fprintf(stderr, "  P1_RAW unified_sigma=%d sigma_ch=%d,%d,%d,%d\n",
+      if(g_verbose) fprintf(stderr, "  P1_RAW unified_sigma=%d sigma_ch=%d,%d,%d,%d\n",
               unified_sigma_q, sigma_gat_ch[0], sigma_gat_ch[1],
               sigma_gat_ch[2], sigma_gat_ch[3]);
     }
@@ -2397,7 +2368,7 @@ int main(int argc, char **argv) {
                   alpha_q20, sigma_sq_q20, ch_dark_ref);
   phase2_dark_subtract(out_q20, width, height, ch_dark_ref);
   double dt2 = (double)(clock() - tp2) / CLOCKS_PER_SEC;
-  fprintf(stderr, "  Phase 2 dark_ref (%.3f s): [0]=%.4f [1]=%.4f [2]=%.4f [3]=%.4f\n",
+  if(g_verbose) fprintf(stderr, "  Phase 2 dark_ref (%.3f s): [0]=%.4f [1]=%.4f [2]=%.4f [3]=%.4f\n",
           dt2,
           fxp_to_float(ch_dark_ref[0]), fxp_to_float(ch_dark_ref[1]),
           fxp_to_float(ch_dark_ref[2]), fxp_to_float(ch_dark_ref[3]));
@@ -2408,7 +2379,7 @@ int main(int argc, char **argv) {
       snprintf(path, sizeof(path), "%s/p2_ingat.bin", raw_dir);
       FILE *df = fopen(path, "wb");
       if(df) { fwrite(out_q20, sizeof(fxp32), npixels, df); fclose(df); }
-      fprintf(stderr, "  P2_RAW ch_dark_ref=%d,%d,%d,%d\n",
+      if(g_verbose) fprintf(stderr, "  P2_RAW ch_dark_ref=%d,%d,%d,%d\n",
               ch_dark_ref[0], ch_dark_ref[1], ch_dark_ref[2], ch_dark_ref[3]);
     }
   }
@@ -2424,7 +2395,7 @@ int main(int argc, char **argv) {
     if(L_cs_q20[i] < lo) lo = L_cs_q20[i];
     if(L_cs_q20[i] > hi) hi = L_cs_q20[i];
   }
-  fprintf(stderr, "  Phase 3 forward L stride=1 (%.3f s): range [%.4f, %.4f]\n",
+  if(g_verbose) fprintf(stderr, "  Phase 3 forward L stride=1 (%.3f s): range [%.4f, %.4f]\n",
           dt3, fxp_to_float(lo), fxp_to_float(hi));
   /* Optional: dump p3_L_cs as FP32 .bin for comparison vs FP32 ref. */
   const char *dump_dir = getenv("GALOSH_INT_DUMP_DIR");
@@ -2447,7 +2418,7 @@ int main(int argc, char **argv) {
       snprintf(path, sizeof(path), "%s/p3_lcs.bin", raw_dir);
       FILE *df = fopen(path, "wb");
       if(df) { fwrite(L_cs_q20, sizeof(fxp32), npixels, df); fclose(df); }
-      fprintf(stderr, "  P3_RAW lo=%d hi=%d\n", lo, hi);
+      if(g_verbose) fprintf(stderr, "  P3_RAW lo=%d hi=%d\n", lo, hi);
     }
   }
 
@@ -2465,7 +2436,7 @@ int main(int argc, char **argv) {
   phase4_chroma_halfres(out_q20, C1_h_q20, C2_h_q20, C3_h_q20,
                         width, height, halfwidth, halfheight);
   double dt4 = (double)(clock() - tp4) / CLOCKS_PER_SEC;
-  fprintf(stderr, "  Phase 4 chroma extract (%.3f s): C1/2/3 half-res %dx%d\n",
+  if(g_verbose) fprintf(stderr, "  Phase 4 chroma extract (%.3f s): C1/2/3 half-res %dx%d\n",
           dt4, halfwidth, halfheight);
   if(dump_dir) {
     const char *names[3] = {"p4_C1_h", "p4_C2_h", "p4_C3_h"};
@@ -2495,7 +2466,7 @@ int main(int argc, char **argv) {
         fwrite(C3_h_q20, sizeof(fxp32), chsize, df);
         fclose(df);
       }
-      fprintf(stderr, "  P4_RAW n=%d\n", (int)chsize);
+      if(g_verbose) fprintf(stderr, "  P4_RAW n=%d\n", (int)chsize);
     }
   }
 
@@ -2529,7 +2500,7 @@ int main(int argc, char **argv) {
         if(L_cs_pilot_q20[i] < plo) plo = L_cs_pilot_q20[i];
         if(L_cs_pilot_q20[i] > phi) phi = L_cs_pilot_q20[i];
       }
-      fprintf(stderr, "  P5PILOT_RAW lo=%d hi=%d\n", plo, phi);
+      if(g_verbose) fprintf(stderr, "  P5PILOT_RAW lo=%d hi=%d\n", plo, phi);
     }
   }
   phase5_pass2_blocked(L_cs_q20, L_cs_pilot_q20, L_cs_den_q20,
@@ -2540,7 +2511,7 @@ int main(int argc, char **argv) {
     if(L_cs_den_q20[i] < d_lo) d_lo = L_cs_den_q20[i];
     if(L_cs_den_q20[i] > d_hi) d_hi = L_cs_den_q20[i];
   }
-  fprintf(stderr, "  Phase 5 BayesShrink P1+P2 (%.3f s): L_cs_den range [%.4f, %.4f]\n",
+  if(g_verbose) fprintf(stderr, "  Phase 5 BayesShrink P1+P2 (%.3f s): L_cs_den range [%.4f, %.4f]\n",
           dt5, fxp_to_float(d_lo), fxp_to_float(d_hi));
   if(dump_dir) {
     char path[1024]; snprintf(path, sizeof(path), "%s/p5_L_cs_den.bin", dump_dir);
@@ -2559,7 +2530,7 @@ int main(int argc, char **argv) {
       char path[1024]; snprintf(path, sizeof(path), "%s/p5_den.bin", raw_dir);
       FILE *df = fopen(path, "wb");
       if(df) { fwrite(L_cs_den_q20, sizeof(fxp32), npixels, df); fclose(df); }
-      fprintf(stderr, "  P5_RAW lo=%d hi=%d\n", d_lo, d_hi);
+      if(g_verbose) fprintf(stderr, "  P5_RAW lo=%d hi=%d\n", d_lo, d_hi);
     }
   }
 
@@ -2575,7 +2546,7 @@ int main(int argc, char **argv) {
   phase6_l_pixel(L_cs_den_q20, L_pixel_q20, width, height);
   phase6_l_h_den(L_cs_den_q20, L_h_den_q20, width, height, halfwidth, halfheight);
   double dt6 = (double)(clock() - tp6) / CLOCKS_PER_SEC;
-  fprintf(stderr, "  Phase 6 L_pixel + L_h_den (%.3f s)\n", dt6);
+  if(g_verbose) fprintf(stderr, "  Phase 6 L_pixel + L_h_den (%.3f s)\n", dt6);
   if(dump_dir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/p6_L_pixel.bin", dump_dir);
@@ -2607,7 +2578,7 @@ int main(int argc, char **argv) {
         fwrite(L_h_den_q20, sizeof(fxp32), chsize, df);
         fclose(df);
       }
-      fprintf(stderr, "  P6_RAW npix=%d chsize=%d\n", (int)npixels, (int)chsize);
+      if(g_verbose) fprintf(stderr, "  P6_RAW npix=%d chsize=%d\n", (int)npixels, (int)chsize);
     }
   }
 
@@ -2686,7 +2657,7 @@ int main(int argc, char **argv) {
   free(C1_e_to_q); free(C2_e_to_q); free(C3_e_to_q);
 
   double dt7 = (double)(clock() - tp7) / CLOCKS_PER_SEC;
-  fprintf(stderr, "  Phase 7 LOESS pyramid (%.3f s): half=%dx%d quarter=%dx%d eighth=%dx%d\n",
+  if(g_verbose) fprintf(stderr, "  Phase 7 LOESS pyramid (%.3f s): half=%dx%d quarter=%dx%d eighth=%dx%d\n",
           dt7, halfwidth, halfheight, cq_w, cq_h, ce_w, ce_h);
   if(dump_dir) {
     const char *names[3] = {"p7_C1_loess_h", "p7_C2_loess_h", "p7_C3_loess_h"};
@@ -2741,7 +2712,7 @@ int main(int argc, char **argv) {
         fwrite(C3_e_up, sizeof(fxp32), chsize, df);
         fclose(df);
       }
-      fprintf(stderr, "  P7_RAW chs=%d\n", (int)chsize);
+      if(g_verbose) fprintf(stderr, "  P7_RAW chs=%d\n", (int)chsize);
     }
   }
 
@@ -2798,7 +2769,7 @@ int main(int argc, char **argv) {
       }
     }
     double dt8 = (double)(clock() - tp8) / CLOCKS_PER_SEC;
-    fprintf(stderr, "  Phase 8 smoothstep (%.3f s): chroma_str=%.3f segment=%d\n",
+    if(g_verbose) fprintf(stderr, "  Phase 8 smoothstep (%.3f s): chroma_str=%.3f segment=%d\n",
             dt8, chroma_str, segment);
     if(dump_dir) {
       char path[1024];
@@ -2821,7 +2792,7 @@ int main(int argc, char **argv) {
         fwrite(C3_h_den_q20, sizeof(fxp32), chsize, df);
         fclose(df);
       }
-      fprintf(stderr, "  P8_RAW chs=%d\n", (int)chsize);
+      if(g_verbose) fprintf(stderr, "  P8_RAW chs=%d\n", (int)chsize);
     }
   }
 
@@ -2835,7 +2806,7 @@ int main(int argc, char **argv) {
                         C1_aligned_q20, C2_aligned_q20, C3_aligned_q20,
                         halfwidth, halfheight, inv_2sigma_sq_k16);
   double dt9 = (double)(clock() - tp9) / CLOCKS_PER_SEC;
-  fprintf(stderr, "  Phase 9 K16 upsample → full-res (%.3f s)\n", dt9);
+  if(g_verbose) fprintf(stderr, "  Phase 9 K16 upsample → full-res (%.3f s)\n", dt9);
   if(dump_dir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/p9_C1_aligned.bin", dump_dir);
@@ -2856,7 +2827,7 @@ int main(int argc, char **argv) {
         fwrite(C3_aligned_q20, sizeof(fxp32), npixels, df);
         fclose(df);
       }
-      fprintf(stderr, "  P9_RAW npix=%d\n", (int)npixels);
+      if(g_verbose) fprintf(stderr, "  P9_RAW npix=%d\n", (int)npixels);
     }
   }
 
@@ -2889,7 +2860,7 @@ int main(int argc, char **argv) {
     }
   }
   double dt10 = (double)(clock() - tp10) / CLOCKS_PER_SEC;
-  fprintf(stderr, "  Phase 10 inverse WHT + denorm + inv-GAT (%.3f s)\n", dt10);
+  if(g_verbose) fprintf(stderr, "  Phase 10 inverse WHT + denorm + inv-GAT (%.3f s)\n", dt10);
   if(dump_dir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/p10_output.bin", dump_dir);
@@ -2905,7 +2876,7 @@ int main(int argc, char **argv) {
       char path[1024]; snprintf(path, sizeof(path), "%s/p10.bin", raw_dir);
       FILE *df = fopen(path, "wb");
       if(df) { fwrite(out_q20, sizeof(fxp32), npixels, df); fclose(df); }
-      fprintf(stderr, "  P10_RAW npix=%d\n", (int)npixels);
+      if(g_verbose) fprintf(stderr, "  P10_RAW npix=%d\n", (int)npixels);
     }
   }
 
@@ -2921,7 +2892,7 @@ int main(int argc, char **argv) {
   if(!fout) { fprintf(stderr, "Cannot open %s for writing\n", output_file); return 1; }
   fwrite(out_f32, sizeof(float), npixels, fout);
   fclose(fout);
-  fprintf(stderr, "  Output: %s (Phase 1 GAT-domain, clamped /4 for viewing)\n",
+  if(g_verbose) fprintf(stderr, "  Output: %s (Phase 1 GAT-domain, clamped /4 for viewing)\n",
           output_file);
 
   free(in_f32); free(out_f32); free(in_q20); free(out_q20);
