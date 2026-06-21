@@ -9,7 +9,7 @@
  *  via fxp_from_float and passed in.  Depends on galosh_int.clh + tbl (sqrt).
  * ========================================================================== */
 
-__kernel void k_p2_dark_ref(__global const int *in_q20, __global const int *in_gat,
+__kernel void k_p2_dark_ref(__global const int *in_q20, __global const lbuf_t *in_gat,
                             int width, int height, int alpha, int sigma_sq,
                             int c_0p05, int c_50, int achroma,
                             __constant fxp_tables *T, __global int *ch_out) {
@@ -32,10 +32,10 @@ __kernel void k_p2_dark_ref(__global const int *in_q20, __global const int *in_g
 
     for(int br = 0; br < height - 1; br += 2) {
       for(int bc = 0; bc < width - 1; bc += 2) {
-        int g0 = in_gat[(size_t)br     * width + bc    ];
-        int g1 = in_gat[(size_t)(br+1) * width + bc    ];
-        int g2 = in_gat[(size_t)br     * width + bc + 1];
-        int g3 = in_gat[(size_t)(br+1) * width + bc + 1];
+        int g0 = LDB(in_gat, (size_t)br     * width + bc    );
+        int g1 = LDB(in_gat, (size_t)(br+1) * width + bc    );
+        int g2 = LDB(in_gat, (size_t)br     * width + bc + 1);
+        int g3 = LDB(in_gat, (size_t)(br+1) * width + bc + 1);
         int gmax = g0; if(g1 > gmax) gmax = g1; if(g2 > gmax) gmax = g2; if(g3 > gmax) gmax = g3;
         int gmin = g0; if(g1 < gmin) gmin = g1; if(g2 < gmin) gmin = g2; if(g3 < gmin) gmin = g3;
         if(gmax - gmin > achroma) continue;
@@ -72,10 +72,10 @@ __kernel void k_p2_dark_ref(__global const int *in_q20, __global const int *in_g
     fxp_acc swR2 = fxp_acc_zero();
     for(int br = 0; br < height - 1; br += 2) {
       for(int bc = 0; bc < width - 1; bc += 2) {
-        int g0 = in_gat[(size_t)br     * width + bc    ];
-        int g1 = in_gat[(size_t)(br+1) * width + bc    ];
-        int g2 = in_gat[(size_t)br     * width + bc + 1];
-        int g3 = in_gat[(size_t)(br+1) * width + bc + 1];
+        int g0 = LDB(in_gat, (size_t)br     * width + bc    );
+        int g1 = LDB(in_gat, (size_t)(br+1) * width + bc    );
+        int g2 = LDB(in_gat, (size_t)br     * width + bc + 1);
+        int g3 = LDB(in_gat, (size_t)(br+1) * width + bc + 1);
         int gmax = g0; if(g1 > gmax) gmax = g1; if(g2 > gmax) gmax = g2; if(g3 > gmax) gmax = g3;
         int gmin = g0; if(g1 < gmin) gmin = g1; if(g2 < gmin) gmin = g2; if(g3 < gmin) gmin = g3;
         if(gmax - gmin > achroma) continue;
@@ -117,11 +117,11 @@ __kernel void k_p2_dark_ref(__global const int *in_q20, __global const int *in_g
   ch_out[0] = ch[0]; ch_out[1] = ch[1]; ch_out[2] = ch[2]; ch_out[3] = ch[3];
 }
 
-__kernel void k_p2_subtract(__global int *in_gat, int width, int height,
+__kernel void k_p2_subtract(__global lbuf_t *in_gat, int width, int height,
                             __global const int *ch_ref) {
   int idx = get_global_id(0);
   if(idx >= width * height) return;
   int r = idx / width, c = idx - r * width;
   int slot = (r & 1) | ((c & 1) << 1);
-  in_gat[idx] -= ch_ref[slot];
+  STB(in_gat, idx, LDB(in_gat, idx) - ch_ref[slot]);
 }

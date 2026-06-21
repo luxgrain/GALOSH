@@ -8,27 +8,27 @@
  *  Bit-mirror of phase6_l_pixel / phase6_l_h_den.
  * ========================================================================== */
 
-__kernel void k_p6_l_pixel(__global const int *lden, __global int *lpix,
+__kernel void k_p6_l_pixel(__global const lbuf_t *lden, __global lbuf_t *lpix,
                            int width, int height) {
   int idx = get_global_id(0);
   if(idx >= width * height) return;
   int fr = idx / width, fc = idx - fr * width;
-  int sum = lden[idx];
+  int sum = LDB(lden, idx);
   int count = 1;
-  if(fr > 0) { sum += lden[(size_t)(fr - 1) * width + fc]; count++; }
-  if(fc > 0) { sum += lden[(size_t)fr * width + (fc - 1)]; count++; }
-  if(fr > 0 && fc > 0) { sum += lden[(size_t)(fr - 1) * width + (fc - 1)]; count++; }
-  lpix[idx] = (count == 4) ? (sum >> 2) :
-              (count == 2) ? (sum >> 1) :
-              (count == 1) ? sum : (sum / count);
+  if(fr > 0) { sum += LDB(lden, (size_t)(fr - 1) * width + fc); count++; }
+  if(fc > 0) { sum += LDB(lden, (size_t)fr * width + (fc - 1)); count++; }
+  if(fr > 0 && fc > 0) { sum += LDB(lden, (size_t)(fr - 1) * width + (fc - 1)); count++; }
+  STB(lpix, idx, (count == 4) ? (sum >> 2) :
+                 (count == 2) ? (sum >> 1) :
+                 (count == 1) ? sum : (sum / count));
 }
 
-__kernel void k_p6_l_h_den(__global const int *lden, __global int *lhden,
+__kernel void k_p6_l_h_den(__global const lbuf_t *lden, __global lbuf_t *lhden,
                            int width, int height, int halfwidth, int halfheight) {
   int idx = get_global_id(0);
   if(idx >= halfwidth * halfheight) return;
   int hr = idx / halfwidth, hc = idx - hr * halfwidth;
   int fr = 2 * hr, fc = 2 * hc;
   if(fr >= height || fc >= width) return;
-  lhden[idx] = lden[(size_t)fr * width + fc];
+  STB(lhden, idx, LDB(lden, (size_t)fr * width + fc));
 }

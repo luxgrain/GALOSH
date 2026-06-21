@@ -11,9 +11,9 @@
  *  chroma line buffers.  (For even W/H — e.g. SIDD 256x256 — no edge skip.)
  * ========================================================================== */
 
-__kernel void k_p4_chroma_halfres(__global const int *in_gat,
-                                  __global int *C1, __global int *C2,
-                                  __global int *C3,
+__kernel void k_p4_chroma_halfres(__global const lbuf_t *in_gat,
+                                  __global lbuf_t *C1, __global lbuf_t *C2,
+                                  __global lbuf_t *C3,
                                   int width, int height,
                                   int halfwidth, int halfheight) {
   int idx = get_global_id(0);
@@ -24,11 +24,11 @@ __kernel void k_p4_chroma_halfres(__global const int *in_gat,
   if(fr1 >= height) return;
   int fc0 = 2 * hc, fc1 = fc0 + 1;
   if(fc1 >= width) return;
-  int a  = in_gat[(size_t)fr0 * width + fc0];
-  int b  = in_gat[(size_t)fr1 * width + fc0];
-  int cc = in_gat[(size_t)fr0 * width + fc1];
-  int d  = in_gat[(size_t)fr1 * width + fc1];
-  C1[idx] = (a - b + cc - d) >> 1;
-  C2[idx] = (a + b - cc - d) >> 1;
-  C3[idx] = (a - b - cc + d) >> 1;
+  int a  = LDB(in_gat, (size_t)fr0 * width + fc0);
+  int b  = LDB(in_gat, (size_t)fr1 * width + fc0);
+  int cc = LDB(in_gat, (size_t)fr0 * width + fc1);
+  int d  = LDB(in_gat, (size_t)fr1 * width + fc1);
+  STB(C1, idx, (a - b + cc - d) >> 1);
+  STB(C2, idx, (a + b - cc - d) >> 1);
+  STB(C3, idx, (a - b - cc + d) >> 1);
 }

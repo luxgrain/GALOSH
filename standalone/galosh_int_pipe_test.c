@@ -135,7 +135,8 @@ static void build_foi_lut(const fxp_gat_params *gat_p, fxp_gat_inv_table_t *tbl)
 
 /* INT16 line-buffer narrowing (requantize a Q11.20 line buffer to its INT16
  * storage precision in place).  luma Q10.5 -> shift 15, chroma Q6.9 -> 11. */
-static int g_i16 = 0;
+static int g_i16 = 0;       /* requant-sim (INT32 build, rounds in place) */
+static int g_genuine = 0;   /* genuine INT16 storage (-DGENUINE_I16 build, short bufs) */
 /* CORRECTED i16 line-buffer format (empirical, full-pipeline 2026-06-21):
  * BOTH luma and chroma = Q6.9 (frac 9, +-64).  The earlier design assumed luma
  * Q10.5 (frac 5) on the basis of the 441-max PRE-normalize GAT — but the LINE
@@ -160,6 +161,7 @@ int main(int argc, char **argv) {
   int dev_idx = (argc > 6) ? atoi(argv[6]) : 0;
   for(int ai = 1; ai < argc; ai++) {
     if(!strcmp(argv[ai], "i16")) g_i16 = 1;
+    else if(!strcmp(argv[ai], "short")) g_genuine = 1;   /* genuine INT16 storage */
     else if(!strncmp(argv[ai], "lf=", 3)) I16_LUMA_SHIFT   = 20 - atoi(argv[ai] + 3);
     else if(!strncmp(argv[ai], "cf=", 3)) I16_CHROMA_SHIFT = 20 - atoi(argv[ai] + 3);
   }
@@ -197,14 +199,15 @@ int main(int argc, char **argv) {
   ctx = clCreateContext(NULL, 1, &device, NULL, NULL, &err); CLCHK(err, "ctx");
   queue = clCreateCommandQueue(ctx, device, 0, &err); CLCHK(err, "q");
 
-  const char *files[] = { "galosh_int.clh", "galosh_int_tbl.clh", "galosh_int_p0.clh",
+  const char *files[] = { "galosh_int.clh", "galosh_int_i16.clh", "galosh_int_tbl.clh",
+                          "galosh_int_p0.clh",
                           "galosh_int_p1.clh", "galosh_int_p5.clh", "galosh_int_p7.clh",
                           "galosh_int_p10.clh",
                           "galosh_int_p0.cl", "galosh_int_p1.cl", "galosh_int_p2.cl",
                           "galosh_int_p3.cl", "galosh_int_p4.cl", "galosh_int_p5.cl",
                           "galosh_int_p6.cl", "galosh_int_p7.cl", "galosh_int_p8.cl",
                           "galosh_int_p10.cl", "galosh_int_i16.cl" };
-  const int nfiles = 18;
+  const int nfiles = 19;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -216,7 +219,7 @@ int main(int argc, char **argv) {
   }
   src[pos] = 0;
   prog = clCreateProgramWithSource(ctx, 1, (const char **)&src, NULL, &err); CLCHK(err, "prog");
-  err = clBuildProgram(prog, 1, &device, "", NULL, NULL);
+  err = clBuildProgram(prog, 1, &device, g_genuine ? "-DGENUINE_I16" : "", NULL, NULL);
   if(err != CL_SUCCESS) { char log[16384];
     clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, sizeof log, log, NULL);
     fprintf(stderr, "[CL] build failed (%d):\n%s\n", err, log); return 1; }
@@ -518,8 +521,16 @@ int main(int argc, char **argv) {
       seti(k10,11,uni); setm(k10,12,&b_gp); setm(k10,13,&b_lut);
       run1(k10, npix); clReleaseKernel(k10); }
     int32_t *o10 = malloc(npix*4);
-    clEnqueueReadBuffer(queue, b_out, CL_TRUE, 0, npix*4, o10, 0, NULL, NULL);
-    clFinish(queue);
+    if(g_genuine) {                       /* b_out holds INT16 Q1.14 -> Q11.20 */
+      short *s10 = malloc(npix * 2);
+      clEnqueueReadBuffer(queue, b_out, CL_TRUE, 0, npix * 2, s10, 0, NULL, NULL);
+      clFinish(queue);
+      for(size_t i = 0; i < npix; i++) o10[i] = (int)s10[i] << 6;
+      free(s10);
+    } else {
+      clEnqueueReadBuffer(queue, b_out, CL_TRUE, 0, npix*4, o10, 0, NULL, NULL);
+      clFinish(queue);
+    }
     FILE *fo10 = fopen(out_path, "wb"); if(fo10) { fwrite(o10, 4, npix, fo10); fclose(fo10); }
     printf("P10_RAW npix=%d\n", (int)npix);
     return 0;

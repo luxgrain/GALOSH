@@ -20,15 +20,15 @@ inline int fxp_reflect_idx(int i, int n) {
   return i;
 }
 
-inline void p7_loess_pixel(__global const int *y_guide,
-                           __global const int *c1_in, __global const int *c2_in,
-                           __global const int *c3_in, int width, int height,
+inline void p7_loess_pixel(__global const lbuf_t *y_guide,
+                           __global const lbuf_t *c1_in, __global const lbuf_t *c2_in,
+                           __global const lbuf_t *c3_in, int width, int height,
                            int x, int y, int eps_gat_scaled, int inv_2sigma_sq,
                            __constant const fxp_tables *T,
                            int *o1, int *o2, int *o3) {
   const int R = P7_LOESS_RADIUS;
   size_t cx = (size_t)y * width + x;
-  int Y_c_orig = y_guide[cx];
+  int Y_c_orig = LDB(y_guide, cx);
   int Y_c = Y_c_orig >> 4;
 
   int w_buf[256], Y_buf[256], C1_buf[256], C2_buf[256], C3_buf[256];
@@ -41,10 +41,10 @@ inline void p7_loess_pixel(__global const int *y_guide,
     size_t row_off = (size_t)yi * width;
     for(int dx = -R; dx <= R; dx++) {
       int xi = fxp_reflect_idx(x + dx, width);
-      int Yi_orig  = y_guide[row_off + xi];
-      int C1i_orig = c1_in[row_off + xi];
-      int C2i_orig = c2_in[row_off + xi];
-      int C3i_orig = c3_in[row_off + xi];
+      int Yi_orig  = LDB(y_guide, row_off + xi);
+      int C1i_orig = LDB(c1_in, row_off + xi);
+      int C2i_orig = LDB(c2_in, row_off + xi);
+      int C3i_orig = LDB(c3_in, row_off + xi);
       int dY = Yi_orig - Y_c_orig;
       fxp_acc dY_sq_acc = fxp_acc_zero();
       fxp_acc_madd(&dY_sq_acc, dY, dY);
@@ -120,8 +120,8 @@ __constant int fxp_k16_jw[4][5][5] = {
 
 /* K16 joint bilateral upsample — one full-res output pixel (fr,fc).
  * Output grid is 2*halfwidth x 2*halfheight; L_pixel guide is at output res. */
-inline void p7_k16_pixel(__global const int *c1_h, __global const int *c2_h,
-                         __global const int *c3_h, __global const int *L_pixel,
+inline void p7_k16_pixel(__global const lbuf_t *c1_h, __global const lbuf_t *c2_h,
+                         __global const lbuf_t *c3_h, __global const lbuf_t *L_pixel,
                          int halfwidth, int halfheight, int fr, int fc,
                          int inv_2sigma_sq, __constant const fxp_tables *T,
                          int *o1, int *o2, int *o3) {
@@ -129,7 +129,7 @@ inline void p7_k16_pixel(__global const int *c1_h, __global const int *c2_h,
   const int W = 2;
   int hy = fr / 2, hx = fc / 2;
   int si = (fr & 1) * 2 + (fc & 1);
-  int L_c = L_pixel[(size_t)fr * fw + fc];
+  int L_c = LDB(L_pixel, (size_t)fr * fw + fc);
 
   fxp_acc sum_w = fxp_acc_zero();
   fxp_acc sum_c1 = fxp_acc_zero(), sum_c2 = fxp_acc_zero(), sum_c3 = fxp_acc_zero();
@@ -144,7 +144,7 @@ inline void p7_k16_pixel(__global const int *c1_h, __global const int *c2_h,
       int fri = 2 * hyi, fci = 2 * hxi;
       if(fri >= fh) fri = fh - 1;
       if(fci >= fw) fci = fw - 1;
-      int L_i = L_pixel[(size_t)fri * fw + fci];
+      int L_i = LDB(L_pixel, (size_t)fri * fw + fci);
       int dL = L_i - L_c;
       fxp_acc dL_sq_acc = fxp_acc_zero();
       fxp_acc_madd(&dL_sq_acc, dL, dL);
@@ -157,9 +157,9 @@ inline void p7_k16_pixel(__global const int *c1_h, __global const int *c2_h,
       int w = fxp_mul(jw, w_bilat);
       size_t hp = (size_t)hyi * halfwidth + hxi;
       fxp_acc_add_i32(&sum_w, w);
-      fxp_acc_madd(&sum_c1, w, c1_h[hp]);
-      fxp_acc_madd(&sum_c2, w, c2_h[hp]);
-      fxp_acc_madd(&sum_c3, w, c3_h[hp]);
+      fxp_acc_madd(&sum_c1, w, LDB(c1_h, hp));
+      fxp_acc_madd(&sum_c2, w, LDB(c2_h, hp));
+      fxp_acc_madd(&sum_c3, w, LDB(c3_h, hp));
     }
   }
   int sw  = fxp_acc_extract_q20(&sum_w);

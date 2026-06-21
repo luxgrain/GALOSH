@@ -13,7 +13,7 @@
  *  even ref_c in [max(0,pc-7), min(cmax,pc)]  (rmax=H-8, cmax=W-8).
  * ========================================================================== */
 
-__kernel void k_p5_pass1(__global const int *input, __global int *pilot,
+__kernel void k_p5_pass1(__global const lbuf_t *input, __global lbuf_t *pilot,
                          int width, int height, __constant fxp_tables *T,
                          __constant int *kaiser, __constant fxp_p5_consts *C) {
   int idx = get_global_id(0);
@@ -41,14 +41,14 @@ __kernel void k_p5_pass1(__global const int *input, __global int *pilot,
   int d = fxp_acc_extract_q20(&denom);
   if(d > 1) {
     int n = fxp_acc_extract_q20(&numer);
-    pilot[idx] = fxp_mul(n, fxp_recip(d));
+    STB(pilot, idx, fxp_mul(n, fxp_recip(d)));
   } else {
-    pilot[idx] = input[idx];
+    STB(pilot, idx, LDB(input, idx));
   }
 }
 
-__kernel void k_p5_pass2(__global const int *noisy, __global const int *pilot,
-                         __global int *output, int width, int height,
+__kernel void k_p5_pass2(__global const lbuf_t *noisy, __global const lbuf_t *pilot,
+                         __global lbuf_t *output, int width, int height,
                          __constant int *kaiser, __constant fxp_p5_consts *C) {
   int idx = get_global_id(0);
   if(idx >= width * height) return;
@@ -75,8 +75,8 @@ __kernel void k_p5_pass2(__global const int *noisy, __global const int *pilot,
   int d = fxp_acc_extract_q20(&denom);
   if(d > 1) {
     int n = fxp_acc_extract_q20(&numer);
-    output[idx] = fxp_mul(n, fxp_recip(d));
+    STB(output, idx, fxp_mul(n, fxp_recip(d)));
   } else {
-    output[idx] = noisy[idx];
+    STB(output, idx, LDB(noisy, idx));
   }
 }

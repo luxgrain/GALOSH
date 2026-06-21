@@ -45,9 +45,11 @@ def run_cpu(in_p, out_p, w, h, phase):
     return ints_after(r.stderr.decode("utf-8", "replace"), phase)
 
 
-def run_gpu(in_p, w, h, phase, out_p1, i16=False, lf=None, cf=None):
+def run_gpu(in_p, w, h, phase, out_p1, i16=False, short=False, lf=None, cf=None):
     cmd = [str(GPU_EXE), str(in_p), str(w), str(h), str(phase), str(out_p1)]
-    if i16:
+    if short:
+        cmd += ["0", "short"]
+    elif i16:
         cmd += ["0", "i16"]
         if lf is not None: cmd.append(f"lf={lf}")
         if cf is not None: cmd.append(f"cf={cf}")
@@ -60,18 +62,22 @@ def main():
     ap.add_argument("--phase", type=int, required=True)
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--i16", action="store_true",
-                    help="narrow GPU line buffers to INT16 precision (zero-loss check)")
-    ap.add_argument("--lf", type=int, default=None, help="luma fractional bits (default 5)")
+                    help="narrow GPU line buffers to INT16 precision in place (requant-sim)")
+    ap.add_argument("--short", action="store_true",
+                    help="genuine INT16 storage (short line buffers, -DGENUINE_I16 build)")
+    ap.add_argument("--lf", type=int, default=None, help="luma fractional bits (default 9)")
     ap.add_argument("--cf", type=int, default=None, help="chroma fractional bits (default 9)")
     args = ap.parse_args()
     ph = args.phase
+    psnr_mode = args.i16 or args.short
 
     n_raw = loadmat(str(SIDD_VAL / "ValidationNoisyBlocksRaw.mat"))["ValidationNoisyBlocksRaw"]
     ns, npp = n_raw.shape[:2]
     rng = random.Random(SEED)
     idxs = rng.sample(range(ns * npp), min(args.n, ns * npp))
 
-    print(f"Phase {ph} GPU vs CPU {'INT16-narrow zero-loss' if args.i16 else 'bit-exact'} (n={len(idxs)})")
+    mode = "genuine-INT16-short zero-loss" if args.short else "INT16-narrow zero-loss" if args.i16 else "bit-exact"
+    print(f"Phase {ph} GPU vs CPU {mode} (n={len(idxs)})")
     n_ok = n_bad = n_fail = 0; bad = []; psnrs = []
     for gi in idxs:
         si, pi = gi // npp, gi % npp
@@ -83,14 +89,14 @@ def main():
         noisy.astype(np.float32).tofile(str(in_p))
         c = run_cpu(in_p, out_p, w, h, ph)
         cpu_b = TMP / PHASE_FILE.get(ph, f"p{ph}_ingat.bin")
-        g = run_gpu(in_p, w, h, ph, gpu_b, i16=args.i16, lf=args.lf, cf=args.cf)
+        g = run_gpu(in_p, w, h, ph, gpu_b, i16=args.i16, short=args.short, lf=args.lf, cf=args.cf)
         if c is None or g is None or not cpu_b.exists() or not gpu_b.exists():
             n_fail += 1; print(f"  s{si}_p{pi}: FAIL (cpu={c} gpu={g})")
             for p in (in_p, out_p, gpu_b): p.unlink(missing_ok=True)
             continue
         ca = np.fromfile(str(cpu_b), dtype=np.int32); ga = np.fromfile(str(gpu_b), dtype=np.int32)
         ndiff = int(np.count_nonzero(ca != ga)) if ca.shape == ga.shape else -1
-        if args.i16:
+        if psnr_mode:
             cf = ca.astype(np.float64) / 2**20; gf = ga.astype(np.float64) / 2**20
             mse = float(np.mean((cf - gf) ** 2))
             psnr = 10 * np.log10(1.0 / mse) if mse > 0 else float("inf")
@@ -107,7 +113,7 @@ def main():
             print(f"  s{si}_p{pi:<3} ndiff={ndiff}  {'OK' if ok else 'MISMATCH'}")
         for p in (in_p, out_p, gpu_b): p.unlink(missing_ok=True)
 
-    if args.i16 and psnrs:
+    if psnr_mode and psnrs:
         import statistics
         print(f"\n=== phase {ph} INT16-narrow: {n_ok} zero-loss(>=80dB) / {n_bad} lossy / {n_fail} fail "
               f"(of {len(idxs)});  PSNR(i16,r32) mean={statistics.mean(psnrs):.2f} min={min(psnrs):.2f} dB ===")

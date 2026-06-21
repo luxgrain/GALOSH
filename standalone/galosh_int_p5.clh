@@ -27,14 +27,14 @@ typedef struct fxp_p5_consts {
 } fxp_p5_consts;
 
 /* BayesShrink block at (ref_r, ref_c).  Returns n_nonzero; fills block[64]. */
-inline int p5_pass1_block(__global const int *input, int width,
+inline int p5_pass1_block(__global const lbuf_t *input, int width,
                           int ref_r, int ref_c, int *block,
                           __constant const fxp_tables *T,
                           __constant const fxp_p5_consts *C) {
   const int sqrtN = 8 * FXP_ONE;
   for(int dy = 0; dy < 8; dy++)
     for(int dx = 0; dx < 8; dx++)
-      block[dy*8+dx] = input[(size_t)(ref_r+dy) * width + (ref_c+dx)];
+      block[dy*8+dx] = LDB(input, (size_t)(ref_r+dy) * width + (ref_c+dx));
 
   fxp_acc s = fxp_acc_zero();
   for(int i = 0; i < 64; i++) fxp_acc_add_i32(&s, block[i] >> 6);
@@ -79,14 +79,14 @@ inline int p5_pass1_block(__global const int *input, int width,
 
 /* Empirical Wiener block at (ref_r, ref_c).  Returns wiener_energy; fills
  * block[64] with the Wiener-weighted reconstructed block. */
-inline int p5_pass2_block(__global const int *noisy, __global const int *pilot,
+inline int p5_pass2_block(__global const lbuf_t *noisy, __global const lbuf_t *pilot,
                           int width, int ref_r, int ref_c, int *block,
                           __constant const fxp_p5_consts *C) {
   int blk_pilot[64];
   for(int dy = 0; dy < 8; dy++) {
     for(int dx = 0; dx < 8; dx++) {
-      block[dy*8+dx]     = noisy[(size_t)(ref_r+dy) * width + (ref_c+dx)];
-      blk_pilot[dy*8+dx] = pilot[(size_t)(ref_r+dy) * width + (ref_c+dx)];
+      block[dy*8+dx]     = LDB(noisy, (size_t)(ref_r+dy) * width + (ref_c+dx));
+      blk_pilot[dy*8+dx] = LDB(pilot, (size_t)(ref_r+dy) * width + (ref_c+dx));
     }
   }
   fxp_acc sn = fxp_acc_zero();

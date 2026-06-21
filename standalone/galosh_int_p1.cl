@@ -11,17 +11,17 @@
  *  galosh_int_p1.cl.
  * ========================================================================== */
 
-__kernel void k_p1_gat_forward(__global const int *in_q20, __global int *gat_q20,
+__kernel void k_p1_gat_forward(__global const int *in_q20, __global lbuf_t *gat_q20,
                                int npix, __constant fxp_gat_params *P,
                                __constant fxp_tables *T) {
   int i = get_global_id(0);
   if(i >= npix) return;
   fxp_gat_params p = *P;
-  gat_q20[i] = fxp_gat_forward(in_q20[i], &p, T);
+  STB(gat_q20, i, fxp_gat_forward(in_q20[i], &p, T));
 }
 
 /* offsets {0,0},{0,1},{1,0},{1,1} indexed by CFA slot s. */
-__kernel void k_p1_sigma_ch(__global const int *gat_q20, int width, int height,
+__kernel void k_p1_sigma_ch(__global const lbuf_t *gat_q20, int width, int height,
                             __global int *lap_hist_all, int inv_1p6521,
                             __global int *sigma_ch) {
   int s = get_global_id(0);
@@ -48,9 +48,9 @@ __kernel void k_p1_unify(__global const int *sigma_ch, __global int *unified_out
   *inv_sg_out  = fxp_recip(unified);
 }
 
-__kernel void k_p1_normalize(__global int *gat_q20, int npix,
+__kernel void k_p1_normalize(__global lbuf_t *gat_q20, int npix,
                              __global const int *inv_sg_buf) {
   int i = get_global_id(0);
   if(i >= npix) return;
-  gat_q20[i] = fxp_mul(gat_q20[i], inv_sg_buf[0]);
+  STB(gat_q20, i, fxp_mul(LDB(gat_q20, i), inv_sg_buf[0]));
 }

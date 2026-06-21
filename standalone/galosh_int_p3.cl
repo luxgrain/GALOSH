@@ -15,7 +15,7 @@ inline int fxp_h_mirror_idx(int i, int n) {
   return i;
 }
 
-__kernel void k_p3_forward_l(__global const int *in_gat, __global int *L_cs,
+__kernel void k_p3_forward_l(__global const lbuf_t *in_gat, __global lbuf_t *L_cs,
                              int width, int height) {
   int idx = get_global_id(0);
   if(idx >= width * height) return;
@@ -23,9 +23,9 @@ __kernel void k_p3_forward_l(__global const int *in_gat, __global int *L_cs,
   int c = idx - r * width;
   int rb = fxp_h_mirror_idx(r + 1, height);
   int cb = fxp_h_mirror_idx(c + 1, width);
-  int a  = in_gat[(size_t)r  * width + c ];
-  int b  = in_gat[(size_t)rb * width + c ];
-  int cc = in_gat[(size_t)r  * width + cb];
-  int d  = in_gat[(size_t)rb * width + cb];
-  L_cs[idx] = (a + b + cc + d) >> 1;
+  int a  = LDB(in_gat, (size_t)r  * width + c );
+  int b  = LDB(in_gat, (size_t)rb * width + c );
+  int cc = LDB(in_gat, (size_t)r  * width + cb);
+  int d  = LDB(in_gat, (size_t)rb * width + cb);
+  STB(L_cs, idx, (a + b + cc + d) >> 1);
 }

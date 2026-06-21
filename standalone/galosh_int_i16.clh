@@ -1,0 +1,45 @@
+/* ============================================================================
+ *  galosh_int_i16.clh  — genuine INT16 line-buffer storage (dual-build).
+ *
+ *  The per-pixel LINE BUFFERS are typed `lbuf_t` and accessed only through
+ *  LDB/STB (Q6.9 luma+chroma) or LDO/STO (Q1.14 output).  Two builds from one
+ *  source:
+ *    - default (INT32):   lbuf_t = int,   LDB/STB = identity  -> bit-exact path.
+ *    - -DGENUINE_I16:     lbuf_t = short, LDB = sign-extend+<<frac, STB =
+ *                         round+saturate -> the honest INT16 ISP data path
+ *                         (INT16 storage, INT32 MAC).  Validated zero-loss
+ *                         (Q6.9, see [[project-i16-perq-design]] correction).
+ *
+ *  COMPUTE / scratch / histogram / constant buffers stay `int` (NOT lbuf_t).
+ *  store_shift: Q6.9 -> 11 (luma & chroma), Q1.14 -> 6 (output).
+ * ========================================================================== */
+#ifndef GALOSH_INT_I16_CLH
+#define GALOSH_INT_I16_CLH
+
+#ifdef GENUINE_I16
+
+typedef short lbuf_t;
+
+inline int  ldq(__global const short *b, size_t i, int sh) { return (int)b[i] << sh; }
+inline void stq(__global short *b, size_t i, int q20, int sh) {
+  int q = (q20 + (1 << (sh - 1))) >> sh;
+  if(q >  32767) q =  32767;
+  if(q < -32768) q = -32768;
+  b[i] = (short)q;
+}
+#define LDB(b, i)      ldq((b), (i), 11)      /* Q6.9 load  (luma + chroma) */
+#define STB(b, i, v)   stq((b), (i), (v), 11) /* Q6.9 store */
+#define LDO(b, i)      ldq((b), (i), 6)       /* Q1.14 load  (output) */
+#define STO(b, i, v)   stq((b), (i), (v), 6)  /* Q1.14 store */
+
+#else  /* INT32 (bit-exact) build — LDB/STB are identity */
+
+typedef int lbuf_t;
+#define LDB(b, i)      ((b)[i])
+#define STB(b, i, v)   ((b)[i] = (v))
+#define LDO(b, i)      ((b)[i])
+#define STO(b, i, v)   ((b)[i] = (v))
+
+#endif
+
+#endif  /* GALOSH_INT_I16_CLH */

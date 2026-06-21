@@ -12,7 +12,7 @@
 #ifndef GALOSH_INT_P1_CLH
 #define GALOSH_INT_P1_CLH
 
-inline int fxp_estimate_gat_sigma_halfres_stream(__global const int *gat_q20,
+inline int fxp_estimate_gat_sigma_halfres_stream(__global const lbuf_t *gat_q20,
                                                  int width, int height,
                                                  int dy0, int dx0,
                                                  __global int *lap_hist,
@@ -30,9 +30,9 @@ inline int fxp_estimate_gat_sigma_halfres_stream(__global const int *gat_q20,
     for(int x = 0; x < halfwidth - 2; x++) {
       int c0 = 2*x + dx0, c1 = 2*(x+1) + dx0, c2 = 2*(x+2) + dx0;
       if(c2 >= width) break;
-      int v0 = gat_q20[(size_t)r * width + c0];
-      int v1 = gat_q20[(size_t)r * width + c1];
-      int v2 = gat_q20[(size_t)r * width + c2];
+      int v0 = LDB(gat_q20, (size_t)r * width + c0);
+      int v1 = LDB(gat_q20, (size_t)r * width + c1);
+      int v2 = LDB(gat_q20, (size_t)r * width + c2);
       int lap = v0 - (v1 << 1) + v2;
       if(lap < 0) lap = -lap;
       int b = (int)(lap >> 11);
@@ -47,9 +47,9 @@ inline int fxp_estimate_gat_sigma_halfres_stream(__global const int *gat_q20,
     for(int x = 0; x < halfwidth; x++) {
       int c = 2*x + dx0;
       if(c >= width) continue;
-      int v0 = gat_q20[(size_t)r0 * width + c];
-      int v1 = gat_q20[(size_t)r1 * width + c];
-      int v2 = gat_q20[(size_t)r2 * width + c];
+      int v0 = LDB(gat_q20, (size_t)r0 * width + c);
+      int v1 = LDB(gat_q20, (size_t)r1 * width + c);
+      int v2 = LDB(gat_q20, (size_t)r2 * width + c);
       int lap = v0 - (v1 << 1) + v2;
       if(lap < 0) lap = -lap;
       int b = (int)(lap >> 11);
