@@ -1010,6 +1010,7 @@ static void galosh_compute_L_fullres_ewajl3(const float *restrict L,
  *   #else                            → [ARCHIVED] full-res raw WHT-LOSH
  *                                       + block-replicated chroma
  * ================================================================ */
+#ifndef GALOSH_RELEASE  /* ==== [DEPRECATED] variants g,h,i,j,k — ablation builds only ==== */
 static void gat_galosh_denoise_rawlc(const float *const restrict in, float *const restrict out,
                                     const dt_iop_roi_t *const roi,
                                     const float luma_strength, const float chroma_strength,
@@ -3791,6 +3792,7 @@ cleanup_rawlc_k:
  *   よる情報劣化を排除。理論的には K より edge fringe 改善 + 計算
  *   コストやや低減。
  * ================================================================ */
+#endif  /* GALOSH_RELEASE: end deprecated g..k.  L kept = canonical O's small-input fallback. */
 static void gat_galosh_denoise_rawlc_l(const float *const restrict in,
                                        float *const restrict out,
                                        const dt_iop_roi_t *const roi,
@@ -4225,6 +4227,7 @@ cleanup_rawlc_l:
  *   data-driven、全 constant 構造的・教科書的・データ駆動 のいずれか
  *   (= magic-free)。
  * ================================================================ */
+#ifndef GALOSH_RELEASE  /* [DEPRECATED] variant m — ablation builds only */
 static void gat_galosh_denoise_rawlc_m(const float *const restrict in,
                                        float *const restrict out,
                                        const dt_iop_roi_t *const roi,
@@ -4654,6 +4657,7 @@ cleanup_rawlc_m:
  *   各 scale で L_cs_den 由来 guide が効き、 final full-res reconstruct
  *   は L_pixel guide で edge 整合 = L coupling 全段配置 完全保持。
  * ================================================================ */
+#endif  /* GALOSH_RELEASE: end deprecated m */
 static void gat_galosh_denoise_rawlc_o(const float *const restrict in,
                                        float *const restrict out,
                                        const dt_iop_roi_t *const roi,
@@ -5590,6 +5594,7 @@ cleanup_n_chroma:
  *   pooled variance、 LOESS 廃止)、 Phase 9 は joint bilateral upsample
  *   不変 (= L から full-res chroma 高周波借用)。
  * ================================================================ */
+#ifndef GALOSH_RELEASE  /* [DEPRECATED] variant n (-3.4 dB) — ablation builds only */
 static void gat_galosh_denoise_rawlc_n(const float *const restrict in,
                                        float *const restrict out,
                                        const dt_iop_roi_t *const roi,
@@ -6109,6 +6114,7 @@ cleanup_rawlc_n:
 
 
 /* --- main() --- */
+#endif  /* GALOSH_RELEASE: end deprecated n */
 int main(int argc, char **argv)
 {
   /* Strip --stride / --orient / --lfr-kernel flags out of argv before
@@ -6153,6 +6159,7 @@ int main(int argc, char **argv)
        * LATEST), 'n' (DEPRECATED: -3.4 dB), 'm', 'l', 'k', 'j', 'i', 'h',
        * 'g' (= all PREVIOUS for bench). */
       const char ch = a[10];
+#ifndef GALOSH_RELEASE
       if(ch == 'g' || ch == 'G')      g_galosh_variant = 'g';
       else if(ch == 'h' || ch == 'H') g_galosh_variant = 'h';
       else if(ch == 'i' || ch == 'I') g_galosh_variant = 'i';
@@ -6162,6 +6169,10 @@ int main(int argc, char **argv)
       else if(ch == 'm' || ch == 'M') g_galosh_variant = 'm';
       else if(ch == 'n' || ch == 'N') g_galosh_variant = 'n';
       else                            g_galosh_variant = 'o';
+#else
+      g_galosh_variant = 'o';   /* release build: canonical GALOSH_RAW_O only */
+      (void)ch;
+#endif
     }
     else if(strncmp(a, "--pass1=", 8) == 0)
     {
@@ -6373,6 +6384,7 @@ int main(int argc, char **argv)
   {
     if(g_galosh_variant == 'o')
       gat_galosh_denoise_rawlc_o(in, out, &roi, luma_str, chroma_str, 0);
+#ifndef GALOSH_RELEASE  /* deprecated variant dispatch — ablation builds only */
     else if(g_galosh_variant == 'n')
       gat_galosh_denoise_rawlc_n(in, out, &roi, luma_str, chroma_str, 0);
     else if(g_galosh_variant == 'm')
@@ -6389,6 +6401,7 @@ int main(int argc, char **argv)
       gat_galosh_denoise_rawlc_h(in, out, &roi, luma_str, chroma_str, 0);
     else
       gat_galosh_denoise_rawlc(in, out, &roi, luma_str, chroma_str, 0);
+#endif  /* GALOSH_RELEASE: end deprecated variant dispatch */
   }
   else
   {
