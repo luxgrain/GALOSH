@@ -4747,7 +4747,8 @@ kernel void galosh_pass12_o32(
     global       float *restrict output,
     const int width,
     const int height,
-    const float sigma_strength)
+    const float sigma_strength,
+    const int phase_stride)   /* cycle-spin subsample: 1=16 phases(full), 2=4, 4=1 */
 {
   const int tile_x = get_group_id(0) * O32_TILE_SIZE;
   const int tile_y = get_group_id(1) * O32_TILE_SIZE;
@@ -4793,6 +4794,7 @@ kernel void galosh_pass12_o32(
     {
       const int px = phase % PHASE_MOD;
       const int py = phase / PHASE_MOD;
+      if(phase_stride > 1 && ((px % phase_stride) || (py % phase_stride))) continue;  /* cycle-spin subsample */
       const int bpd   = (n_blocks_dim - px + PHASE_MOD - 1) / PHASE_MOD;
       const int bpd_y = (n_blocks_dim - py + PHASE_MOD - 1) / PHASE_MOD;
       const int n_blocks = bpd * bpd_y;
@@ -4895,6 +4897,7 @@ kernel void galosh_pass12_o32(
     {
       const int px = phase % PHASE_MOD;
       const int py = phase / PHASE_MOD;
+      if(phase_stride > 1 && ((px % phase_stride) || (py % phase_stride))) continue;  /* cycle-spin subsample */
       const int bpd   = (n_blocks_dim - px + PHASE_MOD - 1) / PHASE_MOD;
       const int bpd_y = (n_blocks_dim - py + PHASE_MOD - 1) / PHASE_MOD;
       const int n_blocks = bpd * bpd_y;
@@ -6133,138 +6136,136 @@ kernel void galosh_o32_ne_finalize(
   local int   bin_valid   [O32_NE_NBINS];
   local float global_min, global_max;
   local int   n_total_valid;
-  /* PERF + SCALE FIX 2026-05-09:
-   *   Previous: per-WI register array (1024 floats × 32 = 128 KB private
-   *     memory, spilled to DRAM) → 8.67 ms.
-   *   1st fix:  LDS shared buffer (32 bins × 256 floats × 4 = 32 KB)
-   *     → 0.099 ms but SLIGHTLY OVER 32 KB ISP limit AND truncated
-   *     samples beyond cnt=256 (= biased percentile at 4K+ images
-   *     where each bin holds ~4000 vars → 6% sample → bias).
-   *   2nd fix (this): histogram-based percentile.
-   *     - 32 bins × 128 var-bins × int = 16 KB LDS (well under 32 KB)
-   *     - No sample truncation: scales to any image size
-   *     - Per-bin: 2-pass scan (1st: cnt + mean + var range; 2nd:
-   *       hist of var values; cumsum scan to find p5/p20 bins;
-   *       weighted-bin-center sum for mean variance estimate). */
-  local int lds_var_hist[O32_NE_NBINS * NE_FIN_VAR_BINS];
+  local int lds_var_hist[O32_NE_NBINS * NE_FIN_VAR_BINS];   /* 16 KB */
+  /* PARALLELIZED 2026-06-21: was launched 32×32 (1 WI = 1 bin, each WI
+   * re-scanned ALL blocks twice = 12.8 ms @4K).  Now launch 256×256:
+   *   - global min/max via full-WG reduction
+   *   - tpb = 256/32 = 8 threads cooperate per mean-bin: split the block
+   *     scan 8 ways, LDS-reduce the stats, atomic_inc the var-histogram.
+   *   - percentile + WLS unchanged.  FP reduction order differs from the
+   *     serial path, so alpha/σ² shift by FP rounding only (o32 = bit-near,
+   *     quality-validated unchanged).  ~8× → ~1.6 ms. */
+  const int tpb = wg / O32_NE_NBINS;     /* threads per bin (= 8 at lws 256) */
+  const int bin = lid / tpb;             /* 0..O32_NE_NBINS-1 */
+  const int sub = lid % tpb;             /* 0..tpb-1 */
+  local float l_msum[O32_NE_NBINS], l_vmin[O32_NE_NBINS], l_vmax[O32_NE_NBINS];
+  local int   l_cnt [O32_NE_NBINS];
+  local int   r_cnt[256];
+  local float r_a[256], r_b[256], r_c[256];   /* reduction scratch (msum/vmin/vmax) */
 
-  /* Reduce global_min / global_max via WG scan (= valid blocks only). */
-  if(lid == 0)
+  /* ---- global min/max/nvalid via full-WG reduction ---- */
   {
-    float gmin = FLT_MAX, gmax = 0.0f;
-    int   nvalid = 0;
-    for(int i = 0; i < total_blocks; i++)
+    float gmin = FLT_MAX, gmax = 0.0f; int nv = 0;
+    for(int i = lid; i < total_blocks; i += wg)
     {
-      const float bm = blk_mean[i];
-      const float bv = blk_var[i];
+      const float bm = blk_mean[i], bv = blk_var[i];
       if(bm > 0.003f && bm < 0.97f && bv < 1e9f)
-      {
-        if(bm < gmin) gmin = bm;
-        if(bm > gmax) gmax = bm;
-        nvalid++;
-      }
+      { gmin = fmin(gmin, bm); gmax = fmax(gmax, bm); nv++; }
     }
-    global_min   = gmin;
-    global_max   = gmax;
-    n_total_valid = nvalid;
+    r_b[lid] = gmin; r_c[lid] = gmax; r_cnt[lid] = nv;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int s = wg >> 1; s > 0; s >>= 1)
+    {
+      if(lid < s)
+      { r_b[lid] = fmin(r_b[lid], r_b[lid + s]); r_c[lid] = fmax(r_c[lid], r_c[lid + s]);
+        r_cnt[lid] += r_cnt[lid + s]; }
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if(lid == 0) { global_min = r_b[0]; global_max = r_c[0]; n_total_valid = r_cnt[0]; }
+    barrier(CLK_LOCAL_MEM_FENCE);
   }
-  barrier(CLK_LOCAL_MEM_FENCE);
 
   /* Early bail: nothing usable. */
   if(global_max - global_min < 1e-10f)
   {
-    if(get_global_id(0) == 0)
-    {
-      params[P_ALPHA]    = 1e-4f;
-      params[P_SIGMA_SQ] = 1e-6f;
-    }
+    if(lid == 0) { params[P_ALPHA] = 1e-4f; params[P_SIGMA_SQ] = 1e-6f; }
     return;
   }
 
-  const float bw = (global_max - global_min) / (float)O32_NE_NBINS;
+  const float bw     = (global_max - global_min) / (float)O32_NE_NBINS;
+  const float bin_lo = global_min + (float)bin * bw;
+  const float bin_hi = bin_lo + bw;
 
-  /* Per-bin histogram percentile (parallelized: 1 WI = 1 bin).
-   * 2-pass scan over blk_mean[]/blk_var[]:
-   *   Pass 1: count items in this bin + accumulate mean sum + find var range
-   *   Pass 2: histogram var values into 128 bins of [vmin, vmax]
-   *   Cumsum: find p5_bin, p20_bin (= 5%, 20% percentiles)
-   *   Output: weighted-bin-center sum / count of cells in [p5, p20] = mean variance
-   * Scales to any image size (no truncation), LDS-bound (= 16 KB hist). */
-  for(int b = lid; b < O32_NE_NBINS; b += wg)
+  /* ---- Pass1: per-bin cnt/msum/vmin/vmax (tpb threads cooperate per bin) ---- */
   {
-    const float bin_lo = global_min + (float)b * bw;
-    const float bin_hi = bin_lo + bw;
-
-    /* This WI's hist slice (= 128 ints per bin, 1 WI = 1 bin). */
-    local int *vhist = &lds_var_hist[(size_t)b * NE_FIN_VAR_BINS];
-
-    /* Pass 1: cnt + msum + var range. */
-    float msum = 0.0f;
-    int cnt = 0;
-    float vmin = FLT_MAX, vmax = 0.0f;
-    for(int i = 0; i < total_blocks; i++)
+    float msum = 0.0f, vmin = FLT_MAX, vmax = 0.0f; int cnt = 0;
+    for(int i = sub; i < total_blocks; i += tpb)
     {
-      const float bm = blk_mean[i];
-      const float bv = blk_var[i];
+      const float bm = blk_mean[i], bv = blk_var[i];
       if(bm >= bin_lo && bm < bin_hi && bm > 0.003f && bm < 0.97f && bv < 1e9f)
-      {
-        msum += bm;
-        cnt++;
-        if(bv < vmin) vmin = bv;
-        if(bv > vmax) vmax = bv;
-      }
+      { msum += bm; cnt++; vmin = fmin(vmin, bv); vmax = fmax(vmax, bv); }
     }
-
-    if(cnt < 20)
+    r_cnt[lid] = cnt; r_a[lid] = msum; r_b[lid] = vmin; r_c[lid] = vmax;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(int s = tpb >> 1; s > 0; s >>= 1)
     {
-      bin_valid[b] = 0;
-      continue;
+      if(sub < s)
+      { const int o = lid + s; r_cnt[lid] += r_cnt[o]; r_a[lid] += r_a[o];
+        r_b[lid] = fmin(r_b[lid], r_b[o]); r_c[lid] = fmax(r_c[lid], r_c[o]); }
+      barrier(CLK_LOCAL_MEM_FENCE);
     }
+    if(sub == 0)
+    { l_cnt[bin] = r_cnt[lid]; l_msum[bin] = r_a[lid]; l_vmin[bin] = r_b[lid]; l_vmax[bin] = r_c[lid]; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const int   cnt  = l_cnt[bin];
+  const float msum = l_msum[bin];
+  const float vmin = l_vmin[bin];
+  const float vmax = l_vmax[bin];
+  const float vrange = fmax(vmax - vmin, 1e-12f);
+  const float vscale = (float)NE_FIN_VAR_BINS / vrange;
 
-    /* Pass 2: histogram of var values in [vmin, vmax]. */
-    for(int i = 0; i < NE_FIN_VAR_BINS; i++) vhist[i] = 0;
-    const float vrange = fmax(vmax - vmin, 1e-12f);
-    const float vscale = (float)NE_FIN_VAR_BINS / vrange;
-    for(int i = 0; i < total_blocks; i++)
+  /* clear this bin's var-histogram (tpb threads) */
+  for(int i = sub; i < NE_FIN_VAR_BINS; i += tpb)
+    lds_var_hist[bin * NE_FIN_VAR_BINS + i] = 0;
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  /* ---- Pass2: per-bin var histogram (tpb threads, atomic_inc) ---- */
+  if(cnt >= 20)
+  {
+    volatile local int *vhist = &lds_var_hist[bin * NE_FIN_VAR_BINS];
+    for(int i = sub; i < total_blocks; i += tpb)
     {
-      const float bm = blk_mean[i];
-      const float bv = blk_var[i];
+      const float bm = blk_mean[i], bv = blk_var[i];
       if(bm >= bin_lo && bm < bin_hi && bm > 0.003f && bm < 0.97f && bv < 1e9f)
       {
         int vbin = (int)((bv - vmin) * vscale);
         if(vbin < 0) vbin = 0;
         if(vbin >= NE_FIN_VAR_BINS) vbin = NE_FIN_VAR_BINS - 1;
-        vhist[vbin]++;
+        atomic_inc(&vhist[vbin]);
       }
     }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
 
-    /* Cumsum scan: find p5_bin and p20_bin (= 5%, 20% percentiles). */
-    const int p5_target  = cnt / 20;
-    const int p20_target = cnt / 5;
-    int cum = 0;
-    int p5_bin = 0, p20_bin = NE_FIN_VAR_BINS - 1;
-    int found_p5 = 0;
-    for(int i = 0; i < NE_FIN_VAR_BINS; i++)
+  /* ---- percentile + bin_mean/var (sub==0 owns each bin) ---- */
+  if(sub == 0)
+  {
+    if(cnt < 20) { bin_valid[bin] = 0; }
+    else
     {
-      cum += vhist[i];
-      if(!found_p5 && cum >= p5_target) { p5_bin = i; found_p5 = 1; }
-      if(cum >= p20_target) { p20_bin = i; break; }
+      local int *vhist = &lds_var_hist[bin * NE_FIN_VAR_BINS];
+      const int p5_target  = cnt / 20;
+      const int p20_target = cnt / 5;
+      int cum = 0, p5_bin = 0, p20_bin = NE_FIN_VAR_BINS - 1, found_p5 = 0;
+      for(int i = 0; i < NE_FIN_VAR_BINS; i++)
+      {
+        cum += vhist[i];
+        if(!found_p5 && cum >= p5_target) { p5_bin = i; found_p5 = 1; }
+        if(cum >= p20_target) { p20_bin = i; break; }
+      }
+      float vsum = 0.0f; int vcnt = 0;
+      for(int i = p5_bin; i <= p20_bin; i++)
+      {
+        const float bin_center = vmin + ((float)i + 0.5f) / vscale;
+        const int n = vhist[i];
+        vsum += bin_center * (float)n; vcnt += n;
+      }
+      bin_var_arr[bin]  = (vcnt > 0) ? (vsum / (float)vcnt) : (vmin + 0.5f / vscale);
+      bin_mean_arr[bin] = msum / (float)cnt;
+      bin_cnt_arr[bin]  = (vcnt > 0) ? vcnt : 1;
+      bin_valid[bin]    = 1;
     }
-
-    /* Weighted bin-center sum over [p5_bin, p20_bin] = lower-envelope mean var. */
-    float vsum = 0.0f;
-    int vcnt = 0;
-    for(int i = p5_bin; i <= p20_bin; i++)
-    {
-      const float bin_center = vmin + ((float)i + 0.5f) / vscale;
-      const int n = vhist[i];
-      vsum += bin_center * (float)n;
-      vcnt += n;
-    }
-    bin_var_arr[b]  = (vcnt > 0) ? (vsum / (float)vcnt) : (vmin + 0.5f / vscale);
-    bin_mean_arr[b] = msum / (float)cnt;
-    bin_cnt_arr[b]  = (vcnt > 0) ? vcnt : 1;
-    bin_valid[b]    = 1;
   }
   barrier(CLK_LOCAL_MEM_FENCE);
 

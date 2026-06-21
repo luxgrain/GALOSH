@@ -1,7 +1,27 @@
 /* galosh_raw_cpu.c — RAW Bayer GALOSH denoiser (CPU reference).
  *
+ * ============================================================================
+ *  CANONICAL — GALOSH RAW V2  (LOCKED 2026-06-21)
+ *  ---------------------------------------------------------------------------
+ *  The paper pipeline = GALOSH_RAW_O  (--variant=o, DEFAULT; dispatch: any
+ *  --variant not in {g..n} -> 'o').  O = L pipeline + 3-level multi-scale LOESS
+ *  chroma pyramid + L-guided refinement + smoothstep slider walk.
+ *
+ *  "GALOSH RAW V2" ships this single O algorithm at FOUR precisions:
+ *    - CPU  FP32  : variant o   (this file)
+ *    - CPU  INT32 : variant r32 (galosh_raw_cpu_int.c, Q11.20)
+ *    - GPU  FP32  : variant o32 (galosh_raw_gpu.c)        ← GPU canonical
+ *    - GPU  INT16 : variant i16 (galosh_int_*.cl, bit-exact vs r32)
+ *
+ *  ALL of g,h,i,j,k,l,m,n documented below are [DEPRECATED/PREVIOUS] — they are
+ *  the perceptual-evolution lineage that O supersedes (each fixed a chroma
+ *  edge-fringe / blotch artifact; n = -3.4 dB, do NOT use).  Kept in-code for
+ *  ablation/forensic bench only.  GPU --variant=g is likewise DEPRECATED.
+ *  NOTE: the per-variant "[LATEST]" labels below are HISTORICAL — O is latest.
+ * ============================================================================
+ *
  * ##############################################################
- * # [LATEST] GALOSH_RAW_L  (default; selected via --variant=l)
+ * # [PREVIOUS] GALOSH_RAW_L  (selected via --variant=l)
  * ##############################################################
  *   Production canonical pipeline — this is what runs by default.
  *   L = K's two-stage chroma reconstruction (Phase 6 K16 + Phase 8

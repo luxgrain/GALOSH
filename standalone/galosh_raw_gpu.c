@@ -805,7 +805,7 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         clSetKernelArg(k_o32_ne_finalize, 4, sizeof(int), &height);
         clSetKernelArg(k_o32_ne_finalize, 5, sizeof(int), &o32_ne_total);
         clSetKernelArg(k_o32_ne_finalize, 6, sizeof(cl_mem), &params_buf);
-        dispatch_1d_named(queue, k_o32_ne_finalize, 32, 32, "K_O32_P0b ne_finalize");
+        dispatch_1d_named(queue, k_o32_ne_finalize, 256, 256, "K_O32_P0b ne_finalize");  /* parallel: 8 thr/bin */
 
         /* §7.2c-§7.2f histogram-based dark refine (multi-WG parallel).
          * Writes σ² to params[P_SIGMA_SQ]; uses params[P_O32_DARK_THRESH]
@@ -1029,8 +1029,8 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         clSetKernelArg(k_o32_sigma_per_cfa, 1, sizeof(int), &width);
         clSetKernelArg(k_o32_sigma_per_cfa, 2, sizeof(int), &height);
         clSetKernelArg(k_o32_sigma_per_cfa, 3, sizeof(cl_mem), &params_buf);
-        const size_t s_global[1] = { 4 * 64 };  /* 4 WGs × 64 WIs (= O32_SIGMA_WG) */
-        const size_t s_local[1]  = { 64 };
+        const size_t s_global[1] = { 4 * 256 };  /* 4 WGs × 256 WIs (more warps/SM) */
+        const size_t s_local[1]  = { 256 };
         cl_event ev_o32_sig;
         err = clEnqueueNDRangeKernel(queue, k_o32_sigma_per_cfa, 1, NULL,
                                      s_global, s_local, 0, NULL, &ev_o32_sig);
@@ -1323,6 +1323,11 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
             clSetKernelArg(k_o32_pass12, 2, sizeof(int), &width);
             clSetKernelArg(k_o32_pass12, 3, sizeof(int), &height);
             clSetKernelArg(k_o32_pass12, 4, sizeof(float), &luma_strength_o32);
+            int o32_phase_stride = 1;   /* cycle-spin subsample (1=16 phases full) */
+            { const char *ps = getenv("GALOSH_O32_PHASE_STRIDE");
+              if(ps) o32_phase_stride = atoi(ps);
+              if(o32_phase_stride < 1) o32_phase_stride = 1; }
+            clSetKernelArg(k_o32_pass12, 5, sizeof(int), &o32_phase_stride);
 
             const int o32_tile_size = 28;   /* matches galosh.cl O32_TILE_SIZE */
             const int wgd = g_tile_wg_dim;  /* 8 */
@@ -2176,13 +2181,12 @@ int main(int argc, char **argv)
         fprintf(stderr,
             "Usage: %s <in.bin> <out.bin> <W> <H>\n"
             "       <strength> <luma_str> <chroma_str>\n"
-            "       <alpha> <sigma_sq> [cl_dev] [--variant=g|o32]\n"
-            "Variants:\n"
-            "  g    GALOSH_RAW_G (default, production half-res LOSH + EWA-JL3 chromaup)\n"
-            "  o32  GALOSH_RAW_O FP32 GPU port (= mirror of CPU --variant=o)\n"
-            "       AS OF 2026-05-09: only Phase 0-4 implemented; output is\n"
-            "       in_gat_full (Phase 2 end state) for CPU-diff verification.\n"
-            "Note: legacy --variant=o (broken FP16 RAW O) archived to archived_o-broke/.\n",
+            "       <alpha> <sigma_sq> [cl_dev] [--variant=o32|g]\n"
+            "Variants (GALOSH RAW V2):\n"
+            "  o32  CANONICAL GPU FP32 (default) — full-pipeline Phase 0-10 mirror of\n"
+            "       CPU --variant=o (= GALOSH_RAW_O).  This is the paper GPU FP32.\n"
+            "  g    [DEPRECATED] GALOSH_RAW_G (half-res LOSH + EWA-JL3) — chroma fringe,\n"
+            "       superseded by o32; kept bench-only.\n",
             argv[0]);
         return 1;
     }
@@ -2198,7 +2202,7 @@ int main(int argc, char **argv)
 
     /* Optional positional [cl_dev] and named [--variant=g|o32]. */
     int dev = 0;
-    int variant = 0;   /* 0 = G, 32 = o32, 16 = o16 (NYI) */
+    int variant = 32;  /* GALOSH RAW V2: default = o32 (GPU canonical). 0 = g (DEPRECATED) */
     for(int i = 10; i < argc; i++) {
         if(strncmp(argv[i], "--variant=", 10) == 0) {
             const char *v = argv[i] + 10;
