@@ -118,6 +118,18 @@ inline void fxp_acc_madd(fxp_acc *acc, int a, int b) {
   acc->hi += (int)hi_part + (int)add_carry;
 }
 
+/* acc += other   (exact 64-bit add of two paired-int32 accumulators).
+ * Integer addition is associative + commutative, so a PARALLEL tree reduction
+ * that sums the same set of terms via this op yields a result BIT-IDENTICAL to
+ * the serial left-to-right accumulation — the basis for parallelising the
+ * single-WI estimator reductions (P0/P1/P2) without losing r32 bit-exactness. */
+inline void fxp_acc_add_acc(fxp_acc *a, fxp_acc b) {
+  uint lo_old = a->lo;
+  a->lo = lo_old + b.lo;
+  uint carry = (a->lo < lo_old) ? 1u : 0u;
+  a->hi += b.hi + (int)carry;
+}
+
 /* Convert acc -> fxp32 WITHOUT shifting (sum of Q-format additions). */
 inline fxp32 fxp_acc_extract_q20(const fxp_acc *acc) {
   int expected_hi = ((int)acc->lo < 0) ? -1 : 0;

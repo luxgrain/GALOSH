@@ -56,6 +56,14 @@ static void run1(cl_kernel k, size_t gws) {
   cl_int e = clEnqueueNDRangeKernel(queue, k, 1, NULL, &gws, NULL, 0, NULL, NULL);
   CLCHK(e, "ndrange");
 }
+/* explicit local-size launch (for single-workgroup reduction kernels). */
+#define P2_WG_HOST 256   /* must match P2_WG in galosh_int_p2.cl */
+#define P0_WG_HOST 256   /* must match P0_WG in galosh_int_p0.cl */
+#define P1_WG_HOST 256   /* must match P1_WG in galosh_int_p1.cl */
+static void run1l(cl_kernel k, size_t gws, size_t lws) {
+  cl_int e = clEnqueueNDRangeKernel(queue, k, 1, NULL, &gws, &lws, 0, NULL, NULL);
+  CLCHK(e, "ndrange_l");
+}
 static void seti(cl_kernel k, int i, int v) { clSetKernelArg(k, i, sizeof(int), &v); }
 static void setm(cl_kernel k, int i, cl_mem *m) { clSetKernelArg(k, i, sizeof(cl_mem), m); }
 
@@ -285,7 +293,7 @@ int main(int argc, char **argv) {
   setm(kes,5,&b_mean); setm(kes,6,&b_var); setm(kes,7,&b_valid); setm(kes,8,&b_C);
   setm(kes,9,&b_pre); setm(kes,10,&b_vh); setm(kes,11,&b_th); setm(kes,12,&b_lh);
   setm(kes,13,&b_a); setm(kes,14,&b_s);
-  run1(kes, 1);
+  run1l(kes, P0_WG_HOST, P0_WG_HOST);   /* single-workgroup parallel estimate */
   int32_t alpha = 0, sigma = 0;
   clEnqueueReadBuffer(queue, b_a, CL_TRUE, 0, 4, &alpha, 0, NULL, NULL);
   clEnqueueReadBuffer(queue, b_s, CL_TRUE, 0, 4, &sigma, 0, NULL, NULL);
@@ -308,7 +316,7 @@ int main(int argc, char **argv) {
   cl_kernel ksig = mkkern("k_p1_sigma_ch");
   setm(ksig,0,&b_gat); seti(ksig,1,width); seti(ksig,2,height); setm(ksig,3,&b_lhall);
   seti(ksig,4,inv_1p6521); setm(ksig,5,&b_sig);
-  run1(ksig, 4);
+  run1l(ksig, 4 * P1_WG_HOST, P1_WG_HOST);   /* 4 work-groups, one per channel */
   cl_kernel kuni = mkkern("k_p1_unify");
   setm(kuni,0,&b_sig); setm(kuni,1,&b_uni); setm(kuni,2,&b_inv); setm(kuni,3,&b_T);
   run1(kuni, 1);
@@ -331,7 +339,7 @@ int main(int argc, char **argv) {
     setm(kdr,0,&b_in); setm(kdr,1,&b_gat); seti(kdr,2,width); seti(kdr,3,height);
     seti(kdr,4,alpha); seti(kdr,5,sigma); seti(kdr,6,c_0p05); seti(kdr,7,c_50);
     seti(kdr,8,achroma); setm(kdr,9,&b_T); setm(kdr,10,&b_chref);
-    run1(kdr, 1);
+    run1l(kdr, P2_WG_HOST, P2_WG_HOST);   /* single-workgroup LDS reduction */
     cl_kernel ksub = mkkern("k_p2_subtract");
     setm(ksub,0,&b_gat); seti(ksub,1,width); seti(ksub,2,height); setm(ksub,3,&b_chref);
     run1(ksub, npix);
@@ -389,14 +397,15 @@ int main(int argc, char **argv) {
     cl_mem b_pilot = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
     b_lden = mkbuf(CL_MEM_READ_WRITE, npix * 4, NULL);
     cl_kernel kp1 = mkkern("k_p5_pass1");
+    size_t p5_tiles = (size_t)((width + 7) / 8) * ((height + 7) / 8);  /* 64 thr/tile */
     setm(kp1,0,&b_lcs); setm(kp1,1,&b_pilot); seti(kp1,2,width); seti(kp1,3,height);
     setm(kp1,4,&b_T); setm(kp1,5,&b_kai); setm(kp1,6,&b_P5);
-    run1(kp1, npix);
+    run1l(kp1, p5_tiles * 64, 64);
     req(b_pilot, npix, I16_LUMA_SHIFT);    /* pilot = luma line buffer */
     cl_kernel kp2 = mkkern("k_p5_pass2");
     setm(kp2,0,&b_lcs); setm(kp2,1,&b_pilot); setm(kp2,2,&b_lden);
     seti(kp2,3,width); seti(kp2,4,height); setm(kp2,5,&b_kai); setm(kp2,6,&b_P5);
-    run1(kp2, npix);
+    run1l(kp2, p5_tiles * 64, 64);
     req(b_lden, npix, I16_LUMA_SHIFT);    /* L_cs_den = luma line buffer */
     if(phase == 5) {
       int32_t *pbuf = malloc(npix * 4);

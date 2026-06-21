@@ -9,7 +9,162 @@
  *  via fxp_from_float and passed in.  Depends on galosh_int.clh + tbl (sqrt).
  * ========================================================================== */
 
-__kernel void k_p2_dark_ref(__global const int *in_q20, __global const lbuf_t *in_gat,
+/* ----------------------------------------------------------------------------
+ * k_p2_dark_ref — PARALLEL (single-workgroup, LDS tree reduction).
+ *
+ * The IRLS iterations are inherently sequential (each weight depends on the
+ * prior s_scale / ch estimate), so they stay inside ONE kernel; but the inner
+ * sum over all 2x2 achromatic cells — the cost — is split across P2_WG threads
+ * and tree-reduced in local memory.  Because fxp_acc integer accumulation is
+ * exact and order-independent, the reduced total is BIT-IDENTICAL to the serial
+ * left-to-right sum (k_p2_dark_ref_serial below) -> r32 bit-exactness preserved.
+ *
+ * Launch with global=local=P2_WG (a single work-group; OpenCL has no global
+ * barrier, so cross-iteration sync must stay within one group).  Self-contained
+ * + LDS-resident, matching the GPU-ISP streaming design policy.
+ * -------------------------------------------------------------------------- */
+#define P2_WG 256
+
+/* tree-reduce the per-thread partial `myacc` into lred[0] (all threads call). */
+#define P2_REDUCE(lred, tid, myacc) do { \
+  (lred)[(tid)] = (myacc); barrier(CLK_LOCAL_MEM_FENCE); \
+  for(int _st = P2_WG >> 1; _st > 0; _st >>= 1) { \
+    if((tid) < _st) fxp_acc_add_acc(&(lred)[(tid)], (lred)[(tid) + _st]); \
+    barrier(CLK_LOCAL_MEM_FENCE); } \
+} while(0)
+
+__kernel __attribute__((reqd_work_group_size(P2_WG, 1, 1)))
+void k_p2_dark_ref(__global const int *in_q20, __global const lbuf_t *in_gat,
+                   int width, int height, int alpha, int sigma_sq,
+                   int c_0p05, int c_50, int achroma,
+                   __constant fxp_tables *T, __global int *ch_out) {
+  const int tid = get_local_id(0);
+  __local fxp_acc lred[P2_WG];
+  __local int l_ch[4];
+  __local int l_sscale;
+
+  int s_init = fxp_div_q20(sigma_sq, alpha < 1 ? 1 : alpha);
+  if(s_init < 1) s_init = 1;
+  int s_min = fxp_mul(s_init, c_0p05);
+  int s_max = fxp_mul(s_init, c_50);
+  if(s_min < 1) s_min = 1;
+  if(tid == 0) l_sscale = s_init;
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  const int n_cc = width / 2, n_cr = height / 2;   /* cell grid (br,bc step 2) */
+  const long ncells = (long)n_cr * n_cc;
+  const int n_iter = 2;
+
+  for(int iter = 0; iter <= n_iter; iter++) {
+    int s_scale = l_sscale;
+    int inv_s = fxp_recip(s_scale < 1 ? 1 : s_scale);
+
+    /* ---- mean pass: per-thread partial sums over a cell stride ---- */
+    fxp_acc my_sw = fxp_acc_zero();
+    fxp_acc my_sw0 = fxp_acc_zero(), my_sw1 = fxp_acc_zero();
+    fxp_acc my_sw2 = fxp_acc_zero(), my_sw3 = fxp_acc_zero();
+    for(long ci = tid; ci < ncells; ci += P2_WG) {
+      int cr = (int)(ci / n_cc), cc = (int)(ci - (long)cr * n_cc);
+      int br = 2 * cr, bc = 2 * cc;
+      int g0 = LDB(in_gat, (size_t)br     * width + bc    );
+      int g1 = LDB(in_gat, (size_t)(br+1) * width + bc    );
+      int g2 = LDB(in_gat, (size_t)br     * width + bc + 1);
+      int g3 = LDB(in_gat, (size_t)(br+1) * width + bc + 1);
+      int gmax = g0; if(g1 > gmax) gmax = g1; if(g2 > gmax) gmax = g2; if(g3 > gmax) gmax = g3;
+      int gmin = g0; if(g1 < gmin) gmin = g1; if(g2 < gmin) gmin = g2; if(g3 < gmin) gmin = g3;
+      if(gmax - gmin > achroma) continue;
+      int iv0 = in_q20[(size_t)br     * width + bc    ];
+      int iv1 = in_q20[(size_t)(br+1) * width + bc    ];
+      int iv2 = in_q20[(size_t)br     * width + bc + 1];
+      int iv3 = in_q20[(size_t)(br+1) * width + bc + 1];
+      int L_raw = (iv0 + iv1 + iv2 + iv3) >> 2;
+      int r  = fxp_mul(L_raw, inv_s);
+      int r2 = fxp_mul(r, r);
+      int r4 = fxp_mul(r2, r2);
+      int denom = (r4 < FXP_MAX_INT - FXP_ONE) ? (FXP_ONE + r4) : FXP_MAX_INT;
+      int w = fxp_recip(denom);
+      if(w <= 0) continue;
+      fxp_acc_add_i32(&my_sw,  w  >> 10);
+      fxp_acc_add_i32(&my_sw0, fxp_mul(w, g0) >> 10);
+      fxp_acc_add_i32(&my_sw1, fxp_mul(w, g1) >> 10);
+      fxp_acc_add_i32(&my_sw2, fxp_mul(w, g2) >> 10);
+      fxp_acc_add_i32(&my_sw3, fxp_mul(w, g3) >> 10);
+    }
+    P2_REDUCE(lred, tid, my_sw);  int sw_q  = fxp_acc_extract_q20(&lred[0]);
+    P2_REDUCE(lred, tid, my_sw0); int sw0_q = fxp_acc_extract_q20(&lred[0]);
+    P2_REDUCE(lred, tid, my_sw1); int sw1_q = fxp_acc_extract_q20(&lred[0]);
+    P2_REDUCE(lred, tid, my_sw2); int sw2_q = fxp_acc_extract_q20(&lred[0]);
+    P2_REDUCE(lred, tid, my_sw3); int sw3_q = fxp_acc_extract_q20(&lred[0]);
+    if(tid == 0) {
+      if(sw_q < 1) sw_q = 1;
+      int inv_sw = fxp_recip(sw_q);
+      l_ch[0] = fxp_mul(sw0_q, inv_sw);
+      l_ch[1] = fxp_mul(sw1_q, inv_sw);
+      l_ch[2] = fxp_mul(sw2_q, inv_sw);
+      l_ch[3] = fxp_mul(sw3_q, inv_sw);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if(iter == n_iter) break;
+
+    /* ---- variance pass: residual-weighted MSE -> s_scale update ---- */
+    int ch0 = l_ch[0], ch1 = l_ch[1], ch2 = l_ch[2], ch3 = l_ch[3];
+    fxp_acc my_swW = fxp_acc_zero(), my_swR2 = fxp_acc_zero();
+    for(long ci = tid; ci < ncells; ci += P2_WG) {
+      int cr = (int)(ci / n_cc), cc = (int)(ci - (long)cr * n_cc);
+      int br = 2 * cr, bc = 2 * cc;
+      int g0 = LDB(in_gat, (size_t)br     * width + bc    );
+      int g1 = LDB(in_gat, (size_t)(br+1) * width + bc    );
+      int g2 = LDB(in_gat, (size_t)br     * width + bc + 1);
+      int g3 = LDB(in_gat, (size_t)(br+1) * width + bc + 1);
+      int gmax = g0; if(g1 > gmax) gmax = g1; if(g2 > gmax) gmax = g2; if(g3 > gmax) gmax = g3;
+      int gmin = g0; if(g1 < gmin) gmin = g1; if(g2 < gmin) gmin = g2; if(g3 < gmin) gmin = g3;
+      if(gmax - gmin > achroma) continue;
+      int iv0 = in_q20[(size_t)br     * width + bc    ];
+      int iv1 = in_q20[(size_t)(br+1) * width + bc    ];
+      int iv2 = in_q20[(size_t)br     * width + bc + 1];
+      int iv3 = in_q20[(size_t)(br+1) * width + bc + 1];
+      int L_raw = (iv0 + iv1 + iv2 + iv3) >> 2;
+      int r  = fxp_mul(L_raw, inv_s);
+      int r2 = fxp_mul(r, r);
+      int r4 = fxp_mul(r2, r2);
+      int denom = (r4 < FXP_MAX_INT - FXP_ONE) ? (FXP_ONE + r4) : FXP_MAX_INT;
+      int w = fxp_recip(denom);
+      if(w <= 0) continue;
+      int d0 = g0 - ch0, d1 = g1 - ch1, d2 = g2 - ch2, d3 = g3 - ch3;
+      int r2_sum = fxp_mul(d0, d0) + fxp_mul(d1, d1) + fxp_mul(d2, d2) + fxp_mul(d3, d3);
+      int wr2 = (fxp_mul(w, r2_sum) >> 2) >> 10;
+      fxp_acc_add_i32(&my_swW,  w >> 10);
+      fxp_acc_add_i32(&my_swR2, wr2);
+    }
+    P2_REDUCE(lred, tid, my_swW);  int swW_q  = fxp_acc_extract_q20(&lred[0]);
+    P2_REDUCE(lred, tid, my_swR2); int swR2_q = fxp_acc_extract_q20(&lred[0]);
+    if(tid == 0) {
+      if(swW_q < 1) swW_q = 1;
+      int mse = fxp_mul(swR2_q, fxp_recip(swW_q));
+      if(mse < 1) mse = 1;
+      int measured_std = fxp_sqrt(mse, T);
+      if(measured_std < 1) measured_std = 1;
+      int ratio = fxp_recip(measured_std);
+      int sqrt_ratio = fxp_sqrt(ratio, T);
+      int ns = fxp_mul(s_scale, sqrt_ratio);
+      if(ns < s_min) ns = s_min;
+      if(ns > s_max) ns = s_max;
+      l_sscale = ns;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+
+  if(tid == 0) {
+    ch_out[0] = l_ch[0]; ch_out[1] = l_ch[1]; ch_out[2] = l_ch[2]; ch_out[3] = l_ch[3];
+  }
+}
+
+/* ----------------------------------------------------------------------------
+ * [DEPRECATED] k_p2_dark_ref_serial — original single work-item reference.
+ * Retained as the bit-exact serial oracle for the parallel kernel above
+ * (codebase = long-term memory of the port).  Not launched in production.
+ * -------------------------------------------------------------------------- */
+__kernel void k_p2_dark_ref_serial(__global const int *in_q20, __global const lbuf_t *in_gat,
                             int width, int height, int alpha, int sigma_sq,
                             int c_0p05, int c_50, int achroma,
                             __constant fxp_tables *T, __global int *ch_out) {
