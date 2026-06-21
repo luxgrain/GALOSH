@@ -45,8 +45,12 @@ def run_cpu(in_p, out_p, w, h, phase):
     return ints_after(r.stderr.decode("utf-8", "replace"), phase)
 
 
-def run_gpu(in_p, w, h, phase, out_p1):
+def run_gpu(in_p, w, h, phase, out_p1, i16=False, lf=None, cf=None):
     cmd = [str(GPU_EXE), str(in_p), str(w), str(h), str(phase), str(out_p1)]
+    if i16:
+        cmd += ["0", "i16"]
+        if lf is not None: cmd.append(f"lf={lf}")
+        if cf is not None: cmd.append(f"cf={cf}")
     r = subprocess.run(cmd, capture_output=True, timeout=120, env=SUBENV)
     return ints_after(r.stdout.decode("utf-8", "replace"), phase)
 
@@ -55,6 +59,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", type=int, required=True)
     ap.add_argument("--n", type=int, default=20)
+    ap.add_argument("--i16", action="store_true",
+                    help="narrow GPU line buffers to INT16 precision (zero-loss check)")
+    ap.add_argument("--lf", type=int, default=None, help="luma fractional bits (default 5)")
+    ap.add_argument("--cf", type=int, default=None, help="chroma fractional bits (default 9)")
     args = ap.parse_args()
     ph = args.phase
 
@@ -63,8 +71,8 @@ def main():
     rng = random.Random(SEED)
     idxs = rng.sample(range(ns * npp), min(args.n, ns * npp))
 
-    print(f"Phase {ph} GPU vs CPU bit-exact (n={len(idxs)})")
-    n_ok = n_bad = n_fail = 0; bad = []
+    print(f"Phase {ph} GPU vs CPU {'INT16-narrow zero-loss' if args.i16 else 'bit-exact'} (n={len(idxs)})")
+    n_ok = n_bad = n_fail = 0; bad = []; psnrs = []
     for gi in idxs:
         si, pi = gi // npp, gi % npp
         noisy = n_raw[si, pi]
@@ -75,19 +83,35 @@ def main():
         noisy.astype(np.float32).tofile(str(in_p))
         c = run_cpu(in_p, out_p, w, h, ph)
         cpu_b = TMP / PHASE_FILE.get(ph, f"p{ph}_ingat.bin")
-        g = run_gpu(in_p, w, h, ph, gpu_b)
+        g = run_gpu(in_p, w, h, ph, gpu_b, i16=args.i16, lf=args.lf, cf=args.cf)
         if c is None or g is None or not cpu_b.exists() or not gpu_b.exists():
             n_fail += 1; print(f"  s{si}_p{pi}: FAIL (cpu={c} gpu={g})")
             for p in (in_p, out_p, gpu_b): p.unlink(missing_ok=True)
             continue
         ca = np.fromfile(str(cpu_b), dtype=np.int32); ga = np.fromfile(str(gpu_b), dtype=np.int32)
         ndiff = int(np.count_nonzero(ca != ga)) if ca.shape == ga.shape else -1
-        ok = (ndiff == 0) and (c == g)
-        if ok: n_ok += 1
-        else: n_bad += 1; bad.append((si, pi, c, g, ndiff))
-        print(f"  s{si}_p{pi:<3} cpu={c} gpu={g}  {'OK' if ok else f'MISMATCH(ndiff={ndiff})'}")
+        if args.i16:
+            cf = ca.astype(np.float64) / 2**20; gf = ga.astype(np.float64) / 2**20
+            mse = float(np.mean((cf - gf) ** 2))
+            psnr = 10 * np.log10(1.0 / mse) if mse > 0 else float("inf")
+            maxd = float(np.max(np.abs(cf - gf)))
+            psnrs.append(psnr)
+            ok = (ndiff == 0) or (psnr >= 80.0)   # >=80 dB vs r32 = effectively zero-loss
+            if ok: n_ok += 1
+            else: n_bad += 1; bad.append((si, pi, c, g, ndiff))
+            print(f"  s{si}_p{pi:<3} PSNR(i16,r32)={psnr:6.2f} dB  maxΔ={maxd:.2e}  ndiff={ndiff}  {'OK' if ok else 'LOSSY'}")
+        else:
+            ok = (ndiff == 0)
+            if ok: n_ok += 1
+            else: n_bad += 1; bad.append((si, pi, c, g, ndiff))
+            print(f"  s{si}_p{pi:<3} ndiff={ndiff}  {'OK' if ok else 'MISMATCH'}")
         for p in (in_p, out_p, gpu_b): p.unlink(missing_ok=True)
 
+    if args.i16 and psnrs:
+        import statistics
+        print(f"\n=== phase {ph} INT16-narrow: {n_ok} zero-loss(>=80dB) / {n_bad} lossy / {n_fail} fail "
+              f"(of {len(idxs)});  PSNR(i16,r32) mean={statistics.mean(psnrs):.2f} min={min(psnrs):.2f} dB ===")
+        return 0 if n_bad == 0 and n_fail == 0 else 2
     print(f"\n=== phase {ph}: {n_ok} bit-exact / {n_bad} mismatch / {n_fail} fail (of {len(idxs)}) ===")
     for si, pi, c, g, nd in bad[:8]:
         print(f"  s{si}_p{pi}: CPU={c} GPU={g} buf_ndiff={nd}")

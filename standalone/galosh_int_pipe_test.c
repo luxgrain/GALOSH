@@ -133,6 +133,24 @@ static void build_foi_lut(const fxp_gat_params *gat_p, fxp_gat_inv_table_t *tbl)
   tbl->valid = 1;
 }
 
+/* INT16 line-buffer narrowing (requantize a Q11.20 line buffer to its INT16
+ * storage precision in place).  luma Q10.5 -> shift 15, chroma Q6.9 -> 11. */
+static int g_i16 = 0;
+/* CORRECTED i16 line-buffer format (empirical, full-pipeline 2026-06-21):
+ * BOTH luma and chroma = Q6.9 (frac 9, +-64).  The earlier design assumed luma
+ * Q10.5 (frac 5) on the basis of the 441-max PRE-normalize GAT — but the LINE
+ * BUFFERS hold the NORMALISED luma (<=~64), so frac 5 wastes range and is lossy
+ * (PSNR(i16,r32) 63-79 dB), while frac 9 is effectively zero-loss (>=~80 dB,
+ * mean ~95).  frac 11 (Q4.11 +-16) saturates the luma and is catastrophic. */
+static int I16_LUMA_SHIFT = 11;     /* 20 - luma_frac  (Q6.9, frac 9) */
+static int I16_CHROMA_SHIFT = 11;   /* 20 - chroma_frac (Q6.9, frac 9) */
+static void req(cl_mem buf, size_t n, int store_shift) {
+  if(!g_i16 || store_shift <= 0) return;   /* store_shift<=0 (frac>=20) = no narrowing */
+  cl_kernel k = mkkern("k_requant_i16");
+  setm(k,0,&buf); seti(k,1,(int)n); seti(k,2,store_shift);
+  run1(k, n); clReleaseKernel(k);
+}
+
 int main(int argc, char **argv) {
   if(argc < 6) { fprintf(stderr, "usage: %s <in.bin> <w> <h> <phase> <out.bin> [dev]\n", argv[0]); return 1; }
   const char *in_path = argv[1];
@@ -140,6 +158,11 @@ int main(int argc, char **argv) {
   int phase = atoi(argv[4]);
   const char *out_path = argv[5];
   int dev_idx = (argc > 6) ? atoi(argv[6]) : 0;
+  for(int ai = 1; ai < argc; ai++) {
+    if(!strcmp(argv[ai], "i16")) g_i16 = 1;
+    else if(!strncmp(argv[ai], "lf=", 3)) I16_LUMA_SHIFT   = 20 - atoi(argv[ai] + 3);
+    else if(!strncmp(argv[ai], "cf=", 3)) I16_CHROMA_SHIFT = 20 - atoi(argv[ai] + 3);
+  }
   size_t npix = (size_t)width * height;
   int npix_i = (int)npix;
 
@@ -180,8 +203,8 @@ int main(int argc, char **argv) {
                           "galosh_int_p0.cl", "galosh_int_p1.cl", "galosh_int_p2.cl",
                           "galosh_int_p3.cl", "galosh_int_p4.cl", "galosh_int_p5.cl",
                           "galosh_int_p6.cl", "galosh_int_p7.cl", "galosh_int_p8.cl",
-                          "galosh_int_p10.cl" };
-  const int nfiles = 17;
+                          "galosh_int_p10.cl", "galosh_int_i16.cl" };
+  const int nfiles = 18;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -250,6 +273,7 @@ int main(int argc, char **argv) {
   cl_kernel knorm = mkkern("k_p1_normalize");
   setm(knorm,0,&b_gat); seti(knorm,1,npix_i); setm(knorm,2,&b_inv);
   run1(knorm, npix);
+  req(b_gat, npix, I16_LUMA_SHIFT);    /* in_gat = luma line buffer */
 
   int32_t unified = 0, sig_ch[4] = {0,0,0,0};
   clEnqueueReadBuffer(queue, b_uni, CL_TRUE, 0, 4, &unified, 0, NULL, NULL);
@@ -269,6 +293,7 @@ int main(int argc, char **argv) {
     cl_kernel ksub = mkkern("k_p2_subtract");
     setm(ksub,0,&b_gat); seti(ksub,1,width); seti(ksub,2,height); setm(ksub,3,&b_chref);
     run1(ksub, npix);
+    req(b_gat, npix, I16_LUMA_SHIFT);    /* in_gat (post dark-subtract) */
     clEnqueueReadBuffer(queue, b_chref, CL_TRUE, 0, 16, ch_ref, 0, NULL, NULL);
     clFinish(queue);
   }
@@ -279,6 +304,7 @@ int main(int argc, char **argv) {
     cl_kernel kl = mkkern("k_p3_forward_l");
     setm(kl,0,&b_gat); setm(kl,1,&b_lcs); seti(kl,2,width); seti(kl,3,height);
     run1(kl, npix);
+    req(b_lcs, npix, I16_LUMA_SHIFT);    /* L_cs = luma line buffer */
   }
 
   /* ---- P4: half-res chroma (parallel; consumes P2 in_gat, not L_cs) ---- */
@@ -324,10 +350,12 @@ int main(int argc, char **argv) {
     setm(kp1,0,&b_lcs); setm(kp1,1,&b_pilot); seti(kp1,2,width); seti(kp1,3,height);
     setm(kp1,4,&b_T); setm(kp1,5,&b_kai); setm(kp1,6,&b_P5);
     run1(kp1, npix);
+    req(b_pilot, npix, I16_LUMA_SHIFT);    /* pilot = luma line buffer */
     cl_kernel kp2 = mkkern("k_p5_pass2");
     setm(kp2,0,&b_lcs); setm(kp2,1,&b_pilot); setm(kp2,2,&b_lden);
     seti(kp2,3,width); seti(kp2,4,height); setm(kp2,5,&b_kai); setm(kp2,6,&b_P5);
     run1(kp2, npix);
+    req(b_lden, npix, I16_LUMA_SHIFT);    /* L_cs_den = luma line buffer */
     if(phase == 5) {
       int32_t *pbuf = malloc(npix * 4);
       clEnqueueReadBuffer(queue, b_lden, CL_TRUE, 0, npix * 4, pbuf, 0, NULL, NULL);
@@ -378,35 +406,45 @@ int main(int argc, char **argv) {
       setm(kc,0,&b_gat); setm(kc,1,&c1h); setm(kc,2,&c2h); setm(kc,3,&c3h);
       seti(kc,4,width); seti(kc,5,height); seti(kc,6,halfw); seti(kc,7,halfh);
       run1(kc, chs); clReleaseKernel(kc); }
+    req(c1h, chs, I16_CHROMA_SHIFT); req(c2h, chs, I16_CHROMA_SHIFT); req(c3h, chs, I16_CHROMA_SHIFT);
     cl_mem lhden = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
     { cl_kernel k6 = mkkern("k_p6_l_h_den");
       setm(k6,0,&b_lden); setm(k6,1,&lhden); seti(k6,2,width); seti(k6,3,height);
       seti(k6,4,halfw); seti(k6,5,halfh); run1(k6, chs); clReleaseKernel(k6); }
+    req(lhden, chs, I16_LUMA_SHIFT);
 
     /* L + C pyramids */
     cl_mem lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL);
-    p7_box_down(lhden, lq, halfw, halfh, cqs);
-    p7_box_down(lq, le, cqw, cqh, ces);
+    p7_box_down(lhden, lq, halfw, halfh, cqs);  req(lq, cqs, I16_LUMA_SHIFT);
+    p7_box_down(lq, le, cqw, cqh, ces);         req(le, ces, I16_LUMA_SHIFT);
     cl_mem c1q = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c2q = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c3q = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL);
     p7_box_down(c1h, c1q, halfw, halfh, cqs); p7_box_down(c2h, c2q, halfw, halfh, cqs); p7_box_down(c3h, c3q, halfw, halfh, cqs);
+    req(c1q, cqs, I16_CHROMA_SHIFT); req(c2q, cqs, I16_CHROMA_SHIFT); req(c3q, cqs, I16_CHROMA_SHIFT);
     cl_mem c1e = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c2e = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c3e = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL);
     p7_box_down(c1q, c1e, cqw, cqh, ces); p7_box_down(c2q, c2e, cqw, cqh, ces); p7_box_down(c3q, c3e, cqw, cqh, ces);
+    req(c1e, ces, I16_CHROMA_SHIFT); req(c2e, ces, I16_CHROMA_SHIFT); req(c3e, ces, I16_CHROMA_SHIFT);
 
     /* LOESS @ each scale */
     cl_mem c1lh = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2lh = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3lh = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
     p7_loess(lhden, c1h, c2h, c3h, c1lh, c2lh, c3lh, halfw, halfh, eps, inv2s, b_T, chs);
+    req(c1lh, chs, I16_CHROMA_SHIFT); req(c2lh, chs, I16_CHROMA_SHIFT); req(c3lh, chs, I16_CHROMA_SHIFT);
     cl_mem c1lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c2lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c3lq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL);
     p7_loess(lq, c1q, c2q, c3q, c1lq, c2lq, c3lq, cqw, cqh, eps, inv2s, b_T, cqs);
+    req(c1lq, cqs, I16_CHROMA_SHIFT); req(c2lq, cqs, I16_CHROMA_SHIFT); req(c3lq, cqs, I16_CHROMA_SHIFT);
     cl_mem c1le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c2le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL), c3le = mkbuf(CL_MEM_READ_WRITE, ces*4, NULL);
     p7_loess(le, c1e, c2e, c3e, c1le, c2le, c3le, cew, ceh, eps, inv2s, b_T, ces);
+    req(c1le, ces, I16_CHROMA_SHIFT); req(c2le, ces, I16_CHROMA_SHIFT); req(c3le, ces, I16_CHROMA_SHIFT);
 
     /* K16 upsample: quarter->half, eighth->quarter, (eighth)quarter->half */
     cl_mem c1qup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2qup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3qup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
     p7_k16(c1lq, c2lq, c3lq, lhden, c1qup, c2qup, c3qup, cqw, cqh, inv2s_k16, b_T, chs);
+    req(c1qup, chs, I16_CHROMA_SHIFT); req(c2qup, chs, I16_CHROMA_SHIFT); req(c3qup, chs, I16_CHROMA_SHIFT);
     cl_mem c1eq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c2eq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL), c3eq = mkbuf(CL_MEM_READ_WRITE, cqs*4, NULL);
     p7_k16(c1le, c2le, c3le, lq, c1eq, c2eq, c3eq, cew, ceh, inv2s_k16, b_T, cqs);
+    req(c1eq, cqs, I16_CHROMA_SHIFT); req(c2eq, cqs, I16_CHROMA_SHIFT); req(c3eq, cqs, I16_CHROMA_SHIFT);
     cl_mem c1eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c2eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL), c3eup = mkbuf(CL_MEM_READ_WRITE, chs*4, NULL);
     p7_k16(c1eq, c2eq, c3eq, lhden, c1eup, c2eup, c3eup, cqw, cqh, inv2s_k16, b_T, chs);
+    req(c1eup, chs, I16_CHROMA_SHIFT); req(c2eup, chs, I16_CHROMA_SHIFT); req(c3eup, chs, I16_CHROMA_SHIFT);
 
     if(phase == 7) {
       cl_mem outs[9] = { c1lh, c2lh, c3lh, c1qup, c2qup, c3qup, c1eup, c2eup, c3eup };
@@ -431,6 +469,7 @@ int main(int argc, char **argv) {
       setm(k8,6,&h1); setm(k8,7,&h2); setm(k8,8,&h3);
       seti(k8,9,(int)chs); seti(k8,10,oneMt); seti(k8,11,t8);
       run1(k8, chs); clReleaseKernel(k8); }
+    req(h1, chs, I16_CHROMA_SHIFT); req(h2, chs, I16_CHROMA_SHIFT); req(h3, chs, I16_CHROMA_SHIFT);
     if(phase == 8) {
       int32_t *o8 = malloc(chs*4*3);
       clEnqueueReadBuffer(queue, h1, CL_TRUE, 0, chs*4, o8, 0, NULL, NULL);
@@ -447,8 +486,10 @@ int main(int argc, char **argv) {
     { cl_kernel k6a = mkkern("k_p6_l_pixel");
       setm(k6a,0,&b_lden); setm(k6a,1,&lpix); seti(k6a,2,width); seti(k6a,3,height);
       run1(k6a, npix); clReleaseKernel(k6a); }
+    req(lpix, npix, I16_LUMA_SHIFT);    /* L_pixel = luma line buffer */
     cl_mem a1 = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL), a2 = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL), a3 = mkbuf(CL_MEM_READ_WRITE, npix*4, NULL);
     p7_k16(h1, h2, h3, lpix, a1, a2, a3, halfw, halfh, inv2s_k16, b_T, npix);
+    req(a1, npix, I16_CHROMA_SHIFT); req(a2, npix, I16_CHROMA_SHIFT); req(a3, npix, I16_CHROMA_SHIFT);
     if(phase == 9) {
       int32_t *o9 = malloc(npix*4*3);
       clEnqueueReadBuffer(queue, a1, CL_TRUE, 0, npix*4, o9, 0, NULL, NULL);
