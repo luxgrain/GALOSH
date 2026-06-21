@@ -2714,6 +2714,20 @@ int main(int argc, char **argv) {
       fclose(df);
     }
   }
+  {
+    const char *raw_dir = getenv("GALOSH_INT_RAW_DUMP_DIR");
+    if(raw_dir) {
+      char path[1024]; snprintf(path, sizeof(path), "%s/p7_loess_h.bin", raw_dir);
+      FILE *df = fopen(path, "wb");
+      if(df) {
+        fwrite(C1_loess_h, sizeof(fxp32), chsize, df);
+        fwrite(C2_loess_h, sizeof(fxp32), chsize, df);
+        fwrite(C3_loess_h, sizeof(fxp32), chsize, df);
+        fclose(df);
+      }
+      fprintf(stderr, "  P7_RAW loess_h n=%d\n", (int)chsize);
+    }
+  }
 
   /* ========== Phase 8: smoothstep slider walk over 4 chroma anchors ========== */
   fxp32 *C1_h_den_q20 = (fxp32 *)malloc(chsize * sizeof(fxp32));

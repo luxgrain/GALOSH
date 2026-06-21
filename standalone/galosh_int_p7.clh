@@ -1,0 +1,112 @@
+/* ============================================================================
+ *  galosh_int_p7.clh  — Phase 7 device functions (LOESS chroma + box down).
+ *
+ *  p7_loess_pixel : one output pixel of fxp_loess_chroma_3ch_r — R=7 Y-guided
+ *  bilateral local linear regression, 3 chroma channels, TWO-PASS centred
+ *  covariance (the foodstuff2 fix).  Per-output-pixel parallel (no cross-pixel
+ *  dependency, no overlap-add) so it ports directly.  The per-window cache
+ *  (w_buf/Y_buf/C*_buf, 225 of 256) is PRIVATE — bit-exact mirror of the CPU.
+ *
+ *  Depends on galosh_int.clh + galosh_int_tbl.clh (fxp_exp).
+ * ========================================================================== */
+#ifndef GALOSH_INT_P7_CLH
+#define GALOSH_INT_P7_CLH
+
+#define P7_LOESS_RADIUS 7
+
+inline int fxp_reflect_idx(int i, int n) {
+  if(i < 0)  return -i;
+  if(i >= n) return 2 * n - i - 2;
+  return i;
+}
+
+inline void p7_loess_pixel(__global const int *y_guide,
+                           __global const int *c1_in, __global const int *c2_in,
+                           __global const int *c3_in, int width, int height,
+                           int x, int y, int eps_gat_scaled, int inv_2sigma_sq,
+                           __constant const fxp_tables *T,
+                           int *o1, int *o2, int *o3) {
+  const int R = P7_LOESS_RADIUS;
+  size_t cx = (size_t)y * width + x;
+  int Y_c_orig = y_guide[cx];
+  int Y_c = Y_c_orig >> 4;
+
+  int w_buf[256], Y_buf[256], C1_buf[256], C2_buf[256], C3_buf[256];
+  int nb = 0;
+  fxp_acc sumW = fxp_acc_zero(), sumY = fxp_acc_zero();
+  fxp_acc sumC1 = fxp_acc_zero(), sumC2 = fxp_acc_zero(), sumC3 = fxp_acc_zero();
+
+  for(int dy = -R; dy <= R; dy++) {
+    int yi = fxp_reflect_idx(y + dy, height);
+    size_t row_off = (size_t)yi * width;
+    for(int dx = -R; dx <= R; dx++) {
+      int xi = fxp_reflect_idx(x + dx, width);
+      int Yi_orig  = y_guide[row_off + xi];
+      int C1i_orig = c1_in[row_off + xi];
+      int C2i_orig = c2_in[row_off + xi];
+      int C3i_orig = c3_in[row_off + xi];
+      int dY = Yi_orig - Y_c_orig;
+      fxp_acc dY_sq_acc = fxp_acc_zero();
+      fxp_acc_madd(&dY_sq_acc, dY, dY);
+      int dY_sq = fxp_acc_to_fxp32(&dY_sq_acc);
+      int arg = -fxp_mul(dY_sq, inv_2sigma_sq);
+      if(arg < -16 * FXP_ONE) arg = -16 * FXP_ONE;
+      if(arg > 0) arg = 0;
+      int w = fxp_exp(arg, T);
+
+      int Yi  = Yi_orig  >> 4;
+      int C1i = C1i_orig >> 4;
+      int C2i = C2i_orig >> 4;
+      int C3i = C3i_orig >> 4;
+
+      w_buf[nb] = w; Y_buf[nb] = Yi;
+      C1_buf[nb] = C1i; C2_buf[nb] = C2i; C3_buf[nb] = C3i; nb++;
+      fxp_acc_add_i32(&sumW, w);
+      fxp_acc_madd(&sumY,  w, Yi);
+      fxp_acc_madd(&sumC1, w, C1i);
+      fxp_acc_madd(&sumC2, w, C2i);
+      fxp_acc_madd(&sumC3, w, C3i);
+    }
+  }
+
+  int sumW_q = fxp_acc_extract_q20(&sumW);
+  if(sumW_q < 1) sumW_q = 1;
+  int invW = fxp_recip(sumW_q);
+  int meanY  = fxp_mul(fxp_acc_to_fxp32(&sumY),  invW);
+  int meanC1 = fxp_mul(fxp_acc_to_fxp32(&sumC1), invW);
+  int meanC2 = fxp_mul(fxp_acc_to_fxp32(&sumC2), invW);
+  int meanC3 = fxp_mul(fxp_acc_to_fxp32(&sumC3), invW);
+
+  fxp_acc sumVarY = fxp_acc_zero();
+  fxp_acc sumCov1 = fxp_acc_zero(), sumCov2 = fxp_acc_zero(), sumCov3 = fxp_acc_zero();
+  for(int i = 0; i < nb; i++) {
+    int wi = w_buf[i];
+    int dYc = Y_buf[i] - meanY;
+    fxp_acc_madd(&sumVarY, wi, fxp_mul(dYc, dYc));
+    fxp_acc_madd(&sumCov1, wi, fxp_mul(dYc, C1_buf[i] - meanC1));
+    fxp_acc_madd(&sumCov2, wi, fxp_mul(dYc, C2_buf[i] - meanC2));
+    fxp_acc_madd(&sumCov3, wi, fxp_mul(dYc, C3_buf[i] - meanC3));
+  }
+  int var_Y = fxp_mul(fxp_acc_to_fxp32(&sumVarY), invW);
+  if(var_Y < 0) var_Y = 0;
+  int cov1 = fxp_mul(fxp_acc_to_fxp32(&sumCov1), invW);
+  int cov2 = fxp_mul(fxp_acc_to_fxp32(&sumCov2), invW);
+  int cov3 = fxp_mul(fxp_acc_to_fxp32(&sumCov3), invW);
+
+  int denom = var_Y + eps_gat_scaled;
+  if(denom < 1) denom = 1;
+  int inv_denom = fxp_recip(denom);
+
+  int a_c1 = fxp_mul(cov1, inv_denom);
+  int a_c2 = fxp_mul(cov2, inv_denom);
+  int a_c3 = fxp_mul(cov3, inv_denom);
+  int b_c1 = meanC1 - fxp_mul(a_c1, meanY);
+  int b_c2 = meanC2 - fxp_mul(a_c2, meanY);
+  int b_c3 = meanC3 - fxp_mul(a_c3, meanY);
+
+  *o1 = (fxp_mul(a_c1, Y_c) + b_c1) << 4;
+  *o2 = (fxp_mul(a_c2, Y_c) + b_c2) << 4;
+  *o3 = (fxp_mul(a_c3, Y_c) + b_c3) << 4;
+}
+
+#endif  /* GALOSH_INT_P7_CLH */

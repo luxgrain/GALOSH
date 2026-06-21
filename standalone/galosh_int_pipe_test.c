@@ -100,11 +100,11 @@ int main(int argc, char **argv) {
   queue = clCreateCommandQueue(ctx, device, 0, &err); CLCHK(err, "q");
 
   const char *files[] = { "galosh_int.clh", "galosh_int_tbl.clh", "galosh_int_p0.clh",
-                          "galosh_int_p1.clh", "galosh_int_p5.clh",
+                          "galosh_int_p1.clh", "galosh_int_p5.clh", "galosh_int_p7.clh",
                           "galosh_int_p0.cl", "galosh_int_p1.cl", "galosh_int_p2.cl",
                           "galosh_int_p3.cl", "galosh_int_p4.cl", "galosh_int_p5.cl",
-                          "galosh_int_p6.cl" };
-  const int nfiles = 12;
+                          "galosh_int_p6.cl", "galosh_int_p7.cl" };
+  const int nfiles = 14;
   char dirbuf[1024];
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
@@ -282,6 +282,45 @@ int main(int argc, char **argv) {
     clFinish(queue);
     FILE *fo6 = fopen(out_path, "wb"); if(fo6) { fwrite(c6, 4, npix + chsize, fo6); fclose(fo6); }
     printf("P6_RAW npix=%d chsize=%d\n", (int)npix, (int)chsize);
+    return 0;
+  }
+
+  /* ---- P7 sub-step: LOESS @ half-res (validate fxp_loess_chroma_3ch_r) ----
+   * Computes the prerequisites inline (chroma from P2 in_gat, L_h_den from the
+   * P5 L_cs_den) so this stays self-contained without a full pipeline rewire. */
+  if(phase == 7) {
+    int halfw = (width + 1) / 2, halfh = (height + 1) / 2;
+    size_t chsize = (size_t)halfw * halfh;
+    cl_mem b_c1h = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_mem b_c2h = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_mem b_c3h = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_kernel kc = mkkern("k_p4_chroma_halfres");
+    setm(kc,0,&b_gat); setm(kc,1,&b_c1h); setm(kc,2,&b_c2h); setm(kc,3,&b_c3h);
+    seti(kc,4,width); seti(kc,5,height); seti(kc,6,halfw); seti(kc,7,halfh);
+    run1(kc, chsize);
+    cl_mem b_lhden = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_kernel k6b = mkkern("k_p6_l_h_den");
+    setm(k6b,0,&b_lden); setm(k6b,1,&b_lhden); seti(k6b,2,width); seti(k6b,3,height);
+    seti(k6b,4,halfw); seti(k6b,5,halfh);
+    run1(k6b, chsize);
+    int32_t eps_gat_scaled = fxp_mul(FXP_ONE, FXP_ONE) >> 8;
+    int32_t inv_2sigma_sq = 58253;   /* FXP_LOESS_INV_2SIGMA_SQ */
+    cl_mem b_l1 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_mem b_l2 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_mem b_l3 = mkbuf(CL_MEM_READ_WRITE, chsize * 4, NULL);
+    cl_kernel kl = mkkern("k_p7_loess");
+    setm(kl,0,&b_lhden); setm(kl,1,&b_c1h); setm(kl,2,&b_c2h); setm(kl,3,&b_c3h);
+    setm(kl,4,&b_l1); setm(kl,5,&b_l2); setm(kl,6,&b_l3);
+    seti(kl,7,halfw); seti(kl,8,halfh); seti(kl,9,eps_gat_scaled);
+    seti(kl,10,inv_2sigma_sq); setm(kl,11,&b_T);
+    run1(kl, chsize);
+    int32_t *c7 = malloc(chsize * 4 * 3);
+    clEnqueueReadBuffer(queue, b_l1, CL_TRUE, 0, chsize*4, c7, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, b_l2, CL_TRUE, 0, chsize*4, c7 + chsize, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, b_l3, CL_TRUE, 0, chsize*4, c7 + 2*chsize, 0, NULL, NULL);
+    clFinish(queue);
+    FILE *fo7 = fopen(out_path, "wb"); if(fo7) { fwrite(c7, 4, chsize * 3, fo7); fclose(fo7); }
+    printf("P7_RAW loess_h n=%d\n", (int)chsize);
     return 0;
   }
 
