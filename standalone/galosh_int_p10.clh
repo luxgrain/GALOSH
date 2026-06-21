@@ -47,4 +47,8 @@ __constant int P10_SIGNS[4][3] = {
   { 1, 1, 1 }, { -1, 1, -1 }, { 1, -1, -1 }, { -1, -1, 1 }
 };
 
+/* Gauss-Hermite weights (Q11.20) + 1/sqrt(pi) for the on-GPU Foi LUT build. */
+__constant int FXP_GH_W[10] = { 8, 1408, 35511, 251726, 640566, 640566, 251726, 35511, 1408, 8 };
+#define FXP_INV_SQRT_PI_Q20 591633
+
 #endif  /* GALOSH_INT_P10_CLH */

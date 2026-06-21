@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 #define CL_TARGET_OPENCL_VERSION 200
 #include <CL/cl.h>
@@ -218,11 +219,49 @@ int main(int argc, char **argv) {
     memcpy(src + pos, part, l); pos += l; src[pos++] = '\n'; free(part);
   }
   src[pos] = 0;
-  prog = clCreateProgramWithSource(ctx, 1, (const char **)&src, NULL, &err); CLCHK(err, "prog");
-  err = clBuildProgram(prog, 1, &device, g_genuine ? "-DGENUINE_I16" : "", NULL, NULL);
-  if(err != CL_SUCCESS) { char log[16384];
-    clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, sizeof log, log, NULL);
-    fprintf(stderr, "[CL] build failed (%d):\n%s\n", err, log); return 1; }
+  /* ---- program build with binary cache (mirrors galosh_raw_gpu.c) ---- */
+  const char *build_opts = g_genuine ? "-DGENUINE_I16" : "";
+  char cache_path[1024];
+  snprintf(cache_path, sizeof cache_path,
+           "C:/Users/luxgrain/GALOSH/standalone/galosh_int_pipe.%s.dev%d.clbin",
+           g_genuine ? "i16" : "i32", dev_idx);
+  long src_mtime = 0;
+  for(int i = 0; i < nfiles; i++) {
+    char ap[1024]; snprintf(ap, sizeof ap, "C:/Users/luxgrain/GALOSH/standalone/%s", files[i]);
+    struct stat st; if(stat(ap, &st) == 0 && (long)st.st_mtime > src_mtime) src_mtime = (long)st.st_mtime;
+  }
+  int built = 0;
+  struct stat cst;
+  if(stat(cache_path, &cst) == 0 && (long)cst.st_mtime >= src_mtime) {
+    size_t blen = 0; char *bin = load_file(cache_path, &blen);
+    if(bin && blen > 0) {
+      cl_int bstat = 0;
+      prog = clCreateProgramWithBinary(ctx, 1, &device, &blen,
+                                       (const unsigned char **)&bin, &bstat, &err);
+      free(bin);
+      if(err == CL_SUCCESS && bstat == CL_SUCCESS &&
+         clBuildProgram(prog, 1, &device, build_opts, NULL, NULL) == CL_SUCCESS)
+        built = 1;
+      else if(prog) { clReleaseProgram(prog); prog = NULL; }
+    }
+  }
+  if(!built) {
+    prog = clCreateProgramWithSource(ctx, 1, (const char **)&src, NULL, &err); CLCHK(err, "prog");
+    err = clBuildProgram(prog, 1, &device, build_opts, NULL, NULL);
+    if(err != CL_SUCCESS) { char log[16384];
+      clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, sizeof log, log, NULL);
+      fprintf(stderr, "[CL] build failed (%d):\n%s\n", err, log); return 1; }
+    size_t bsz = 0;
+    clGetProgramInfo(prog, CL_PROGRAM_BINARY_SIZES, sizeof bsz, &bsz, NULL);
+    if(bsz > 0) {
+      unsigned char *binp = (unsigned char *)malloc(bsz);
+      unsigned char *bins[1] = { binp };
+      if(clGetProgramInfo(prog, CL_PROGRAM_BINARIES, sizeof bins, bins, NULL) == CL_SUCCESS) {
+        FILE *cf = fopen(cache_path, "wb"); if(cf) { fwrite(binp, 1, bsz, cf); fclose(cf); }
+      }
+      free(binp);
+    }
+  }
 
   cl_mem b_in = mkbuf(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, npix * 4, in_q20);
   cl_mem b_mean = mkbuf(CL_MEM_READ_WRITE, total_blocks * 4, NULL);
@@ -504,9 +543,32 @@ int main(int argc, char **argv) {
       return 0;
     }
 
-    /* ---- P10: inverse WHT + dark restore + denorm + Foi-exact inverse GAT ---- */
+    /* ---- P10: inverse WHT + dark restore + denorm + Foi-exact inverse GAT ----
+     * Foi LUT built ON GPU (k_build_foi_lut, 1024 work-items) instead of the
+     * ~300 ms host build_foi_lut. */
     fxp_gat_inv_table_t lut;
-    build_foi_lut(&gp, &lut);
+    if(gp.alpha < fxp_from_float(1e-4f)) {
+      lut.valid = 0;
+    } else {
+      int32_t z_table[8];
+      int32_t sqrt2_sigma = fxp_mul(FXP_SQRT2_Q20, gp.sigma_raw);
+      for(int g = 0; g < 8; g++) z_table[g] = fxp_mul(sqrt2_sigma, fxp_gh_nodes_q20[g + 1]);
+      cl_mem b_z = mkbuf(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 8 * 4, z_table);
+      cl_mem b_d = mkbuf(CL_MEM_READ_WRITE, 1024 * 4, NULL);
+      cl_mem b_x = mkbuf(CL_MEM_READ_WRITE, 1024 * 4, NULL);
+      cl_kernel klut = mkkern("k_build_foi_lut");
+      setm(klut,0,&b_d); setm(klut,1,&b_x); setm(klut,2,&b_gp); setm(klut,3,&b_T); setm(klut,4,&b_z);
+      run1(klut, 1024);
+      clEnqueueReadBuffer(queue, b_d, CL_TRUE, 0, 1024*4, lut.d, 0, NULL, NULL);
+      clEnqueueReadBuffer(queue, b_x, CL_TRUE, 0, 1024*4, lut.x, 0, NULL, NULL);
+      clFinish(queue);
+      lut.d_min = lut.d[0]; lut.d_max = lut.d[FXP_GAT_INV_TABLE_SIZE - 1];
+      lut.alpha = gp.alpha; lut.sigma_raw = gp.sigma_raw;
+      lut.y_break = gp.y_break; lut.t_break = gp.t_break;
+      lut.valid = 1;
+      clReleaseKernel(klut);
+      clReleaseMemObject(b_z); clReleaseMemObject(b_d); clReleaseMemObject(b_x);
+    }
     cl_mem b_lut = mkbuf(CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof lut, &lut);
     int32_t chref[4] = {0,0,0,0};
     clEnqueueReadBuffer(queue, b_chref, CL_TRUE, 0, 16, chref, 0, NULL, NULL);

@@ -88,9 +88,13 @@ standalone/archive/
 standalone/*.bak
 standalone/*.backup
 
+# --- /c/tmp rescue archive (6.5 GB of prior debug bins / dirs, 2026-05-16) ---
+tools/_tmp_archive_*/
+
 # --- Allow specific text files even with broad rules above ---
 !README.md
 !CONTRIBUTING*.md
 !docs/*.md
 !standalone/*.txt
 !scripts/*.txt
+standalone/*.clbin
