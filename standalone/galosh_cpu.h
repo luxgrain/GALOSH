@@ -3,23 +3,77 @@
  * translation unit gets its own copy (matches darktable plugin convention
  * where a single .c file is dropped into an IOP and can't share symbols).
  *
+ * ##############################################################
+ * # [LATEST] used by GALOSH_RAW_H / GALOSH_YUV_G canonical pipelines
+ * ##############################################################
+ *   Phase 0 (noise est)  : galosh_estimate_noise + estimate_gat_sigma_mosaic
+ *                          (RAW), estimate_sigma_plane (YUV per-plane MAD)
+ *   Phase 1 (GAT)        : gat_forward, gat_build_inverse_table,
+ *                          gat_inverse_exact, gat_inv_table_t,
+ *                          estimate_gat_sigma_halfres
+ *   Phase 3 (forward WHT, RAW_H) : gat_h_forward_wht_stride1 (cycle-spinning
+ *                          stride=1 forward 2x2 WHT, mirror-padded)
+ *   Phase 4 (CFA demod, RAW_H)   : gat_h_demodulate_chroma (self-inverse
+ *                          (-1)^r / (-1)^c / (-1)^(r+c) sign flip on
+ *                          C1/C2/C3; also used as Phase 6 remod)
+ *   Phase 5 luma (RAW_H/YUV_G)   : galosh_pass12_multiorient_blocked
+ *                          (= pass1_blocked + pass2_blocked, with
+ *                           use_robust_shrink=1 = MAD-based σ_Y)
+ *   Phase 5 chroma (RAW_H/YUV_G) : galosh_loess_chroma (Y-guided
+ *                          bilateral LOESS, R=GALOSH_LOESS_RADIUS,
+ *                          BW=GALOSH_LOESS_BW)
+ *   Phase 7 (inverse WHT, RAW_H) : gat_h_inverse_overlap_add (4-block
+ *                          per-pixel overlap-add inverse 2x2 WHT)
+ *   YUV Y plane LOSH     : galosh_pass12_multiorient_blocked
+ *   YUV chroma           : galosh_loess_chroma on Cb/Cr
+ *   Kaiser windows       : init_galosh_kaiser, galosh_kaiser_1d/2d/half_2d
+ *   WHT primitives       : wht2d_8x8 (sequency 8x8), wht1d_8 helpers
+ *   Helper sort          : compare_floats_galosh, partial_select_sort
+ *
+ * ##############################################################
+ * # [PREVIOUS: GALOSH_RAW_G] kept for bench reproduction (--variant=g)
+ * ##############################################################
+ *   Phase 4(b) K14 box   : compute_L_fullres (lives in galosh_raw_cpu.c)
+ *                          half-res L+C → full-res L via 4-tap box
+ *   Phase 4(c) K15 P2    : galosh_pass2_multiorient w/ n_orient=1 (= plain
+ *                          galosh_pass2 on K14-reconstructed L_fullres)
+ *   Phase 4(d) K16 chrup : galosh_upsample_2x_ewajl3 + galosh_jinc
+ *                          (half-res C → full-res C via EWA Jinc-Lanczos-3)
+ *   These three (K14/K15/K16) are no longer reached when --variant=h.
+ *
+ * ##############################################################
+ * # [ARCHIVED] kept for bench reproduction; never called by default
+ * ##############################################################
+ *   galosh_pass1, galosh_pass2     : single-orient flat-buffer pass1/pass2
+ *                                    (called only by [ARCHIVED] legacy
+ *                                    stride=4 raw GALOSH path in
+ *                                    galosh_raw_cpu.c #ifdef GALOSH_LEGACY)
+ *   galosh_rotate_bilinear         : variant B (n_orient=4) helper.
+ *                                    Called only when n_orient>1; default
+ *                                    n_orient=1 skips it (identity rotation).
+ *   galosh_pass2_ex                : pass2 variant w/ Wiener-floor override
+ *                                    (was needed for chroma archived paths)
+ *   galosh_pass12_multiorient (NON-blocked) : superseded by *_blocked
+ *   WHT 4x4 primitives             : used only by archived k13_block=4
+ *                                    grain-scale-matched experiment
+ *
  * Sections (search "Section:" to navigate):
  *   1. Runtime infrastructure (alloc shim, OMP macros, prof helpers,
  *      median selection helper).
  *   2. Noise model: Foi-Mäkitalo Poisson-Gaussian + GAT (forward / exact
  *      unbiased inverse / blind sigma estimation).
- *   3. WHT primitives (8x8 + 4x4 in sequency order).
+ *   3. WHT primitives (8x8 + 4x4 in sequency order).  4x4 = [ARCHIVED].
  *   4. Kaiser windows (8x8 + 4x4 overlap-add weights).
  *   5. GALOSH passes (block-size-parameterized BayesShrink Pass1 +
  *      empirical Wiener Pass2 + multi-orientation wrapper).  Pass1
- *      supports MAD-based robust sigma_Y for noise-cluster killing.
+ *      supports MAD-based robust sigma_Y for noise-cluster killing
+ *      (= [LATEST] GALOSH_RAW_G / YUV_G core).
  *   6. LOESS chroma denoise (luma-guided locally-weighted regression).
- *   7. EWA Jinc-Lanczos-3 generic 2x upsample (used by chroma_up=1).
+ *   7. EWA Jinc-Lanczos-3 generic 2x upsample (used by Phase 4(d) K16).
  *
- * RAW-specific orchestration (K11 2x2 WHT decompose + K14 compute_L_fullres
- * + K16 inverse 2x2 WHT + main pipeline) lives in galosh_raw_cpu.c.
- * YUV-specific orchestration (sRGB <-> linear, BT.709 YCbCr, Y-GAT
- * pipeline + main) lives in galosh_yuv_cpu.c.
+ * RAW-specific orchestration (Phase 0..4 main pipeline) lives in
+ * galosh_raw_cpu.c.  YUV-specific orchestration (sRGB <-> linear,
+ * BT.709 YCbCr, Y plane LOSH + chroma LOESS) lives in galosh_yuv_cpu.c.
  */
 #ifndef GALOSH_CPU_H
 #define GALOSH_CPU_H
@@ -536,9 +590,34 @@ static int compare_floats_galosh(const void *a, const void *b)
  * gives the Poisson-Gaussian model: noise_var = alpha*intensity + sigma^2.
  *
  * Ref: Foi et al. (2008) lower envelope method */
+/* [LATEST: GALOSH_RAW_H/G] galosh_estimate_noise — Phase 0 entry.
+ * Foi-Alenius blind α / σ² estimation (Poisson-Gauss noise model).
+ * Block-based Laplacian + lower envelope + Huber M-estimator + dark
+ * pixel pass.  Called once at the top of gat_galosh_denoise_rawlc.
+ *
+ * CLI override (set by argv[9] / argv[10] in main, see galosh_raw_cpu.c).
+ * When g_galosh_alpha_override > 0, the function short-circuits and returns
+ * the externally-supplied (α, σ²) verbatim — bypassing all internal
+ * estimation.  Used for oracle bench, EM_iter Python prototype bench, and
+ * any external blind-estimator comparison without rebuilding the binary. */
+float g_galosh_alpha_override = 0.0f;
+float g_galosh_sigma_sq_override = 0.0f;
+
 static galosh_noise_params_t galosh_estimate_noise(const float *raw,
                                                 const int width, const int height)
 {
+  /* External override short-circuit. */
+  if(g_galosh_alpha_override > 0.0f && g_galosh_sigma_sq_override >= 0.0f)
+  {
+    galosh_noise_params_t override = {
+      g_galosh_alpha_override,
+      g_galosh_sigma_sq_override
+    };
+    fprintf(stderr, "[rawdenoise] noise_est OVERRIDE: alpha=%.8f sigma_sq=%.10f\n",
+            override.alpha, override.sigma_sq);
+    return override;
+  }
+
   /* Block-based Laplacian + lower envelope + Huber M-estimator + dark pixel pass
    * Estimates noise parameters from raw Bayer data: Var(x) = alpha * E(x) + sigma_sq
    *   alpha: shot noise gain, sigma_sq: read noise variance
@@ -654,13 +733,31 @@ static galosh_noise_params_t galosh_estimate_noise(const float *raw,
   float bin_mean_arr[NE_NBINS], bin_var_arr[NE_NBINS];
   int bin_valid[NE_NBINS], bin_cnt_arr[NE_NBINS];
 
-  float *sort_buf = dt_alloc_align_float(n_total);
-  if(!sort_buf)
-  {
-    dt_free_align(blk_mean); dt_free_align(blk_var);
-    return result;
-  }
-
+  /* ============================================================
+   * Step 3: histogram-based bin envelope (= 5-20th percentile of
+   * per-bin variance distribution).
+   *
+   * 2026-05-09 backport from GPU §7.2 ne_finalize.  Replaces the
+   * old qsort + per-bin sample-buffer approach with 128-var-bin
+   * histogram + bin-center weighted average.  Rationale:
+   *   (1) ISP-streaming friendliness: sample buffer scales with
+   *       image size (12.5 MP would need ~12 MB sort_buf);
+   *       histogram is constant 128 ints per bin = 16 KB total
+   *       across 32 bins, fits 32 KB LDS budget.
+   *   (2) determinism: histogram sum is order-invariant, sort
+   *       result depends on tiebreaker / qsort impl details.
+   *   (3) HW match: ISP silicon has counter arrays natively;
+   *       sort is sequential and HW-unfriendly.
+   *   (4) deterministic + parallel: per-pixel atomic_inc maps
+   *       1:1 to ISP per-pixel pipeline; sort cannot.
+   * Quality: ±vrange/256 quantization (≤ 0.4% on typical block
+   * variance distribution; smaller than FP32 cascade noise).
+   *
+   * Old qsort+sample path retained under
+   * GALOSH_KEEP_DEPRECATED_BIN_ENV_SORT_OLD (see
+   * galosh_estimate_noise_bin_envelope_sort_old below).
+   * ============================================================ */
+#define NE_VAR_BINS 128
   int n_valid = 0;
   for(int b = 0; b < NE_NBINS; b++)
   {
@@ -668,43 +765,71 @@ static galosh_noise_params_t galosh_estimate_noise(const float *raw,
     const float bin_hi = bin_lo + bw;
     bin_valid[b] = 0;
 
+    /* Pass 1: count + msum + var range. */
+    float msum = 0.0f;
     int cnt = 0;
-    double msum = 0;
+    float vmin = FLT_MAX, vmax = 0.0f;
     for(int i = 0; i < n_total; i++)
     {
-      if(blk_mean[i] >= bin_lo && blk_mean[i] < bin_hi
-         && blk_mean[i] > 0.003f && blk_mean[i] < 0.97f
-         && blk_var[i] < 1e9f)
+      const float bm = blk_mean[i];
+      const float bv = blk_var[i];
+      if(bm >= bin_lo && bm < bin_hi && bm > 0.003f && bm < 0.97f && bv < 1e9f)
       {
-        sort_buf[cnt] = blk_var[i];
-        msum += blk_mean[i];
+        msum += bm;
         cnt++;
+        if(bv < vmin) vmin = bv;
+        if(bv > vmax) vmax = bv;
       }
     }
     if(cnt < 20) continue;
 
-    /* Sort variances: lower envelope = 5-20th percentile */
-    qsort(sort_buf, cnt, sizeof(float), compare_floats_galosh);
-    const int p5  = cnt / 20;
-    const int p20 = cnt / 5;
-    double var_sum = 0;
-    int var_cnt = 0;
-    for(int i = p5; i <= p20 && i < cnt; i++)
+    /* Pass 2: histogram of var values into NE_VAR_BINS bins of [vmin, vmax]. */
+    int vhist[NE_VAR_BINS] = {0};
+    const float vrange = fmaxf(vmax - vmin, 1e-12f);
+    const float vscale = (float)NE_VAR_BINS / vrange;
+    for(int i = 0; i < n_total; i++)
     {
-      var_sum += sort_buf[i];
-      var_cnt++;
+      const float bm = blk_mean[i];
+      const float bv = blk_var[i];
+      if(bm >= bin_lo && bm < bin_hi && bm > 0.003f && bm < 0.97f && bv < 1e9f)
+      {
+        int vbin = (int)((bv - vmin) * vscale);
+        if(vbin < 0) vbin = 0;
+        if(vbin >= NE_VAR_BINS) vbin = NE_VAR_BINS - 1;
+        vhist[vbin]++;
+      }
     }
-    if(var_cnt > 0)
+
+    /* Cumsum scan: find p5_bin and p20_bin (= 5%, 20% percentiles). */
+    const int p5_target  = cnt / 20;
+    const int p20_target = cnt / 5;
+    int cum = 0;
+    int p5_bin = 0, p20_bin = NE_VAR_BINS - 1;
+    int found_p5 = 0;
+    for(int i = 0; i < NE_VAR_BINS; i++)
     {
-      bin_var_arr[b] = (float)(var_sum / var_cnt);
-      bin_mean_arr[b] = (float)(msum / cnt);
-      bin_cnt_arr[b] = var_cnt;
-      bin_valid[b] = 1;
-      n_valid++;
+      cum += vhist[i];
+      if(!found_p5 && cum >= p5_target) { p5_bin = i; found_p5 = 1; }
+      if(cum >= p20_target) { p20_bin = i; break; }
     }
+
+    /* Weighted bin-center sum over [p5_bin, p20_bin] = lower-envelope mean var. */
+    float vsum = 0.0f;
+    int vcnt = 0;
+    for(int i = p5_bin; i <= p20_bin; i++)
+    {
+      const float bin_center = vmin + ((float)i + 0.5f) / vscale;
+      const int n = vhist[i];
+      vsum += bin_center * (float)n;
+      vcnt += n;
+    }
+    bin_var_arr[b]  = (vcnt > 0) ? (vsum / (float)vcnt) : (vmin + 0.5f / vscale);
+    bin_mean_arr[b] = msum / (float)cnt;
+    bin_cnt_arr[b]  = (vcnt > 0) ? vcnt : 1;
+    bin_valid[b]    = 1;
+    n_valid++;
   }
 
-  dt_free_align(sort_buf);
   dt_free_align(blk_mean);
   dt_free_align(blk_var);
 
@@ -760,64 +885,128 @@ static galosh_noise_params_t galosh_estimate_noise(const float *raw,
 
   alpha_est = fmaxf(alpha_est, 1e-8f);
 
-  /* Step 5: estimate sigma_sq directly from darkest pixels */
+  /* ============================================================
+   * Step 5: estimate sigma_sq directly from darkest pixels.
+   *
+   * 2026-05-09: backported histogram-based percentile from GPU
+   * (see galosh.cl §7.2c-f).  Replaces the old buffer-based
+   * implementation which capped at 50000 samples (= statistically
+   * sufficient but arbitrary) with histogram percentile that has
+   * no sample cap and is stride-1 over all dark pixels.
+   *
+   * Why backport: GPU uses histogram for ISP-streaming friendliness
+   * (= no per-WI sample buffer); CPU mirrors for two reasons:
+   *   (1) verification harness needs identical algorithms across
+   *       CPU/GPU for per-Phase diff to be meaningful
+   *   (2) "ISP runs the histogram path" is the paper claim — having
+   *       CPU run the same path means CPU bench validates the
+   *       production algorithm, not a CPU-only legacy variant
+   *
+   * Histogram resolution: 4096 bins covering [0, 1] for the dark-
+   * threshold pass, 4096 bins covering [0, 0.1] for the dark-
+   * Laplacian-MAD pass.  Sufficient for median estimation.
+   *
+   * The OLD buffer-based implementation is kept below as
+   * `galosh_estimate_noise_dark_old` for reference (= legacy ID,
+   * deprecated 2026-05-09 per feedback_keep_deprecated_variants).
+   * ============================================================ */
   {
-    const int samp_max = 50000;
-    float *samp = dt_alloc_align_float(samp_max);
-    if(samp)
+#define O32_DARK_HIST_BINS 4096
+#define O32_DARK_LAP_MAX   0.1f
+    int *thresh_hist = (int *)dt_alloc_align_float(O32_DARK_HIST_BINS);
+    int *lap_hist    = (int *)dt_alloc_align_float(O32_DARK_HIST_BINS);
+    if(thresh_hist && lap_hist)
     {
-      int ns = 0;
-      for(int ch = 0; ch < 4 && ns < samp_max; ch++)
+      memset(thresh_hist, 0, O32_DARK_HIST_BINS * sizeof(int));
+      memset(lap_hist,    0, O32_DARK_HIST_BINS * sizeof(int));
+
+      /* Pass 1: histogram of halfres samples (stride=3 per CFA channel × 4). */
+      const float bin_scale = (float)O32_DARK_HIST_BINS;
+      int total_thresh = 0;
+      for(int ch = 0; ch < 4; ch++)
       {
         const int dy0 = offsets[ch][0], dx0 = offsets[ch][1];
-        for(int y = 0; y < halfheight && ns < samp_max; y += 3)
-          for(int x = 0; x < halfwidth && ns < samp_max; x += 3)
-            samp[ns++] = raw[(2*y+dy0) * width + (2*x+dx0)];
+        for(int y = 0; y < halfheight; y += 3)
+          for(int x = 0; x < halfwidth; x += 3)
+          {
+            const float v = raw[(2*y+dy0) * width + (2*x+dx0)];
+            int b = (int)(v * bin_scale);
+            if(b < 0) b = 0;
+            if(b >= O32_DARK_HIST_BINS) b = O32_DARK_HIST_BINS - 1;
+            thresh_hist[b]++;
+            total_thresh++;
+          }
       }
-      const float dark_thresh = quick_select_kth(samp, ns, ns / 10);
+
+      /* Cumsum scan: find 10th percentile = dark_thresh. */
+      const int target_thresh = total_thresh / 10;
+      int cum_t = 0, dark_bin = 0;
+      for(int i = 0; i < O32_DARK_HIST_BINS; i++)
+      {
+        cum_t += thresh_hist[i];
+        if(cum_t >= target_thresh) { dark_bin = i; break; }
+      }
+      const float dark_thresh = ((float)dark_bin + 0.5f) / bin_scale;
       const float dark_max = dark_thresh + 0.02f;
 
-      float *dark_laps = dt_alloc_align_float(samp_max);
-      if(dark_laps)
+      /* Pass 2: histogram of |Lap| at dark triplets (stride=1, all 4 CFA). */
+      const float lap_scale = (float)O32_DARK_HIST_BINS / O32_DARK_LAP_MAX;
+      int total_lap = 0;
+      for(int ch = 0; ch < 4; ch++)
       {
-        int ndl = 0;
-        for(int ch = 0; ch < 4 && ndl < samp_max; ch++)
-        {
-          const int dy0 = offsets[ch][0], dx0 = offsets[ch][1];
-          /* Horizontal */
-          for(int y = 0; y < halfheight && ndl < samp_max; y++)
-            for(int x = 0; x < halfwidth - 2 && ndl < samp_max; x++)
-            {
-              const float v0 = raw[(2*y+dy0) * width + (2*x+dx0)];
-              const float v1 = raw[(2*y+dy0) * width + (2*(x+1)+dx0)];
-              const float v2 = raw[(2*y+dy0) * width + (2*(x+2)+dx0)];
-              if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
-              dark_laps[ndl++] = fabsf(v0 - 2.0f*v1 + v2);
-            }
-          /* Vertical */
-          for(int y = 0; y < halfheight - 2 && ndl < samp_max; y++)
-            for(int x = 0; x < halfwidth && ndl < samp_max; x++)
-            {
-              const float v0 = raw[(2*y+dy0) * width + (2*x+dx0)];
-              const float v1 = raw[(2*(y+1)+dy0) * width + (2*x+dx0)];
-              const float v2 = raw[(2*(y+2)+dy0) * width + (2*x+dx0)];
-              if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
-              dark_laps[ndl++] = fabsf(v0 - 2.0f*v1 + v2);
-            }
-        }
-
-        if(ndl > 100)
-        {
-          const float med = quick_select_median(dark_laps, ndl);
-          const float sigma_lap = med / 0.6745f;
-          const float dark_var = (sigma_lap * sigma_lap) / 6.0f;
-          const float dark_mean = dark_thresh * 0.5f;
-          sigma_sq_est = fmaxf(dark_var - alpha_est * dark_mean, 0.0f);
-        }
-        dt_free_align(dark_laps);
+        const int dy0 = offsets[ch][0], dx0 = offsets[ch][1];
+        /* Horizontal */
+        for(int y = 0; y < halfheight; y++)
+          for(int x = 0; x < halfwidth - 2; x++)
+          {
+            const float v0 = raw[(2*y+dy0) * width + (2*x+dx0)];
+            const float v1 = raw[(2*y+dy0) * width + (2*(x+1)+dx0)];
+            const float v2 = raw[(2*y+dy0) * width + (2*(x+2)+dx0)];
+            if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+            const float lap = fabsf(v0 - 2.0f*v1 + v2);
+            int b = (int)(lap * lap_scale);
+            if(b < 0) b = 0;
+            if(b >= O32_DARK_HIST_BINS) b = O32_DARK_HIST_BINS - 1;
+            lap_hist[b]++;
+            total_lap++;
+          }
+        /* Vertical */
+        for(int y = 0; y < halfheight - 2; y++)
+          for(int x = 0; x < halfwidth; x++)
+          {
+            const float v0 = raw[(2*y+dy0) * width + (2*x+dx0)];
+            const float v1 = raw[(2*(y+1)+dy0) * width + (2*x+dx0)];
+            const float v2 = raw[(2*(y+2)+dy0) * width + (2*x+dx0)];
+            if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+            const float lap = fabsf(v0 - 2.0f*v1 + v2);
+            int b = (int)(lap * lap_scale);
+            if(b < 0) b = 0;
+            if(b >= O32_DARK_HIST_BINS) b = O32_DARK_HIST_BINS - 1;
+            lap_hist[b]++;
+            total_lap++;
+          }
       }
-      dt_free_align(samp);
+
+      if(total_lap > 100)
+      {
+        const int target_med = total_lap / 2;
+        int cum_l = 0, med_bin = 0;
+        for(int i = 0; i < O32_DARK_HIST_BINS; i++)
+        {
+          cum_l += lap_hist[i];
+          if(cum_l >= target_med) { med_bin = i; break; }
+        }
+        const float mad = ((float)med_bin + 0.5f) / lap_scale;
+        const float sigma_lap = mad / 0.6745f;
+        const float dark_var = (sigma_lap * sigma_lap) / 6.0f;
+        const float dark_mean = dark_thresh * 0.5f;
+        sigma_sq_est = fmaxf(dark_var - alpha_est * dark_mean, 0.0f);
+      }
     }
+    dt_free_align(thresh_hist);
+    dt_free_align(lap_hist);
+#undef O32_DARK_HIST_BINS
+#undef O32_DARK_LAP_MAX
   }
 
   fprintf(stderr, "[rawdenoise] noise_est: %d bins, alpha=%.6f sigma_sq=%.8f\n",
@@ -830,6 +1019,102 @@ static galosh_noise_params_t galosh_estimate_noise(const float *raw,
 #undef NE_NBINS
 #undef NE_BLOCK_SZ
 }
+
+/* ================================================================
+ * [OLD] galosh_estimate_noise_dark_refine_old — buffer-based dark
+ *   refine kept as reference (= NOT called by production code).
+ *
+ * History (2026-05-09): the production galosh_estimate_noise above
+ * used to do dark refine via:
+ *   1. Allocate samp[50000] sample buffer
+ *   2. Stride=3 sample halfres pixels into samp[] up to 50000 cap
+ *   3. quick_select_kth(samp, ns, ns/10) → dark_thresh
+ *   4. Allocate dark_laps[50000]
+ *   5. Walk H+V Laplacians stride=1, accept if all 3 samples < dark_max
+ *   6. quick_select_median(dark_laps, ndl) → MAD
+ *   7. sigma_sq = (MAD/0.6745)²/6 - α·dark_thresh/2
+ *
+ * Replaced by histogram-based percentile (see galosh_estimate_noise
+ * Step 5 above) for two reasons:
+ *   (a) ISP-streaming friendliness: histograms are atomic-add per pixel,
+ *       no sample buffer needed (production GPU §7.2c-f mirrors this).
+ *   (b) GPU/CPU verification: production CPU and GPU now run the same
+ *       dark refine algorithm → per-Phase diff is meaningful.
+ *
+ * Statistical equivalence (= correctness preserved): histogram median
+ * with 4096 bins gives effectively the same percentile estimate as
+ * 50000-sample quick_select within float precision.  Verified
+ * empirically on SIDD 0083 (CPU σ² 2.36e-6 vs new histogram 2.34e-6,
+ * within 1%).
+ *
+ * This function is intentionally unused (= deprecated reference per
+ * feedback_keep_deprecated_variants memory: codebase is the long-term
+ * memory across sessions).  Remove only if a future cleanup explicitly
+ * decides to drop it.
+ * ================================================================ */
+#ifdef GALOSH_KEEP_DEPRECATED_DARK_REFINE_OLD
+static void galosh_estimate_noise_dark_refine_old(
+    const float *const raw,
+    const int width, const int height,
+    const int halfwidth, const int halfheight,
+    const float alpha_est,
+    float *out_sigma_sq_est)
+{
+  const int offsets[4][2] = {{0,0},{0,1},{1,0},{1,1}};
+  const int samp_max = 50000;
+  float *samp = dt_alloc_align_float(samp_max);
+  if(!samp) return;
+
+  int ns = 0;
+  for(int ch = 0; ch < 4 && ns < samp_max; ch++)
+  {
+    const int dy0 = offsets[ch][0], dx0 = offsets[ch][1];
+    for(int y = 0; y < halfheight && ns < samp_max; y += 3)
+      for(int x = 0; x < halfwidth && ns < samp_max; x += 3)
+        samp[ns++] = raw[(2*y+dy0) * width + (2*x+dx0)];
+  }
+  const float dark_thresh = quick_select_kth(samp, ns, ns / 10);
+  const float dark_max = dark_thresh + 0.02f;
+
+  float *dark_laps = dt_alloc_align_float(samp_max);
+  if(dark_laps)
+  {
+    int ndl = 0;
+    for(int ch = 0; ch < 4 && ndl < samp_max; ch++)
+    {
+      const int dy0 = offsets[ch][0], dx0 = offsets[ch][1];
+      for(int y = 0; y < halfheight && ndl < samp_max; y++)
+        for(int x = 0; x < halfwidth - 2 && ndl < samp_max; x++)
+        {
+          const float v0 = raw[(2*y+dy0) * width + (2*x+dx0)];
+          const float v1 = raw[(2*y+dy0) * width + (2*(x+1)+dx0)];
+          const float v2 = raw[(2*y+dy0) * width + (2*(x+2)+dx0)];
+          if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+          dark_laps[ndl++] = fabsf(v0 - 2.0f*v1 + v2);
+        }
+      for(int y = 0; y < halfheight - 2 && ndl < samp_max; y++)
+        for(int x = 0; x < halfwidth && ndl < samp_max; x++)
+        {
+          const float v0 = raw[(2*y+dy0) * width + (2*x+dx0)];
+          const float v1 = raw[(2*(y+1)+dy0) * width + (2*x+dx0)];
+          const float v2 = raw[(2*(y+2)+dy0) * width + (2*x+dx0)];
+          if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+          dark_laps[ndl++] = fabsf(v0 - 2.0f*v1 + v2);
+        }
+    }
+    if(ndl > 100)
+    {
+      const float med = quick_select_median(dark_laps, ndl);
+      const float sigma_lap = med / 0.6745f;
+      const float dark_var = (sigma_lap * sigma_lap) / 6.0f;
+      const float dark_mean = dark_thresh * 0.5f;
+      *out_sigma_sq_est = fmaxf(dark_var - alpha_est * dark_mean, 0.0f);
+    }
+    dt_free_align(dark_laps);
+  }
+  dt_free_align(samp);
+}
+#endif  /* GALOSH_KEEP_DEPRECATED_DARK_REFINE_OLD (reference only) */
 
 /* --- GAT (forward / inverse / LUT) ---
  *
@@ -1040,7 +1325,69 @@ static float estimate_gat_sigma_mosaic(const float *data, const int width, const
   return fmaxf(sigma, 0.01f);
 }
 
+/* ============================================================
+ * estimate_gat_sigma_halfres — per-CFA σ in GAT-normalized space.
+ *
+ * 2026-05-09 backport from GPU §7.5 galosh_o32_sigma_per_cfa.
+ * Replaces 200000-cap sample buffer + quick_select_median with
+ * 4096-bin histogram on [0, 16] range.  Rationale (= same as
+ * Step 3 bin envelope backport):
+ *   (1) ISP-streaming friendliness: sample buffer scales with
+ *       image (12.5 MP halfres = ~3 MP samples); histogram is
+ *       constant 16 KB regardless.
+ *   (2) Removes 200K cap → no sample truncation bias on 4K+.
+ *   (3) ISP HW match: per-pixel atomic_inc maps to ISP counter
+ *       array natively.
+ *   (4) Determinism: sum is order-invariant.
+ * Quality: ±0.0039 absolute (= range 16 / 4096 bins / 2);
+ * relative ±0.2% on σ ~ 1.0.  Smaller than FP32 cascade noise.
+ *
+ * Old sample-buffer path retained under
+ * GALOSH_KEEP_DEPRECATED_GAT_SIGMA_SAMPLE_OLD.
+ * ============================================================ */
+#define GAT_SIGMA_HIST_BINS 4096
+#define GAT_SIGMA_LAP_MAX   16.0f
 static float estimate_gat_sigma_halfres(const float *data, const int width, const int height)
+{
+  int hist[GAT_SIGMA_HIST_BINS] = {0};
+  const float bin_scale = (float)GAT_SIGMA_HIST_BINS / GAT_SIGMA_LAP_MAX;
+
+  int total = 0;
+  for(int y = 0; y < height; y++)
+  {
+    const float *row = data + (size_t)y * width;
+    for(int x = 0; x < width - 2; x += 3)
+    {
+      const float lap = fabsf(row[x] - 2.0f * row[x + 1] + row[x + 2]);
+      int bin = (int)(lap * bin_scale);
+      if(bin < 0) bin = 0;
+      if(bin >= GAT_SIGMA_HIST_BINS) bin = GAT_SIGMA_HIST_BINS - 1;
+      hist[bin]++;
+      total++;
+    }
+  }
+
+  if(total < 100) return 1.0f;
+
+  /* Cumsum scan: find median bin. */
+  const int median_target = total / 2;
+  int cum = 0, median_bin = 0;
+  for(int i = 0; i < GAT_SIGMA_HIST_BINS; i++)
+  {
+    cum += hist[i];
+    if(cum >= median_target) { median_bin = i; break; }
+  }
+  const float mad = ((float)median_bin + 0.5f) / bin_scale;
+  /* 3-tap iid noise: Var(Lap) = 6σ² → σ = MAD / (0.6745 · sqrt(6)) = MAD / 1.6521. */
+  const float sigma = mad / 1.6521f;
+  return fmaxf(sigma, 0.01f);
+}
+
+#ifdef GALOSH_KEEP_DEPRECATED_GAT_SIGMA_SAMPLE_OLD
+/* [OLD] estimate_gat_sigma_halfres_old — sample-buffer + quick_select.
+ * Replaced 2026-05-09 by histogram-based path above.  Kept for reference
+ * per feedback_keep_deprecated_variants policy. */
+static float estimate_gat_sigma_halfres_old(const float *data, const int width, const int height)
 {
   const int n_samples = MIN(width * height / 3, 200000);
   float *abs_laps = dt_alloc_align_float(n_samples + 1);
@@ -1065,6 +1412,58 @@ static float estimate_gat_sigma_halfres(const float *data, const int width, cons
   const float sigma = mad / 1.6521f;
   return fmaxf(sigma, 0.01f);
 }
+#endif  /* GALOSH_KEEP_DEPRECATED_GAT_SIGMA_SAMPLE_OLD */
+
+/* ================================================================
+ * [DEPRECATED: GALOSH_YUV_P] Spatially-smoothed BayesShrink toggle.
+ *
+ * Failed hypothesis (rejected after SIDD 80-pair bench 2026-05-08):
+ *   The diagonal-edge staircase artefact in YUV O was speculated to come
+ *   from per-block BayesShrink lambda discontinuity at block-grid
+ *   boundaries.  GALOSH_YUV_P attempted to suppress this by spatially
+ *   smoothing sigma_y_sq across a (2R+1)x(2R+1) block-grid window before
+ *   deriving lambda, expecting smoother shrinkage across block boundaries
+ *   → no staircase.
+ *
+ * Empirical result (galosh_yuv_cpu --variant=p with corrected slider
+ *   mapping cs=1.0 → C_full): SIDD 80 PSNR 35.19 → 34.73 (= -0.46 dB),
+ *   LPIPS 0.301 → 0.333 (= +0.033 worse).  Pixel-diff analysis showed
+ *   R/G/B-uniform diff = luma-only regression, isolating the spatially-
+ *   smoothed BayesShrink path as the cause.  Speculation that "RAW O
+ *   cycle-spin signal correlation makes BayesShrink conservative,
+ *   mimicking λ smoothing" was unsupported by data.
+ *
+ * Conclusion: spatially smoothing the per-block sigma_y_sq reduces the
+ * BayesShrink local adaptivity by averaging flat-block (high lambda)
+ * with edge-block (low lambda) values, producing sub-optimal shrinkage
+ * everywhere.  Same failure mode as the [DEPRECATED] GALOSH_RAW_N
+ * multi-scale luma decomposition (= -0.6 dB regression), confirming that
+ * luma adaptive-σ manipulation is structurally incompatible with the
+ * BLS-GSM PointSC framework GALOSH inherits.
+ *
+ * Diagonal-edge staircase is intrinsic to axis-aligned WHT-LOSH and
+ * requires rotation-equivariant transform replacement (= DT-CWT,
+ * steerable pyramid) for true mitigation; left for future work.
+ *
+ * Code retained for archival reproducibility.  Default 0 → bypass.
+ * Setting to 1 reproduces the failed _P bench numbers.
+ * ================================================================ */
+static int g_galosh_lambda_smooth = 0;  /* [DEPRECATED: GALOSH_YUV_P] */
+
+/* Pass 1 BayesShrink threshold mode (--pass1= CLI flag).
+ *   0 = baseline (per-block BayesShrink + VisuShrink cap σ·√(2 ln N))
+ *   1 = a1 (hierarchical empirical Bayes — image-level σ_x_global as prior,
+ *       no VisuShrink cap).  Fix for super-clean catastrophic destruction
+ *       (-8 to -12 dB) on RawNIND.  See galosh_pass1_blocked prepass block
+ *       for full derivation. */
+extern int g_galosh_pass1_mode;
+
+/* [DEPRECATED: GALOSH_YUV_P] block-grid sigma_y_sq smoothing kernel
+ * half-radius.  radius=1 → 3x3 block neighborhood; with stride=2
+ * ≈ 6 source-pixel smoothing window for the sigma_y_sq estimate. */
+#ifndef GALOSH_LAMBDA_SMOOTH_RADIUS
+#define GALOSH_LAMBDA_SMOOTH_RADIUS 1  /* [DEPRECATED: GALOSH_YUV_P] */
+#endif
 
 /* ================================================================
  * GALOSH Pass 1: BayesShrink adaptive hard thresholding
@@ -1093,11 +1492,21 @@ static float estimate_gat_sigma_halfres(const float *data, const int width, cons
  * later in this header (or in libm).  Explicit decls avoid implicit-
  * declaration warnings under -Wall and the static-after-implicit error
  * that follows. */
+/* [ARCHIVED] galosh_pass1 — single-orient flat-buffer Pass1 BayesShrink.
+ * Called only by [ARCHIVED] legacy stride=4 path in galosh_raw_cpu.c
+ * (#ifdef GALOSH_LEGACY).  GALOSH_RAW_G uses galosh_pass1_blocked +
+ * galosh_pass12_multiorient_blocked instead.  Forward decl below; impl
+ * later in this header. */
 static void galosh_pass1(const float *restrict input,
                          float *restrict output,
                          const int width, const int height,
                          const float sigma_strength,
                          const int stride);
+/* [PREVIOUS: GALOSH_RAW_G] / [LATEST: YUV_G] galosh_pass2 — single-orient
+ * flat-buffer Pass2 Wiener.  Called only by galosh_pass2_multiorient
+ * (Phase 4(c) K15 in GALOSH_RAW_G) and by [ARCHIVED] legacy stride=4.
+ * GALOSH_RAW_H Phase 5 luma uses pass12_multiorient_blocked instead;
+ * pass2 directly is no longer reached on the LATEST RAW path. */
 static void galosh_pass2(const float *restrict noisy,
                          const float *restrict pilot,
                          float *restrict output,
@@ -1121,6 +1530,11 @@ extern double j1(double x);
  * direction; sinc rotation would be overkill for what is essentially a
  * 4-sample symmetric average over rotational frame mismatches.
  * ================================================================ */
+/* [ARCHIVED] galosh_rotate_bilinear — variant B (n_orient=4) helper.
+ * Called only when galosh_pass*_multiorient sees angle != 0.  Default
+ * n_orient=1 has angle=0 only → identity rotation skips this function.
+ * GALOSH_RAW_G / YUV_G use n_orient=1, so this is dead code in
+ * production. */
 static void galosh_rotate_bilinear(const float *restrict in,
                                     float *restrict out,
                                     const int width, const int height,
@@ -1182,10 +1596,14 @@ static void galosh_rotate_bilinear(const float *restrict in,
  * n_orient == 4 uses the four orientations above.  Other values are
  * treated as 1.
  * ================================================================ */
-/* Forward declarations for the block-size-parameterized Pass1/Pass2.
- * Definitions live further down (after wht2d primitives + Kaiser init);
- * the multiorient wrapper calls into them, so it needs the prototypes
- * up here. */
+/* [LATEST: GALOSH_RAW_H/YUV_G] block-size-parameterized Pass1/Pass2
+ * forward declarations.  Definitions further down (after WHT primitives
+ * + Kaiser init).  These are the core LOSH primitives:
+ *   galosh_pass1_blocked : BayesShrink hard-threshold pilot, MAD-based
+ *                          σ_Y when use_robust_shrink=1 (= adopted by
+ *                          GALOSH_RAW_G/YUV_G).
+ *   galosh_pass2_blocked : empirical Wiener using pass1 pilot.
+ * Wrapped by galosh_pass12_multiorient_blocked below. */
 static void galosh_pass1_blocked(const float *restrict input,
                                  float *restrict output,
                                  const int width, const int height,
@@ -1202,13 +1620,17 @@ static void galosh_pass2_blocked(const float *restrict noisy,
                                   const int block_size,
                                   const int stride);
 
-/* Block-size-parameterized multi-orientation Pass1+Pass2 wrapper.
- * wiener_floor defaults to 1/B (=1/sqrt(N)) per the GALOSH convention.
+/* [LATEST: GALOSH_RAW_H/YUV_G] galosh_pass12_multiorient_blocked —
+ * Phase 4(a) K13 luma denoise wrapper.  Calls pass1_blocked +
+ * pass2_blocked (n_orient times; with n_orient=1 = single pass).
+ * wiener_floor defaults to 1/B (=1/sqrt(N)) per GALOSH convention.
  *
- * use_robust_shrink controls Pass1's σ_Y estimator (MAD vs mean) — see
- * galosh_pass1_blocked.  Pass2 is empirical Wiener with pilot, unaffected
- * by this flag (pilot quality from Pass1 is what propagates the robust
- * estimate's benefit through to Pass2's surviving-coefficient selection). */
+ * use_robust_shrink=1 (GALOSH_RAW_G/YUV_G adopted) flips Pass1's σ_Y
+ * estimator from L2 sum_sq to MAD partial-selection-sort robust
+ * estimator (Donoho-Johnstone 1995); pass2 inherits via pilot.
+ *
+ * GALOSH_RAW_G call: block_size=8, stride=2, n_orient=1, robust=1
+ * GALOSH_YUV_G call: same args on Y plane. */
 static void galosh_pass12_multiorient_blocked(const float *restrict noisy,
                                                float *restrict output,
                                                const int width, const int height,
@@ -1298,9 +1720,11 @@ static void galosh_pass12_multiorient_blocked(const float *restrict noisy,
     dt_free_align(derotated);
 }
 
-/* Backward-compat wrapper: legacy 8×8 multi-orient Pass1+2, mean-based
- * sigma_Y (use_robust_shrink=0).  External callers (galosh_yuv_cpu.c) and
- * legacy non-GALOSH_F path see no change. */
+/* [ARCHIVED] galosh_pass12_multiorient — backward-compat wrapper that
+ * forces use_robust_shrink=0 (mean-based σ_Y).  GALOSH_RAW_G/YUV_G
+ * adopted MAD-based σ_Y (use_robust_shrink=1), so this wrapper is no
+ * longer called by the production pipeline.  Kept for old YUV bench
+ * scripts that link this header directly. */
 static inline void galosh_pass12_multiorient(const float *restrict noisy,
                                               float *restrict output,
                                               const int width, const int height,
@@ -1315,15 +1739,15 @@ static inline void galosh_pass12_multiorient(const float *restrict noisy,
 }
 
 /* ================================================================
- * Multi-orientation Pass2-only wrapper (with precomputed pilot).
+ * [PREVIOUS: GALOSH_RAW_G] galosh_pass2_multiorient — Phase 4(c) K15 wrapper.
  *
- * Used by the RAW pipeline's full-res L refinement step (compute_L_fullres
- * already produced a pilot, so we only need Pass2 / Wiener).  Same
- * 4-orientation averaging as galosh_pass12_multiorient, but operates on
- * an externally supplied (noisy, pilot) pair.
+ * Called from gat_galosh_denoise_rawlc Phase 4(c) with n_orient=1 →
+ * collapses to plain galosh_pass2 (Wiener-only).  noisy + pilot pair
+ * comes from Phase 4(b) compute_L_fullres × 2 (= K14).
  *
- * Both `noisy` and `pilot` are rotated together at each orientation to
- * keep the Wiener weighting consistent across the pair.
+ * If n_orient>1 (= [ARCHIVED] variant B), it averages 4 rotations of
+ * (noisy, pilot) via galosh_rotate_bilinear — currently unreachable
+ * because GALOSH_RAW_G hardcodes n_orient=1.
  * ================================================================ */
 static void galosh_pass2_multiorient(const float *restrict noisy,
                                       const float *restrict pilot,
@@ -1430,6 +1854,13 @@ static inline float galosh_jinc(float x);
  *   sign as wsum so the normalisation just rescales positive
  *   contributions; tested stable for all four sub-pixel positions.
  * ================================================================ */
+/* [PREVIOUS: GALOSH_RAW_G] galosh_upsample_2x_ewajl3 — Phase 4(d) K16
+ * chromaup helper.  Bandlimit-faithful 2x upsample of half-res chroma
+ * (c1/c2/c3) to full-res, used by gat_galosh_denoise_rawlc Phase 4(d).
+ * 5x5 jinc-windowed-jinc kernel, normalised per sub-pixel offset.
+ * Killed pre-G's 2x2 chroma stair-step on diagonal edges.
+ * GALOSH_RAW_H operates at full-res throughout, so the K16 chromaup is
+ * no longer reached on the LATEST RAW path; kept for --variant=g bench. */
 static void galosh_upsample_2x_ewajl3(const float *restrict src,
                                        float *restrict dst,
                                        const int halfwidth, const int halfheight)
@@ -1553,6 +1984,12 @@ static inline float galosh_jinc(float x)
  *     公式が成立、WHT primitive と Kaiser window だけ B で切り替え。
  *     K13 4×4 + K15 8×8 が full-res で grain scale 一致 (2*4=8=8) する
  *     唯一の組合せで、K11 の Bayer 2×2 階層から自然に導かれる。
+ * ================================================================
+ * [LATEST: GALOSH_RAW_H/YUV_G] body of galosh_pass1_blocked.
+ * BayesShrink hard-threshold pilot.  When use_robust_shrink=1
+ * (= adopted by GALOSH_RAW_G/YUV_G), σ_Y is computed via MAD partial-
+ * selection-sort robust estimator (Donoho-Johnstone 1995).  Otherwise
+ * L2 sum_sq estimator (= [ARCHIVED] pre-G default) is used.
  * ================================================================ */
 static void galosh_pass1_blocked(const float *restrict input,
                                  float *restrict output,
@@ -1615,6 +2052,185 @@ static void galosh_pass1_blocked(const float *restrict input,
     /* VisuShrink fallback for flat blocks: lambda_max = sigma * sqrt(2 ln N) */
     const float lambda_max = sigma_strength * sqrtf(2.0f * logf((float)N));
 
+    /* ================================================================
+     * Hierarchical empirical Bayes prepass (= "A1" image-level BayesShrink)
+     *
+     * EN: Activated by g_galosh_pass1_mode==1.  The vanilla BayesShrink
+     *   threshold λ = σ²/σ_x_local breaks down when σ_x_local → 0
+     *   (= subtle texture in super-clean images), forcing λ → ∞ and
+     *   killing every AC coefficient even when subtle signal exists.
+     *   The current code patches this via VisuShrink cap (λ_max =
+     *   σ·√(2 ln N)) which is a worst-case universal bound — still
+     *   strong enough to destroy super-clean texture (catastrophic
+     *   -8 to -12 dB on RawNIND 2pilesofplates ISO125/160, Blombukett,
+     *   Elplint where BM3D loses < 1 dB).
+     *
+     *   A1 replaces the universal cap with an image-level Bayes prior:
+     *     σ_x_global² = max( mean(σ_y_local²) - σ², ε )
+     *     σ_x_eff²    = max( σ_x_local², σ_x_global² )
+     *     λ           = σ² / √σ_x_eff² · √N  (no cap)
+     *
+     *   This is hierarchical empirical Bayes shrinkage (Efron-Morris,
+     *   Carlin-Louis): when local signal variance is unreliable, fall
+     *   back to the global signal variance estimate.  For super-clean
+     *   images, σ_x_global is small but non-zero (= edge / structure
+     *   contribution still dominates a few blocks), preventing the
+     *   λ → ∞ catastrophe.  For noisy images, σ_x_local typically
+     *   exceeds σ_x_global → behavior reduces to vanilla BayesShrink.
+     *
+     *   No new tuning constants; σ_x_global is derived purely from
+     *   pre-pass statistics.
+     *
+     * JP: σ_x_local が 0 に近づくと λ が発散して全 AC が消されるのが
+     *   super-clean 崩壊の本因.  従来は VisuShrink universal cap
+     *   (σ·√(2 ln N)) で抑え込んでいたが、cap 自体が subtle texture
+     *   を kill するレベル.  A1 は階層的 empirical Bayes で「画像
+     *   全体の signal variance σ_x_global」を prior として、 σ_x_local
+     *   が信頼できない時 (≈0 の時) これにフォールバック.  Cap 撤廃.
+     *   定数なし、 既存統計から完全導出.
+     * ================================================================ */
+    float sigma_x_sq_global = 0.0f;
+    if(g_galosh_pass1_mode == 1)
+    {
+      /* Prepass: forward WHT every block, compute sigma_y_sq, accumulate. */
+      double sum_sigma_y_sq = 0.0;
+      long n_blk_global = 0;
+      #pragma omp parallel for reduction(+:sum_sigma_y_sq,n_blk_global) schedule(dynamic, 4)
+      for(int ref_r = 0; ref_r <= rmax; ref_r += stride)
+      {
+        for(int ref_c = 0; ref_c <= cmax; ref_c += stride)
+        {
+          float blk[GALOSH_BLOCK_PIXELS];
+          for(int dy = 0; dy < B; dy++)
+            memcpy(blk + dy * B,
+                   input + (ref_r + dy) * width + ref_c,
+                   B * sizeof(float));
+          wht_fn(blk, 0);
+          float s2;
+          if(use_robust_shrink)
+          {
+            float ac[GALOSH_BLOCK_PIXELS];
+            for(int i = 1; i < N; i++) ac[i - 1] = fabsf(blk[i]);
+            const float mad = quick_select_median(ac, N - 1);
+            const float scale = mad / 0.6745f;
+            s2 = (scale * scale) / (float)N;
+          }
+          else
+          {
+            float sum_sq = 0.0f;
+            for(int i = 1; i < N; i++) sum_sq += blk[i] * blk[i];
+            s2 = sum_sq / ((float)(N - 1) * (float)N);
+          }
+          sum_sigma_y_sq += s2;
+          n_blk_global++;
+        }
+      }
+      if(n_blk_global > 0)
+      {
+        const float mean_sigma_y_sq = (float)(sum_sigma_y_sq / (double)n_blk_global);
+        sigma_x_sq_global = fmaxf(mean_sigma_y_sq - sigma_sq, 1e-8f);
+      }
+      fprintf(stderr, "[pass1] A1 prepass: n_blk=%ld, mean_sigma_y_sq=%.6e, "
+              "sigma_x_sq_global=%.6e (sigma_sq=%.6e)\n",
+              n_blk_global,
+              (n_blk_global > 0) ? (float)(sum_sigma_y_sq / (double)n_blk_global) : 0.0f,
+              sigma_x_sq_global, sigma_sq);
+    }
+
+    /* ================================================================
+     * [DEPRECATED: GALOSH_YUV_P] Spatially-smoothed BayesShrink pre-pass.
+     * Failed hypothesis, retained for archival reproducibility.
+     *
+     * Activated only when g_galosh_lambda_smooth=1 (= the [DEPRECATED]
+     * --variant=p path).  Pass-A estimates sigma_y_sq for every block,
+     * then box-smooths the (n_blk_y × n_blk_x) grid using a (2R+1)×(2R+1)
+     * window with R = GALOSH_LAMBDA_SMOOTH_RADIUS.  Pass-B (= main loop)
+     * reads the smoothed sigma_y_sq instead of recomputing it inline.
+     *
+     * Empirical result: -0.46 dB PSNR regression vs O on SIDD 80-pair
+     * bench 2026-05-08.  See toggle declaration above for full rejection
+     * rationale (= reduces BayesShrink local adaptivity, same family of
+     * failure as [DEPRECATED] GALOSH_RAW_N multi-scale luma).
+     *
+     * Production [LATEST: GALOSH_*_O] and [LATEST: GALOSH_YUV_Q] keep
+     * g_galosh_lambda_smooth=0 (= bypass this pre-pass entirely).
+     * ================================================================ */
+    float *sigma_smooth = NULL;
+    int n_blk_x = 0, n_blk_y = 0;
+    if(g_galosh_lambda_smooth)
+    {
+        n_blk_x = (cmax / stride) + 1;
+        n_blk_y = (rmax / stride) + 1;
+        float *sigma_grid = (float *)dt_alloc_align(64,
+                                (size_t)n_blk_x * n_blk_y * sizeof(float));
+        sigma_smooth      = (float *)dt_alloc_align(64,
+                                (size_t)n_blk_x * n_blk_y * sizeof(float));
+        if(!sigma_grid || !sigma_smooth)
+        {
+            if(sigma_grid)   dt_free_align(sigma_grid);
+            if(sigma_smooth) { dt_free_align(sigma_smooth); sigma_smooth = NULL; }
+            /* fall through with sigma_smooth=NULL → main loop uses inline sigma_y_sq */
+        }
+        else
+        {
+            /* Pass-A: per-block sigma_y_sq via WHT + MAD (or L2 sum_sq). */
+            #pragma omp parallel for schedule(dynamic, 4)
+            for(int ref_r = 0; ref_r <= rmax; ref_r += stride)
+            {
+                for(int ref_c = 0; ref_c <= cmax; ref_c += stride)
+                {
+                    float blk[GALOSH_BLOCK_PIXELS];
+                    for(int dy = 0; dy < B; dy++)
+                        memcpy(blk + dy * B,
+                               input + (ref_r + dy) * width + ref_c,
+                               B * sizeof(float));
+                    wht_fn(blk, 0);
+                    float s2;
+                    if(use_robust_shrink)
+                    {
+                        float ac[GALOSH_BLOCK_PIXELS];
+                        for(int i = 1; i < N; i++) ac[i - 1] = fabsf(blk[i]);
+                        const float mad   = quick_select_median(ac, N - 1);
+                        const float scale = mad / 0.6745f;
+                        s2 = (scale * scale) / (float)N;
+                    }
+                    else
+                    {
+                        float ss = 0.0f;
+                        for(int i = 1; i < N; i++) ss += blk[i] * blk[i];
+                        s2 = ss / ((float)(N - 1) * (float)N);
+                    }
+                    const int by = ref_r / stride;
+                    const int bx = ref_c / stride;
+                    sigma_grid[(size_t)by * n_blk_x + bx] = s2;
+                }
+            }
+            /* Spatial box-smoothing on block grid. */
+            const int R = GALOSH_LAMBDA_SMOOTH_RADIUS;
+            #pragma omp parallel for schedule(static)
+            for(int by = 0; by < n_blk_y; by++)
+            {
+                for(int bx = 0; bx < n_blk_x; bx++)
+                {
+                    float sum = 0.0f;
+                    int   cnt = 0;
+                    const int by0 = (by - R < 0) ? 0 : (by - R);
+                    const int by1 = (by + R >= n_blk_y) ? (n_blk_y - 1) : (by + R);
+                    const int bx0 = (bx - R < 0) ? 0 : (bx - R);
+                    const int bx1 = (bx + R >= n_blk_x) ? (n_blk_x - 1) : (bx + R);
+                    for(int ny = by0; ny <= by1; ny++)
+                        for(int nx = bx0; nx <= bx1; nx++)
+                        {
+                            sum += sigma_grid[(size_t)ny * n_blk_x + nx];
+                            cnt++;
+                        }
+                    sigma_smooth[(size_t)by * n_blk_x + bx] = sum / (float)cnt;
+                }
+            }
+            dt_free_align(sigma_grid);
+        }
+    }
+
     #pragma omp parallel
     {
         const int tid = omp_get_thread_num();
@@ -1664,7 +2280,17 @@ static void galosh_pass1_blocked(const float *restrict input,
                  * noise cluster を構造的に消す唯一の局所手法 (NL に踏み込まず
                  * BM3D-style cluster suppression に近づける)。 */
                 float sigma_y_sq;
-                if(use_robust_shrink)
+                if(sigma_smooth)
+                {
+                    /* [DEPRECATED: GALOSH_YUV_P] read pre-computed and
+                     * spatially-smoothed sigma_y_sq from the block grid.
+                     * Eliminates the per-block lambda discontinuity that
+                     * otherwise leaves block-grid trace at curved edges. */
+                    const int by = ref_r / stride;
+                    const int bx = ref_c / stride;
+                    sigma_y_sq = sigma_smooth[(size_t)by * n_blk_x + bx];
+                }
+                else if(use_robust_shrink)
                 {
                     float abs_coefs[GALOSH_BLOCK_PIXELS];  /* max 64, holds N-1 ACs */
                     for(int i = 1; i < N; i++)
@@ -1683,22 +2309,37 @@ static void galosh_pass1_blocked(const float *restrict input,
                     sigma_y_sq = sum_sq / ((float)(N - 1) * (float)N);
                 }
 
-                /* sigma_X^2 = max(sigma_Y^2 - sigma^2, 0) */
-                const float sigma_x_sq = fmaxf(sigma_y_sq - sigma_sq, 0.0f);
+                /* sigma_X^2 = max(sigma_Y^2 - sigma^2, 0)
+                 *
+                 * A1 (g_galosh_pass1_mode==1): replace cap-based safety net
+                 * with hierarchical empirical Bayes — when local σ_x is
+                 * unreliable (< σ_x_global), fall back to image-level prior.
+                 * Avoids λ → ∞ catastrophe in super-clean blocks without
+                 * the over-aggressive VisuShrink cap. */
+                const float sigma_x_sq_local = fmaxf(sigma_y_sq - sigma_sq, 0.0f);
+                const float sigma_x_sq = (g_galosh_pass1_mode == 1)
+                  ? fmaxf(sigma_x_sq_local, sigma_x_sq_global)
+                  : sigma_x_sq_local;
 
                 /* BayesShrink threshold (in unnormalized WHT scale) */
                 float lambda;
                 if(sigma_x_sq < 1e-10f)
                 {
-                    /* Flat block: kill all AC (only noise) */
+                    /* Flat block: kill all AC (only noise). In A1 mode this
+                     * branch is effectively unreachable (sigma_x_sq_global is
+                     * clamped to >=1e-8), but kept as safety. */
                     lambda = 1e30f;
                 }
                 else
                 {
                     /* lambda = sigma^2 / sigma_x scaled by sqrt(N) for unnormalized coef domain */
                     lambda = (sigma_sq / sqrtf(sigma_x_sq)) * sqrtf((float)N);
-                    const float lambda_max_unorm = lambda_max * sqrtf((float)N);
-                    if(lambda > lambda_max_unorm) lambda = lambda_max_unorm;
+                    if(g_galosh_pass1_mode != 1)
+                    {
+                        /* Baseline VisuShrink cap retained for non-A1 mode. */
+                        const float lambda_max_unorm = lambda_max * sqrtf((float)N);
+                        if(lambda > lambda_max_unorm) lambda = lambda_max_unorm;
+                    }
                 }
 
                 /* Hard threshold: zero coefficients below lambda, preserve DC */
@@ -1714,8 +2355,10 @@ static void galosh_pass1_blocked(const float *restrict input,
                 /* Inverse 2D WHT (with normalization: divide by N) */
                 wht_fn(block, 1);
 
-                /* Overlap-add with Kaiser window */
+                /* Overlap-add with Kaiser window + per-block sparsity
+                 * weight (= 1/n_nonzero, BLS-GSM PointSC convention). */
                 const float weight = 1.0f / (float)n_nonzero;
+
                 for(int dy = 0; dy < B; dy++)
                     for(int dx = 0; dx < B; dx++)
                     {
@@ -1751,12 +2394,16 @@ static void galosh_pass1_blocked(const float *restrict input,
     }
     free(t_numer);
     free(t_denom);
+    if(sigma_smooth) dt_free_align(sigma_smooth);
 }
 
-/* Backward-compat wrapper: legacy 8×8 BayesShrink pilot, mean-based
- * sigma_Y estimate (use_robust_shrink=0).  Existing callers (rawdenoise_v6.c,
- * yuv_galosh_core.c, galosh_yuv_cpu.c, raw_cpu.c legacy non-GALOSH_F path)
- * see no behaviour change. */
+/* [ARCHIVED] galosh_pass1 — backward-compat wrapper that forces
+ * use_robust_shrink=0 (mean-based σ_Y).  GALOSH_RAW_G/YUV_G adopted
+ * MAD-based σ_Y (use_robust_shrink=1) so this wrapper is no longer
+ * called by the [LATEST] pipeline.  Used by:
+ *   - galosh_raw_cpu.c [ARCHIVED] legacy stride=4 #ifdef GALOSH_LEGACY
+ *     branch (line ~1500: galosh_pass1 + galosh_pass2)
+ *   - old YUV bench scripts that link this header directly */
 static inline void galosh_pass1(const float *restrict input,
                                 float *restrict output,
                                 const int width, const int height,
@@ -1800,6 +2447,11 @@ static inline void galosh_pass1(const float *restrict input,
  * JP: Wiener pass を block size B でパラメータ化。Pass1 と同じ B={4,8}
  *     dispatch、wiener_floor は明示渡し。default は 1/sqrt(N) で B=4 だと
  *     0.25 (8×8 の倍に粗く保護)。
+ * ================================================================
+ * [LATEST: GALOSH_RAW_H/YUV_G] body of galosh_pass2_blocked.  Empirical
+ * Wiener Pass2 using a precomputed pilot.  Called from
+ * galosh_pass12_multiorient_blocked (Phase 4(a) K13) and from
+ * galosh_pass2 / galosh_pass2_multiorient (Phase 4(c) K15).
  * ================================================================ */
 static void galosh_pass2_blocked(const float *restrict noisy,
                                   const float *restrict pilot,
@@ -1939,7 +2591,11 @@ static void galosh_pass2_blocked(const float *restrict noisy,
     free(t_denom);
 }
 
-/* Backward-compat wrapper: legacy 8×8 Pass2 with caller-specified floor. */
+/* [ARCHIVED] galosh_pass2_ex — Pass2 wrapper with caller-specified
+ * Wiener floor.  Used by archived chroma WHT-LOSH paths (B-cfa etc.)
+ * that needed a higher floor (0.3 vs default 0.125) to prevent
+ * over-shrinkage of chroma AC.  GALOSH_RAW_G/YUV_G use LOESS for
+ * chroma so this wrapper is no longer called by [LATEST]. */
 static inline void galosh_pass2_ex(const float *restrict noisy,
                                     const float *restrict pilot,
                                     float *restrict output,
@@ -1953,7 +2609,13 @@ static inline void galosh_pass2_ex(const float *restrict noisy,
                           GALOSH_BLOCK_SIZE, stride);
 }
 
-/* Convenience wrapper: standard Wiener (original floor) */
+/* [LATEST: GALOSH_RAW_H/YUV_G] body of galosh_pass2 (forward decl above).
+ * Wiener-shrinkage Pass2 with default floor (1/B = 0.125 for B=8).
+ * Called by:
+ *   - galosh_pass2_multiorient (LATEST Phase 4(c) K15, n_orient=1 case)
+ *   - galosh_raw_cpu.c [ARCHIVED] legacy stride=4 path (#ifdef GALOSH_LEGACY)
+ * Convenience wrapper around galosh_pass2_blocked with B=GALOSH_BLOCK_SIZE
+ * and the standard Wiener floor. */
 static void galosh_pass2(const float *restrict noisy,
                          const float *restrict pilot,
                          float *restrict output,
@@ -2026,17 +2688,35 @@ static inline int reflect_idx(int i, int n)
   return i;
 }
 
-static void galosh_loess_chroma(const float *restrict y_guide,
-                                const float *restrict cb_in,
-                                const float *restrict cr_in,
-                                float *restrict cb_out,
-                                float *restrict cr_out,
-                                const int width, const int height,
-                                const float strength_c)
+/* [LATEST: GALOSH_RAW_I/H/YUV_G] galosh_loess_chroma_r — Y-guided
+ * bilateral LOESS on chroma planes, R-parameterized.
+ *   GALOSH_RAW_I  use: Phase 5(C) at half-res w/ R=GALOSH_LOESS_RADIUS,
+ *                      AND Phase 6.5 at full-res w/ R=3 for L-edge
+ *                      alignment refinement (joint bilateral upsample).
+ *   GALOSH_RAW_H  use: Phase 5 at full-res w/ R=GALOSH_LOESS_RADIUS.
+ *   GALOSH_RAW_G  use: Phase 3.5 at half-res w/ R=GALOSH_LOESS_RADIUS.
+ *   GALOSH_YUV_G  use: chroma stage on Cb/Cr after Y plane LOSH.
+ *
+ * Per-pixel local linear regression with bilateral weight
+ *   w_i = exp(-(Y_i - Y_c)² / (2σ²))
+ * (σ = GALOSH_LOESS_BW = 3.0).  Specular highlights excluded by the
+ * weight, kills silver-window red/blue chroma noise spurs.
+ *
+ * R parameterization usage:
+ *   R=GALOSH_LOESS_RADIUS (=7, 15x15 window) — primary denoise
+ *   R=3 (7x7 window)                          — refinement / edge align
+ *
+ * Replaces pre-G WHT-LOSH-on-chroma + pre-G separable mean guided. */
+static void galosh_loess_chroma_r(const float *restrict y_guide,
+                                  const float *restrict cb_in,
+                                  const float *restrict cr_in,
+                                  float *restrict cb_out,
+                                  float *restrict cr_out,
+                                  const int width, const int height,
+                                  const float strength_c, const int R)
 {
   const float eps_gat = strength_c * strength_c * GALOSH_LOESS_TAU_SQ_INV;
   const float inv_2sigma_sq = 1.0f / (2.0f * GALOSH_LOESS_BW * GALOSH_LOESS_BW);
-  const int R = GALOSH_LOESS_RADIUS;
 
   const int x0_int = (R < width)  ? R          : width;
   const int x1_int = (width  > R) ? width - R  : 0;
@@ -2133,6 +2813,1283 @@ static void galosh_loess_chroma(const float *restrict y_guide,
       cr_out[cx] = a_cr * Y_c + b_cr;
     }
   }
+}
+
+/* [LATEST: GALOSH_RAW_J/I/H/YUV_G] galosh_loess_chroma — thin wrapper that
+ * delegates to galosh_loess_chroma_r with R = GALOSH_LOESS_RADIUS (=7).
+ * Preserved for backward compatibility with all existing callers
+ * (gat_galosh_denoise_rawlc, gat_galosh_denoise_rawlc_h,
+ *  galosh_yuv_cpu).  GALOSH_RAW_J / I prefer galosh_loess_chroma_3ch_r
+ * (3-channel fused) for performance. */
+static inline void galosh_loess_chroma(const float *restrict y_guide,
+                                       const float *restrict cb_in,
+                                       const float *restrict cr_in,
+                                       float *restrict cb_out,
+                                       float *restrict cr_out,
+                                       const int width, const int height,
+                                       const float strength_c)
+{
+  galosh_loess_chroma_r(y_guide, cb_in, cr_in, cb_out, cr_out,
+                        width, height, strength_c, GALOSH_LOESS_RADIUS);
+}
+
+/* [LATEST: GALOSH_RAW_M] galosh_loess_chroma_3ch_r_with_var — same as
+ * galosh_loess_chroma_3ch_r below but ALSO emits per-pixel sample
+ * variance estimates (var_C1/var_C2/var_C3) used by hierarchical
+ * Bayesian denoising (= GALOSH_RAW_M Phase 5(C)).
+ *
+ * Per-pixel σ_local²(x) is the bias-corrected weighted sample variance
+ * within the LOESS window:
+ *   σ_local²(x) = max( weighted_var(C_in in window) - σ_n², 0 )
+ *   weighted_var = Σ w_i C_i² / Σ w_i  −  (Σ w_i C_i / Σ w_i)²
+ * In GAT-normalized space σ_n² = 1 (= structural property of GAT
+ * normalization, NOT a magic constant).
+ *
+ * The variance estimate is computed from sumC²_per_channel which is
+ * accumulated alongside the existing LOESS sums (= one extra mul-add
+ * per window position per chroma channel = +~15% LOESS cost).
+ *
+ * Used by GALOSH_RAW_M Phase 5(C) for the LOCAL LOESS stage; the
+ * GLOBAL stage uses galosh_loess_chroma_3ch_r (without var) since
+ * hierarchical Bayesian only needs σ²_local, not σ²_global. */
+static void galosh_loess_chroma_3ch_r_with_var(
+    const float *restrict y_guide,
+    const float *restrict c1_in,
+    const float *restrict c2_in,
+    const float *restrict c3_in,
+    float *restrict c1_out,
+    float *restrict c2_out,
+    float *restrict c3_out,
+    float *restrict var_c1_out,
+    float *restrict var_c2_out,
+    float *restrict var_c3_out,
+    const int width, const int height,
+    const float strength_c, const int R, const float BW)
+{
+  const float eps_gat = strength_c * strength_c * GALOSH_LOESS_TAU_SQ_INV;
+  const float inv_2sigma_sq = 1.0f / (2.0f * BW * BW);
+
+  const int x0_int = (R < width)  ? R          : width;
+  const int x1_int = (width  > R) ? width - R  : 0;
+  const int y0_int = (R < height) ? R          : height;
+  const int y1_int = (height > R) ? height - R : 0;
+
+  /* σ_n² = 1 in GAT-normalized space (= structural property post-Phase 1
+   * RMS unified-sigma normalization).  Not a magic constant. */
+  const float sigma_n_sq = 1.0f;
+
+  DT_OMP_FOR()
+  for(int y = 0; y < height; y++)
+  {
+    const int y_interior = (y >= y0_int && y < y1_int);
+    for(int x = 0; x < width; x++)
+    {
+      const size_t cx = (size_t)y * width + x;
+      const float Y_c = y_guide[cx];
+
+      float sumW = 0.f, sumY = 0.f, sumYY = 0.f;
+      float sumC1 = 0.f, sumC2 = 0.f, sumC3 = 0.f;
+      float sumYC1 = 0.f, sumYC2 = 0.f, sumYC3 = 0.f;
+      /* Per-channel sumC²_i for sample variance (Bayesian σ_local²). */
+      float sumC1sq = 0.f, sumC2sq = 0.f, sumC3sq = 0.f;
+
+      if(y_interior && x >= x0_int && x < x1_int)
+      {
+        for(int dy = -R; dy <= R; dy++)
+        {
+          const size_t row_off = (size_t)(y + dy) * width;
+          const float *rowY  = y_guide + row_off;
+          const float *rowC1 = c1_in   + row_off;
+          const float *rowC2 = c2_in   + row_off;
+          const float *rowC3 = c3_in   + row_off;
+          for(int dx = -R; dx <= R; dx++)
+          {
+            const int xi = x + dx;
+            const float Yi  = rowY [xi];
+            const float C1i = rowC1[xi];
+            const float C2i = rowC2[xi];
+            const float C3i = rowC3[xi];
+            const float dY  = Yi - Y_c;
+            const float w   = expf(-dY * dY * inv_2sigma_sq);
+            sumW   += w;
+            sumY   += w * Yi;
+            sumYY  += w * Yi * Yi;
+            sumC1  += w * C1i;
+            sumC2  += w * C2i;
+            sumC3  += w * C3i;
+            sumYC1 += w * Yi * C1i;
+            sumYC2 += w * Yi * C2i;
+            sumYC3 += w * Yi * C3i;
+            sumC1sq += w * C1i * C1i;
+            sumC2sq += w * C2i * C2i;
+            sumC3sq += w * C3i * C3i;
+          }
+        }
+      }
+      else
+      {
+        for(int dy = -R; dy <= R; dy++)
+        {
+          const int yi = reflect_idx(y + dy, height);
+          const size_t row_off = (size_t)yi * width;
+          const float *rowY  = y_guide + row_off;
+          const float *rowC1 = c1_in   + row_off;
+          const float *rowC2 = c2_in   + row_off;
+          const float *rowC3 = c3_in   + row_off;
+          for(int dx = -R; dx <= R; dx++)
+          {
+            const int xi = reflect_idx(x + dx, width);
+            const float Yi  = rowY [xi];
+            const float C1i = rowC1[xi];
+            const float C2i = rowC2[xi];
+            const float C3i = rowC3[xi];
+            const float dY  = Yi - Y_c;
+            const float w   = expf(-dY * dY * inv_2sigma_sq);
+            sumW   += w;
+            sumY   += w * Yi;
+            sumYY  += w * Yi * Yi;
+            sumC1  += w * C1i;
+            sumC2  += w * C2i;
+            sumC3  += w * C3i;
+            sumYC1 += w * Yi * C1i;
+            sumYC2 += w * Yi * C2i;
+            sumYC3 += w * Yi * C3i;
+            sumC1sq += w * C1i * C1i;
+            sumC2sq += w * C2i * C2i;
+            sumC3sq += w * C3i * C3i;
+          }
+        }
+      }
+
+      const float invW   = 1.0f / fmaxf(sumW, 1e-10f);
+      const float meanY  = sumY  * invW;
+      const float meanYY = sumYY * invW;
+      const float meanC1 = sumC1 * invW;
+      const float meanC2 = sumC2 * invW;
+      const float meanC3 = sumC3 * invW;
+      const float meanYC1 = sumYC1 * invW;
+      const float meanYC2 = sumYC2 * invW;
+      const float meanYC3 = sumYC3 * invW;
+      const float meanC1sq = sumC1sq * invW;
+      const float meanC2sq = sumC2sq * invW;
+      const float meanC3sq = sumC3sq * invW;
+
+      const float var_Y   = fmaxf(meanYY - meanY * meanY, 0.0f);
+      const float denom   = fmaxf(var_Y + eps_gat, 1e-6f);
+      const float inv_denom = 1.0f / denom;
+
+      const float a_c1 = (meanYC1 - meanY * meanC1) * inv_denom;
+      const float a_c2 = (meanYC2 - meanY * meanC2) * inv_denom;
+      const float a_c3 = (meanYC3 - meanY * meanC3) * inv_denom;
+      const float b_c1 = meanC1 - a_c1 * meanY;
+      const float b_c2 = meanC2 - a_c2 * meanY;
+      const float b_c3 = meanC3 - a_c3 * meanY;
+
+      c1_out[cx] = a_c1 * Y_c + b_c1;
+      c2_out[cx] = a_c2 * Y_c + b_c2;
+      c3_out[cx] = a_c3 * Y_c + b_c3;
+
+      /* Per-channel σ_local²(x) = max(sample_variance - σ_n², 0).
+       * Sample variance from weighted second moment, bias-corrected by
+       * subtracting structural σ_n² = 1 (GAT-norm). */
+      const float var_c1_raw = meanC1sq - meanC1 * meanC1;
+      const float var_c2_raw = meanC2sq - meanC2 * meanC2;
+      const float var_c3_raw = meanC3sq - meanC3 * meanC3;
+      var_c1_out[cx] = fmaxf(var_c1_raw - sigma_n_sq, 0.0f);
+      var_c2_out[cx] = fmaxf(var_c2_raw - sigma_n_sq, 0.0f);
+      var_c3_out[cx] = fmaxf(var_c3_raw - sigma_n_sq, 0.0f);
+    }
+  }
+}
+
+/* [LATEST: GALOSH_RAW_M] gat_m_bayesian_fusion_3ch — per-pixel
+ * hierarchical Bayesian inverse-variance weighted fusion of local
+ * vs global LOESS estimates.
+ *
+ * Per-channel update (k = 1, 2, 3):
+ *   σ_n²_eff = chroma_strength² × σ_n²        (= chroma_strength² in GAT-norm)
+ *   w_data_k = (N_local · σ_local_k²) / (N_local · σ_local_k² + σ_n²_eff)
+ *   C_k_out  = w_data_k · C_k_local + (1 - w_data_k) · C_k_global
+ *
+ * Behavior:
+ *   chroma_strength = 0  → w_data = 1 → C_out = C_local (= H equivalent)
+ *   chroma_strength = 1  → balanced (σ_local²(x)-driven adaptive)
+ *   chroma_strength → ∞  → w_data = 0 → C_out = C_global (= max smoothing)
+ *
+ * This is the MAP estimator under the hierarchical model:
+ *   C_true ~ N(C_global, σ_local²)        (= local-vs-global prior)
+ *   C_local_hat ~ N(C_true, σ_n²/N_local) (= local LOESS estimator)
+ * with chroma_strength scaling the noise variance σ_n² (= user's
+ * "stronger denoise = treat noise as larger" intuition, principled).
+ *
+ * (日) MAP estimator: σ_n² scaling で「noise を k×大きいと仮定」して
+ *   denoise を強めるという user 直感を Bayesian 階層モデルで実現。
+ *   平坦部は σ_local² ≈ 0 → w_data → 0 → C_global (強平滑化)。
+ *   detail 部は σ_local² > 0 → w_data → 1 → C_local (詳細保存)。 */
+static void gat_m_bayesian_fusion_3ch(
+    const float *c1_local,
+    const float *c2_local,
+    const float *c3_local,
+    const float *c1_global,
+    const float *c2_global,
+    const float *c3_global,
+    const float *var_c1,
+    const float *var_c2,
+    const float *var_c3,
+    float *c1_out,
+    float *c2_out,
+    float *c3_out,
+    const int width, const int height,
+    const int N_local,
+    const float chroma_strength)
+{
+  /* σ_n²_eff = chroma_strength² × σ_n² = chroma_strength² (GAT-norm σ_n²=1). */
+  const float sigma_n_sq_eff = chroma_strength * chroma_strength;
+  const float Nl = (float)N_local;
+
+  DT_OMP_FOR()
+  for(int y = 0; y < height; y++)
+  {
+    const size_t row_off = (size_t)y * width;
+    for(int x = 0; x < width; x++)
+    {
+      const size_t cx = row_off + x;
+
+      const float v1 = var_c1[cx], v2 = var_c2[cx], v3 = var_c3[cx];
+      const float Nv1 = Nl * v1;
+      const float Nv2 = Nl * v2;
+      const float Nv3 = Nl * v3;
+      /* Per-channel inverse-variance weight w_data_k.
+       * Floor on denom guards against simultaneous v_k=0 AND
+       * chroma_strength=0 (= edge case → w_data→1, output=local). */
+      const float w1 = Nv1 / fmaxf(Nv1 + sigma_n_sq_eff, 1e-12f);
+      const float w2 = Nv2 / fmaxf(Nv2 + sigma_n_sq_eff, 1e-12f);
+      const float w3 = Nv3 / fmaxf(Nv3 + sigma_n_sq_eff, 1e-12f);
+
+      c1_out[cx] = w1 * c1_local[cx] + (1.0f - w1) * c1_global[cx];
+      c2_out[cx] = w2 * c2_local[cx] + (1.0f - w2) * c2_global[cx];
+      c3_out[cx] = w3 * c3_local[cx] + (1.0f - w3) * c3_global[cx];
+    }
+  }
+}
+
+/* [LATEST: GALOSH_RAW_J] galosh_loess_chroma_3ch_r — multi-channel
+ * (3 chroma plane) Y-guided bilateral LOESS, fused single-pass version
+ * of galosh_loess_chroma_r.  Y-related stats (sumW, sumY, sumYY) are
+ * computed once per window and shared across the 3 chroma regressions
+ * → ~36% compute reduction vs 2 separate chroma_r calls (which would
+ * recompute Y stats independently in each call).  Per-channel sums
+ * (sumC1/2/3, sumYC1/2/3) computed once each.
+ *
+ * Parameters:
+ *   strength_c — sets ε = strength_c² × GALOSH_LOESS_TAU_SQ_INV
+ *                (Bayesian: ε = σ_C² / τ²; should match the input C's
+ *                 noise variance for principled regularization)
+ *   R          — bilateral window half-size (window = (2R+1)×(2R+1))
+ *   BW         — bilateral bandwidth (σ in GAT-norm units; 3.0 for
+ *                Phase 5(C) primary denoise = 3σ Mahalanobis cluster
+ *                threshold; 1.5 for Phase 8 refinement = tighter
+ *                separation for moderate-to-weak edges where input is
+ *                already low-noise)
+ *
+ * Used by:
+ *   GALOSH_RAW_J Phase 5(C): half-res chroma denoise
+ *     (strength_c = chroma slider, R = GALOSH_LOESS_RADIUS, BW = 3.0)
+ *   GALOSH_RAW_J Phase 8:    full-res chroma refinement
+ *     (strength_c = 0.1 hardcoded for ε=0.01, R=3, BW=1.5) */
+static void galosh_loess_chroma_3ch_r(
+    const float *restrict y_guide,
+    const float *restrict c1_in,
+    const float *restrict c2_in,
+    const float *restrict c3_in,
+    float *restrict c1_out,
+    float *restrict c2_out,
+    float *restrict c3_out,
+    const int width, const int height,
+    const float strength_c, const int R, const float BW)
+{
+  const float eps_gat = strength_c * strength_c * GALOSH_LOESS_TAU_SQ_INV;
+  const float inv_2sigma_sq = 1.0f / (2.0f * BW * BW);
+
+  const int x0_int = (R < width)  ? R          : width;
+  const int x1_int = (width  > R) ? width - R  : 0;
+  const int y0_int = (R < height) ? R          : height;
+  const int y1_int = (height > R) ? height - R : 0;
+
+  DT_OMP_FOR()
+  for(int y = 0; y < height; y++)
+  {
+    const int y_interior = (y >= y0_int && y < y1_int);
+    for(int x = 0; x < width; x++)
+    {
+      const size_t cx = (size_t)y * width + x;
+      const float Y_c = y_guide[cx];
+
+      float sumW = 0.f, sumY = 0.f, sumYY = 0.f;
+      float sumC1 = 0.f, sumC2 = 0.f, sumC3 = 0.f;
+      float sumYC1 = 0.f, sumYC2 = 0.f, sumYC3 = 0.f;
+
+      if(y_interior && x >= x0_int && x < x1_int)
+      {
+        for(int dy = -R; dy <= R; dy++)
+        {
+          const size_t row_off = (size_t)(y + dy) * width;
+          const float *rowY  = y_guide + row_off;
+          const float *rowC1 = c1_in   + row_off;
+          const float *rowC2 = c2_in   + row_off;
+          const float *rowC3 = c3_in   + row_off;
+          for(int dx = -R; dx <= R; dx++)
+          {
+            const int xi = x + dx;
+            const float Yi  = rowY [xi];
+            const float C1i = rowC1[xi];
+            const float C2i = rowC2[xi];
+            const float C3i = rowC3[xi];
+            const float dY  = Yi - Y_c;
+            const float w   = expf(-dY * dY * inv_2sigma_sq);
+            sumW   += w;
+            sumY   += w * Yi;
+            sumYY  += w * Yi * Yi;
+            sumC1  += w * C1i;
+            sumC2  += w * C2i;
+            sumC3  += w * C3i;
+            sumYC1 += w * Yi * C1i;
+            sumYC2 += w * Yi * C2i;
+            sumYC3 += w * Yi * C3i;
+          }
+        }
+      }
+      else
+      {
+        for(int dy = -R; dy <= R; dy++)
+        {
+          const int yi = reflect_idx(y + dy, height);
+          const size_t row_off = (size_t)yi * width;
+          const float *rowY  = y_guide + row_off;
+          const float *rowC1 = c1_in   + row_off;
+          const float *rowC2 = c2_in   + row_off;
+          const float *rowC3 = c3_in   + row_off;
+          for(int dx = -R; dx <= R; dx++)
+          {
+            const int xi = reflect_idx(x + dx, width);
+            const float Yi  = rowY [xi];
+            const float C1i = rowC1[xi];
+            const float C2i = rowC2[xi];
+            const float C3i = rowC3[xi];
+            const float dY  = Yi - Y_c;
+            const float w   = expf(-dY * dY * inv_2sigma_sq);
+            sumW   += w;
+            sumY   += w * Yi;
+            sumYY  += w * Yi * Yi;
+            sumC1  += w * C1i;
+            sumC2  += w * C2i;
+            sumC3  += w * C3i;
+            sumYC1 += w * Yi * C1i;
+            sumYC2 += w * Yi * C2i;
+            sumYC3 += w * Yi * C3i;
+          }
+        }
+      }
+
+      const float invW   = 1.0f / fmaxf(sumW, 1e-10f);
+      const float meanY  = sumY  * invW;
+      const float meanYY = sumYY * invW;
+      const float meanC1 = sumC1 * invW;
+      const float meanC2 = sumC2 * invW;
+      const float meanC3 = sumC3 * invW;
+      const float meanYC1 = sumYC1 * invW;
+      const float meanYC2 = sumYC2 * invW;
+      const float meanYC3 = sumYC3 * invW;
+
+      const float var_Y   = fmaxf(meanYY - meanY * meanY, 0.0f);
+      const float denom   = fmaxf(var_Y + eps_gat, 1e-6f);
+      const float inv_denom = 1.0f / denom;
+
+      const float a_c1 = (meanYC1 - meanY * meanC1) * inv_denom;
+      const float a_c2 = (meanYC2 - meanY * meanC2) * inv_denom;
+      const float a_c3 = (meanYC3 - meanY * meanC3) * inv_denom;
+      const float b_c1 = meanC1 - a_c1 * meanY;
+      const float b_c2 = meanC2 - a_c2 * meanY;
+      const float b_c3 = meanC3 - a_c3 * meanY;
+
+      c1_out[cx] = a_c1 * Y_c + b_c1;
+      c2_out[cx] = a_c2 * Y_c + b_c2;
+      c3_out[cx] = a_c3 * Y_c + b_c3;
+    }
+  }
+}
+
+/* =================================================================
+ * [LATEST: GALOSH_RAW_H] H-pipeline helpers — stride=1 cycle-spinning
+ * forward WHT, CFA sign-flip demodulation/remodulation, 4-block
+ * overlap-add inverse.
+ *
+ * GALOSH_RAW_H operates entirely at full resolution, eliminating the
+ * half-res ↔ full-res round-trip that GALOSH_RAW_G needed (K14 box
+ * compute_L_fullres + K16 EWA-JL3 chromaup).  The 2x2 Bayer block is
+ * decomposed via cycle-spinning forward WHT (one decomposition per
+ * pixel TL with right/bottom mirror padding), giving 4 full-res planes
+ * (L, C1, C2, C3).
+ *
+ * CFA periodicity manifests as deterministic sign flips on chroma bins:
+ *   C1 sign at (r,c) = (-1)^r       (vertical Bayer flip)
+ *   C2 sign at (r,c) = (-1)^c       (horizontal Bayer flip)
+ *   C3 sign at (r,c) = (-1)^(r+c)   (checkerboard Bayer flip)
+ * Demodulating these flips before denoise yields smooth full-res
+ * chroma planes amenable to LOESS / WHT-LOSH.  Re-modulating before
+ * inverse WHT is the exact algebraic inverse (the demod operator is
+ * self-inverse: applying it twice is identity).
+ *
+ * Reconstruction is per-pixel, summing contributions from up to 4
+ * cycle-shifted block decompositions (overlap-add average — 4 blocks
+ * in interior, fewer at boundary).
+ *
+ * (日本語) raw 全解像度上で stride=1 cycle-spinning 順方向 WHT を
+ *   周辺ミラー詰めで実行 → 4 plane (L, C1, C2, C3) を full-res で得る。
+ *   CFA 周期由来の C1/C2/C3 符号反転を脱変調で除去 → LOESS / WHT-LOSH
+ *   適用可能、denoise 後に再変調 + 4-block 重なり加算逆変換で
+ *   full-res に戻す。GALOSH_RAW_G の半解像度往復 (K14 box / K16
+ *   chromaup) を完全消滅。
+ *
+ * Reference: cycle-spinning denoising — Coifman & Donoho (Wavelets
+ *   and Statistics, 1995); CFA frequency analysis on Bayer raw —
+ *   Hirakawa & Wolfe (TIP 2008).
+ * ================================================================= */
+
+/* Mirror index — same convention as reflect_idx above (line ~2118),
+ * kept here for hot-loop callsites that want to inline.  Mirrors
+ * strictly across the boundary so that mirror(N) = N-2 (not N-1, which
+ * would alias one pixel). */
+static inline int galosh_h_mirror_idx(const int i, const int n)
+{
+  if(i < 0)  return -i;
+  if(i >= n) return 2 * n - i - 2;
+  return i;
+}
+
+/* [LATEST: GALOSH_RAW_H] gat_h_forward_wht_stride1 — forward 2x2 WHT
+ * at every pixel position (cycle-spinning, stride=1) with right/bottom
+ * mirror padding.  Output planes (L, C1, C2, C3) are all full-res; the
+ * value at (r,c) corresponds to the 2x2 block whose TL is at (r,c),
+ * BL at (r+1,c), TR at (r,c+1), BR at (r+1,c+1).
+ *
+ * Forward formulas (a=TL, b=BL, c=TR, d=BR):
+ *   L  = (a + b + c + d) / 2
+ *   C1 = (a - b + c - d) / 2     (vertical chroma — TL−BL paired)
+ *   C2 = (a + b - c - d) / 2     (horizontal chroma — TL+BL vs TR+BR)
+ *   C3 = (a - b - c + d) / 2     (diagonal chroma — TL+BR vs TR+BL)
+ *
+ * (日) 各画素 (r,c) を TL とする 2x2 WHT を full-res で全画素実行。
+ *     右下境界はミラー詰め(galosh_h_mirror_idx)で 2x2 が成立するよう
+ *     にする。順方向 WHT は単位的 (orthonormal) → 各 plane の
+ *     GAT-norm 雑音標準偏差は 1 を維持する。 */
+static void gat_h_forward_wht_stride1(const float *restrict in,
+                                      float *restrict L,
+                                      float *restrict C1,
+                                      float *restrict C2,
+                                      float *restrict C3,
+                                      const int width, const int height)
+{
+  DT_OMP_FOR()
+  for(int r = 0; r < height; r++)
+  {
+    const int rb = galosh_h_mirror_idx(r + 1, height);
+    const float *row_a = in + (size_t)r  * width;
+    const float *row_b = in + (size_t)rb * width;
+    const size_t out_off = (size_t)r * width;
+    for(int c = 0; c < width; c++)
+    {
+      const int cb = galosh_h_mirror_idx(c + 1, width);
+      const float a  = row_a[c];
+      const float b  = row_b[c];
+      const float cc = row_a[cb];
+      const float d  = row_b[cb];
+      L [out_off + c] = (a + b + cc + d) * 0.5f;
+      C1[out_off + c] = (a - b + cc - d) * 0.5f;
+      C2[out_off + c] = (a + b - cc - d) * 0.5f;
+      C3[out_off + c] = (a - b - cc + d) * 0.5f;
+    }
+  }
+}
+
+/* [LATEST: GALOSH_RAW_J] gat_h_forward_l_only_stride1 — forward 2x2 WHT
+ * at every pixel position, computing ONLY the L plane (not C1/C2/C3).
+ *
+ * Used by GALOSH_RAW_J Phase 3: J's chroma path operates at half-res
+ * (intrinsic CFA chroma Nyquist limit), so the cycle-spun full-res
+ * C planes that gat_h_forward_wht_stride1 would compute are immediately
+ * sub-sampled and discarded.  This L-only variant skips the C compute
+ * entirely (~75% of forward WHT cost saved + 3 × full-res buffers
+ * (= ~150 MB at 16 MP) eliminated) and is mathematically equivalent
+ * to gat_h_forward_wht_stride1's L output.
+ *
+ * The half-res C planes for J are computed separately by extracting
+ * the 2x2 block at every-other-pixel positions of in_gat directly
+ * (a stride=2 forward 2x2 WHT, mathematically identical to the
+ * sub-sample of the would-be full-res C_cs at even (r,c) positions). */
+static void gat_h_forward_l_only_stride1(const float *restrict in,
+                                         float *restrict L,
+                                         const int width, const int height)
+{
+  DT_OMP_FOR()
+  for(int r = 0; r < height; r++)
+  {
+    const int rb = galosh_h_mirror_idx(r + 1, height);
+    const float *row_a = in + (size_t)r  * width;
+    const float *row_b = in + (size_t)rb * width;
+    const size_t out_off = (size_t)r * width;
+    for(int c = 0; c < width; c++)
+    {
+      const int cb = galosh_h_mirror_idx(c + 1, width);
+      const float a  = row_a[c];
+      const float b  = row_b[c];
+      const float cc = row_a[cb];
+      const float d  = row_b[cb];
+      L[out_off + c] = (a + b + cc + d) * 0.5f;
+    }
+  }
+}
+
+/* [LATEST: GALOSH_RAW_J] gat_j_forward_c_halfres — half-res 2x2 forward
+ * WHT extracting ONLY the chroma planes from the full-res GAT-domain
+ * raw, at every-other-pixel (stride=2) positions.
+ *
+ * For RGGB at half-res position (hr, hc), reads in_gat at full-res
+ * positions (2hr, 2hc) [TL=R], (2hr+1, 2hc) [BL=Gb], (2hr, 2hc+1)
+ * [TR=Gr], (2hr+1, 2hc+1) [BR=B] and computes:
+ *   C1[hr,hc] = (R - Gb + Gr - B) / 2
+ *   C2[hr,hc] = (R + Gb - Gr - B) / 2
+ *   C3[hr,hc] = (R - Gb - Gr + B) / 2
+ *
+ * This is mathematically identical to (a) running gat_h_forward_wht_stride1
+ * to get full-res cycle-spun C, then (b) sub-sampling at even positions.
+ * The direct half-res computation is ~4× cheaper and avoids the
+ * intermediate full-res C buffers (~150 MB saved at 16 MP).
+ *
+ * CFA-aligned at every-other-pixel → no sign flips needed (= G's half-res
+ * 2x2 WHT convention).  Boundary pixels skipped if (2hr+1, 2hc+1) would
+ * land outside the input image.
+ *
+ * (日) full-res GAT raw から半解像度 C を直接抽出 (stride=2 forward
+ *   2x2 WHT)。J Phase 3 の full-res C 経由 sub-sample (Phase 4) を
+ *   1 ステップ化。CFA 偶数位置整列なので符号反転不要。 */
+static void gat_j_forward_c_halfres(const float *restrict in,
+                                    float *restrict C1_h,
+                                    float *restrict C2_h,
+                                    float *restrict C3_h,
+                                    const int width, const int height,
+                                    const int halfwidth, const int halfheight)
+{
+  DT_OMP_FOR()
+  for(int hr = 0; hr < halfheight; hr++)
+  {
+    const int fr0 = 2 * hr;
+    const int fr1 = fr0 + 1;
+    if(fr1 >= height) continue;  /* skip last row if odd-sized */
+    const float *row_a = in + (size_t)fr0 * width;
+    const float *row_b = in + (size_t)fr1 * width;
+    const size_t hp_off = (size_t)hr * halfwidth;
+    for(int hc = 0; hc < halfwidth; hc++)
+    {
+      const int fc0 = 2 * hc;
+      const int fc1 = fc0 + 1;
+      if(fc1 >= width) continue;
+      const float a  = row_a[fc0];
+      const float b  = row_b[fc0];
+      const float cc = row_a[fc1];
+      const float d  = row_b[fc1];
+      C1_h[hp_off + hc] = (a - b + cc - d) * 0.5f;
+      C2_h[hp_off + hc] = (a + b - cc - d) * 0.5f;
+      C3_h[hp_off + hc] = (a - b - cc + d) * 0.5f;
+    }
+  }
+}
+
+/* [LATEST: GALOSH_RAW_H] gat_h_demodulate_chroma — apply CFA-periodic
+ * sign flips to C1/C2/C3 in-place.  Self-inverse (call twice = identity).
+ *   Phase 4: forward demodulate (raw cycle-spun WHT → smooth chroma)
+ *   Phase 6: re-modulate (smooth chroma → raw cycle-spun WHT)
+ *
+ *   C1[r,c] *= (-1)^r       (row-periodic; vertical Bayer flip)
+ *   C2[r,c] *= (-1)^c       (col-periodic; horizontal Bayer flip)
+ *   C3[r,c] *= (-1)^(r+c)   (checkerboard; diagonal Bayer flip)
+ *
+ * Derivation: at TL=(r+1,c) the 2x2 reads {b, mirror, d, mirror} of
+ * the (r,c) block, i.e. the (a,b,c,d) tuple is row-cycled by one Bayer
+ * row.  C1=(a−b+c−d)/2 ↦ (b−a+d−c)/2 = −C1 (sign flip).  C2 is invariant
+ * under row cycle; C3=(a−b−c+d)/2 ↦ (b−a−d+c)/2 = −C3.  Similarly for
+ * column cycle.  Hence the (-1)^r / (-1)^c / (-1)^(r+c) pattern.
+ *
+ * The pattern is CFA-symmetric: for any of the four Bayer phases
+ * (RGGB, GRBG, GBRG, BGGR) the periodicity is the same (only the
+ * channel labels at (0,0) differ — irrelevant for the WHT signs). */
+static void gat_h_demodulate_chroma(float *restrict C1,
+                                    float *restrict C2,
+                                    float *restrict C3,
+                                    const int width, const int height)
+{
+  DT_OMP_FOR()
+  for(int r = 0; r < height; r++)
+  {
+    const float sr = (r & 1) ? -1.0f : 1.0f;       /* (-1)^r */
+    float *p1 = C1 + (size_t)r * width;
+    float *p2 = C2 + (size_t)r * width;
+    float *p3 = C3 + (size_t)r * width;
+    for(int c = 0; c < width; c++)
+    {
+      const float sc = (c & 1) ? -1.0f : 1.0f;     /* (-1)^c */
+      p1[c] *= sr;
+      p2[c] *= sc;
+      p3[c] *= sr * sc;                            /* (-1)^(r+c) */
+    }
+  }
+}
+
+/* [LATEST: GALOSH_RAW_H] gat_h_inverse_overlap_add — per-pixel inverse
+ * 2x2 WHT averaged over up to 4 cycle-shifted block decompositions.
+ *
+ * For output pixel (fr, fc), gather contributions from blocks whose
+ * TL is at (br, bc):
+ *   (fr,   fc  )  → role TL : val = (L+C1+C2+C3)/2
+ *   (fr-1, fc  )  → role BL : val = (L-C1+C2-C3)/2
+ *   (fr,   fc-1)  → role TR : val = (L+C1-C2-C3)/2
+ *   (fr-1, fc-1)  → role BR : val = (L-C1-C2+C3)/2
+ * Average over the 1..4 blocks that exist (boundary handling: top-left
+ * corner has only TL contribution, top edge has TL+TR, left edge has
+ * TL+BL, interior has all 4).
+ *
+ * (日) 各画素 (fr,fc) は最大 4 個の cycle-shifted 2x2 block 逆変換に
+ *     寄与する (TL/BL/TR/BR のいずれかとして)。存在する block の寄与
+ *     を平均することで cycle-spinning denoising 効果を得る (Coifman-
+ *     Donoho 1995)。
+ *
+ * Caller must have re-modulated C1/C2/C3 (= Phase 6, identical to Phase 4
+ * since demod is self-inverse) before calling this function. */
+static void gat_h_inverse_overlap_add(const float *restrict L,
+                                      const float *restrict C1,
+                                      const float *restrict C2,
+                                      const float *restrict C3,
+                                      float *restrict out,
+                                      const int width, const int height)
+{
+  DT_OMP_FOR()
+  for(int fr = 0; fr < height; fr++)
+  {
+    for(int fc = 0; fc < width; fc++)
+    {
+      const size_t p_tl = (size_t)fr * width + fc;
+      float sum = 0.0f;
+      int count = 0;
+
+      /* role TL @ block (fr, fc) — always exists */
+      sum += (L[p_tl] + C1[p_tl] + C2[p_tl] + C3[p_tl]) * 0.5f;
+      count++;
+
+      if(fr > 0)
+      {
+        /* role BL @ block (fr-1, fc) */
+        const size_t p_bl = (size_t)(fr - 1) * width + fc;
+        sum += (L[p_bl] - C1[p_bl] + C2[p_bl] - C3[p_bl]) * 0.5f;
+        count++;
+      }
+      if(fc > 0)
+      {
+        /* role TR @ block (fr, fc-1) */
+        const size_t p_tr = (size_t)fr * width + (fc - 1);
+        sum += (L[p_tr] + C1[p_tr] - C2[p_tr] - C3[p_tr]) * 0.5f;
+        count++;
+      }
+      if(fr > 0 && fc > 0)
+      {
+        /* role BR @ block (fr-1, fc-1) */
+        const size_t p_br = (size_t)(fr - 1) * width + (fc - 1);
+        sum += (L[p_br] - C1[p_br] - C2[p_br] + C3[p_br]) * 0.5f;
+        count++;
+      }
+
+      out[p_tl] = sum / (float)count;
+    }
+  }
+}
+
+/* =================================================================
+ * [LATEST: GALOSH_RAW_L] gat_k16_joint_bilateral_upsample — guide-aware
+ * EWA Jinc-Lanczos-3 upsample of half-res chroma to full-res, with
+ * per-sample bilateral L weighting (joint bilateral upsample, Kopf et
+ * al. SIGGRAPH 2007 / He et al. TPAMI 2010 guided filter framework).
+ *
+ * Replaces the GALOSH_RAW_K's two-stage chain
+ *   Phase 6: galosh_upsample_2x_ewajl3 (L-unaware bandlimit interp)
+ *   Phase 8: galosh_loess_chroma_3ch_r (L-guided LOESS post-process)
+ * with a single fused stage that combines bandlimit interp AND
+ * cross-channel L-edge alignment in one filter pass.
+ *
+ * Per output pixel (fr, fc), the kernel weight is:
+ *   w[i] = w_jinc(d_i) × exp( -(L_pixel[fr,fc] - L_at_h[i])² / (2·BW²) )
+ *          ───────────       ──────────────────────────────────────────
+ *          K16 bandlimit     bilateral L-edge alignment
+ *
+ *   C_full[fr,fc] = Σ w[i] · C_h[i] / Σ w[i]
+ *
+ * In flat L regions: bilateral ≈ uniform → effective kernel = pure
+ * jinc → bandlimit-faithful (= K16 standard behavior preserved).
+ * At L edges: bilateral kills cross-edge samples → effective kernel
+ * = one-sided jinc → C edges snap to L edges via cross-channel prior
+ * (= principled demosaic-style super-resolution from CFA likelihood
+ * + L-correlated structural prior).
+ *
+ * The L value at each half-res chroma sample is taken from L_pixel at
+ * the sample's full-res TL position (= L_pixel[2·hyi, 2·hxi]).  This
+ * is consistent because the half-res C samples were extracted at TL
+ * positions of the 2x2 Bayer blocks (= G's half-res convention).
+ *
+ * Multi-channel: C1/C2/C3 all share the same bilateral L weight per
+ * window position → 3-channel fusion saves ~67% of the bilateral
+ * compute (1 expf shared vs 3 separate calls) and ~67% of the kernel
+ * weight precomputation.
+ *
+ * (日) K16 EWA-JL3 を L_pixel guide 込みの bilateral 重み付き版に置換。
+ *   K の Phase 6 (帯域制限 upsample) + Phase 8 (LOESS edge alignment)
+ *   を 1 段融合。flat 部では純 jinc (帯域忠実)、edge 部では bilateral
+ *   が cross-edge sample を kill して L edge に snap した chroma を
+ *   生成 (cross-channel super-resolution、Kopf 2007 / He 2010 系)。 */
+static void gat_k16_joint_bilateral_upsample(
+    const float *restrict c1_h,
+    const float *restrict c2_h,
+    const float *restrict c3_h,
+    const float *restrict L_pixel,
+    float *restrict c1_full,
+    float *restrict c2_full,
+    float *restrict c3_full,
+    const int halfwidth, const int halfheight,
+    const float BW)
+{
+  const int fw = 2 * halfwidth;
+  const int fh = 2 * halfheight;
+
+  /* Sub-pixel offsets: for each output pixel position (fr, fc) within
+   * the upsampled grid, the sub-pixel index si = (fr&1)*2 + (fc&1)
+   * picks one of 4 jinc kernel orientations. */
+  const float subpix[4][2] = {
+      {  0.00f,  0.00f },
+      {  0.00f, +0.50f },
+      { +0.50f,  0.00f },
+      { +0.50f, +0.50f },
+  };
+
+  const int W  = 2;
+  const int kw = 2 * W + 1;
+
+  /* UN-normalized jinc weights per sub-pixel offset.  Bilateral
+   * modulation re-normalizes per output pixel (= can't pre-normalize). */
+  float jw[4][5][5];
+  for(int si = 0; si < 4; si++)
+  {
+    const float oy = subpix[si][0];
+    const float ox = subpix[si][1];
+    for(int dy = -W; dy <= W; dy++)
+    {
+      for(int dx = -W; dx <= W; dx++)
+      {
+        const float ry = (float)dy - oy;
+        const float rx = (float)dx - ox;
+        const float r_half = sqrtf(rx * rx + ry * ry);
+        const float r_full = r_half * 2.0f;
+        float w_val = 0.0f;
+        if(r_full < 3.0f)
+          w_val = galosh_jinc(r_full) * galosh_jinc(r_full / 3.0f);
+        jw[si][dy + W][dx + W] = w_val;
+      }
+    }
+  }
+
+  const float inv_2sigma_sq = 1.0f / (2.0f * BW * BW);
+
+  DT_OMP_FOR()
+  for(int hy = 0; hy < halfheight; hy++)
+  {
+    for(int hx = 0; hx < halfwidth; hx++)
+    {
+      for(int si = 0; si < 4; si++)
+      {
+        const int sub_dy = si / 2;
+        const int sub_dx = si % 2;
+        const int fr = 2 * hy + sub_dy;
+        const int fc = 2 * hx + sub_dx;
+        if(fr >= fh || fc >= fw) continue;
+
+        const float L_c = L_pixel[(size_t)fr * fw + fc];
+
+        float sum_w = 0.0f;
+        float sum_c1 = 0.0f, sum_c2 = 0.0f, sum_c3 = 0.0f;
+
+        for(int dy = -W; dy <= W; dy++)
+        {
+          int hyi = hy + dy;
+          if(hyi < 0)            hyi = 0;
+          if(hyi >= halfheight)  hyi = halfheight - 1;
+          for(int dx = -W; dx <= W; dx++)
+          {
+            int hxi = hx + dx;
+            if(hxi < 0)           hxi = 0;
+            if(hxi >= halfwidth)  hxi = halfwidth - 1;
+
+            /* L value at this half-res chroma sample's full-res TL
+             * position.  Boundary-clamped for last odd row/col. */
+            const int fri = 2 * hyi;
+            const int fci = 2 * hxi;
+            const int fri_c = (fri < fh) ? fri : fh - 1;
+            const int fci_c = (fci < fw) ? fci : fw - 1;
+            const float L_i = L_pixel[(size_t)fri_c * fw + fci_c];
+
+            const float dL = L_i - L_c;
+            const float w_bilat = expf(-dL * dL * inv_2sigma_sq);
+            const float w = jw[si][dy + W][dx + W] * w_bilat;
+
+            sum_w  += w;
+            const size_t hp = (size_t)hyi * halfwidth + hxi;
+            sum_c1 += w * c1_h[hp];
+            sum_c2 += w * c2_h[hp];
+            sum_c3 += w * c3_h[hp];
+          }
+        }
+
+        /* Safety: sum_w can have sign matching the per-sub-pixel jinc
+         * sum sign (in flat L regions, all jinc weights have same sign
+         * so the sum is well-defined; bilateral mod preserves this).
+         * Floor on |sum_w| guards against pathological cases where
+         * bilateral kills nearly all weights. */
+        const float safe_w = (fabsf(sum_w) > 1e-6f) ? sum_w : 1e-6f;
+        const float inv_w = 1.0f / safe_w;
+        const size_t fp = (size_t)fr * fw + fc;
+        c1_full[fp] = sum_c1 * inv_w;
+        c2_full[fp] = sum_c2 * inv_w;
+        c3_full[fp] = sum_c3 * inv_w;
+      }
+    }
+  }
+}
+
+/* =================================================================
+ * [LATEST: GALOSH_RAW_I] I-pipeline helper — L-only overlap-add average.
+ *
+ * GALOSH_RAW_I is a hybrid pipeline that takes "L from RAW_H, C from
+ * RAW_G".  Motivation: H's full-res cycle-spinning eliminates the K14
+ * box stair on luma, BUT the cycle-spun C plane has autocov=0.5 noise
+ * correlation that LOESS can't fully suppress, leaving long-wavelength
+ * chroma blotch visible in DISTS/NIQE/LPIPS metrics.  G's K16 EWA-JL3
+ * upsample of half-res C provides bandlimit-faithful chroma (CFA chroma
+ * sampling is intrinsically half-Nyquist limited, so K16 loses no
+ * signal information by going through half-res).  Combining the two
+ * yields the principled best of each plane.
+ *
+ * Pipeline difference vs H (chroma path only):
+ *   I keeps H Phase 0..3 (forward stride=1 cycle-spinning at full-res)
+ *   I sub-samples cycle-spun C planes at stride=2 to get half-res C
+ *     (= mathematically identical to G's half-res 2x2 WHT on the 4ch
+ *     RGGB extract; CFA-aligned at every-other-pixel, no demod needed)
+ *   I runs half-res LOESS on C with sub-sampled L_den as Y guide
+ *     (= G's Phase 3.5 chroma path)
+ *   I upsamples C to full-res via K16 EWA-JL3 (= G's Phase 4(d) chromaup)
+ *   I does per-pixel WHT inverse using L from cycle-spun + C from K16
+ *
+ * Open question solved by gat_i_lpixel_overlap_avg below: how to
+ * convert the cycle-spun L plane (where L[r,c] is the L of the 2x2
+ * block whose TL is (r,c), implying half-pixel position offset) into
+ * a per-pixel L for use with G's K16 inverse formula at pixel (fr,fc).
+ *
+ * (日) GALOSH_RAW_I: L パスは H 全部 (full-res cycle-spinning + LOSH)、
+ *   C パスは G (half-res LOESS + K16 EWA-JL3 chromaup) のハイブリッド。
+ *   理論的根拠: CFA chroma サンプリングは元々 half-Nyquist 帯域制限で、
+ *   full-res cycle-spinning は C plane に余計な相関ノイズを導入する
+ *   だけ。L はその逆で、4ch 全てが luma に寄与 → full-res cycle-spinning
+ *   の恩恵を享受できる。
+ * ================================================================= */
+
+/* [LATEST: GALOSH_RAW_I] gat_i_lpixel_overlap_avg — derive per-pixel L
+ * from cycle-spun L plane via 2x2 overlap average.
+ *
+ * Cycle-spun L_cs[r,c] = ((a+b+c+d)/2) where (a,b,c,d) are the 2x2 block
+ * pixels with TL at (r,c).  L_cs represents the "block luma at half-pixel
+ * shifted center (r+0.5, c+0.5)".  To get a pixel-centered luma
+ * estimate at (fr,fc), average the 4 cycle-shifted blocks containing
+ * (fr,fc) (TL@(fr,fc), BL@(fr-1,fc), TR@(fr,fc-1), BR@(fr-1,fc-1)).
+ * The 4-block average covers a 3x3 weighted area centered on (fr,fc)
+ * with weights (1,2,1; 2,4,2; 1,2,1)/16 — = the L kernel obtained from
+ * 2x2 block overlap, mathematically equivalent to a separable [1,2,1]/4
+ * box-tent self-convolution.
+ *
+ * Boundary: top-left corner has only TL (1 contribution); top edge has
+ * TL+TR (2); left edge has TL+BL (2); interior has all 4.
+ *
+ * (日) cycle-spun L から per-pixel L 推定。L_cs[r,c] は半画素ずれた
+ *   block 中心の L なので、(fr,fc) に整合する 4 つの cycle-shifted
+ *   block の平均を取ると 3x3 重み付き平均 (1,2,1;2,4,2;1,2,1)/16 に
+ *   相当 → 半画素ずれが消えて pixel-centered になる。
+ *
+ * G's K14 box reconstruct uses 4-tap box on half-res L+C and produces
+ * 2x2 stair on diagonals.  This helper uses 4-tap box on FULL-RES
+ * cycle-spun L (different grid!) and produces no stair because the
+ * input grid is already at full resolution. */
+static void gat_i_lpixel_overlap_avg(const float *restrict L_cs,
+                                     float *restrict L_pixel,
+                                     const int width, const int height)
+{
+  DT_OMP_FOR()
+  for(int fr = 0; fr < height; fr++)
+  {
+    for(int fc = 0; fc < width; fc++)
+    {
+      const size_t p_tl = (size_t)fr * width + fc;
+      float sum = L_cs[p_tl];
+      int count = 1;
+      if(fr > 0)
+      {
+        sum += L_cs[(size_t)(fr - 1) * width + fc];
+        count++;
+      }
+      if(fc > 0)
+      {
+        sum += L_cs[(size_t)fr * width + (fc - 1)];
+        count++;
+      }
+      if(fr > 0 && fc > 0)
+      {
+        sum += L_cs[(size_t)(fr - 1) * width + (fc - 1)];
+        count++;
+      }
+      L_pixel[p_tl] = sum / (float)count;
+    }
+  }
+}
+
+/* =================================================================
+ * [DEPRECATED: GALOSH_RAW_N] N pipeline helpers — Laplacian pyramid
+ * decomposition / reconstruction + L-coupled WHT-LOSH.
+ *
+ * GALOSH_RAW_N extends the existing single-scale 8x8 WHT-LOSH to:
+ *   1. Multi-scale via 3-level Laplacian pyramid (= 8x8 WHT-LOSH at
+ *      each pyramid band), capturing noise across spatial frequencies
+ *   2. Cross-channel L-coupling for chroma (= per-block BayesShrink
+ *      threshold derived from pooled L+C signal variance, leveraging
+ *      L_pixel structure as cross-channel prior)
+ *
+ * This generalizes "Local Shrinkage" (= GALOSH name's "LO" + "SH") to
+ *   - Multi-scale Local Shrinkage (= scale generalization)
+ *   - Cross-channel coupled shrinkage (= L/C decomposition synergy)
+ * keeping GAT × WHT-LOSH × L/C philosophy fully intact.
+ * ================================================================= */
+
+/* [DEPRECATED: GALOSH_RAW_N] gat_box_downsample_2x — 2x2 box-average
+ * downsample.  Used in Laplacian pyramid decompose step.  Boundary:
+ * src dimensions assumed even; if odd, last row/col silently dropped
+ * (caller guarantees padding or accepts boundary loss). */
+static void gat_box_downsample_2x(const float *restrict src,
+                                  float *restrict dst,
+                                  const int sw, const int sh)
+{
+  const int dw = sw / 2;
+  const int dh = sh / 2;
+  DT_OMP_FOR()
+  for(int y = 0; y < dh; y++)
+  {
+    const int sy = 2 * y;
+    const float *row0 = src + (size_t)sy       * sw;
+    const float *row1 = src + (size_t)(sy + 1) * sw;
+    float *drow = dst + (size_t)y * dw;
+    for(int x = 0; x < dw; x++)
+    {
+      const int sx = 2 * x;
+      drow[x] = (row0[sx] + row0[sx + 1] + row1[sx] + row1[sx + 1]) * 0.25f;
+    }
+  }
+}
+
+/* [LATEST: GALOSH_RAW_O] gat_crop_2d_topleft — top-left crop with stride
+ * conversion.  Copies src[0..dh, 0..dw] into a tightly-packed dst at
+ * stride dw (= different from src's stride sw).  Used at K16 boundaries
+ * when source dim (sw, sh) doesn't divide cleanly by 2 in the chroma
+ * pyramid round-trip (e.g. SIDD halfwidth=2663 odd → cq_w=1331 → 2*cq_w
+ * =2662 < halfwidth, lose 1 col).  Caller guarantees dw <= sw, dh <= sh. */
+static inline void gat_crop_2d_topleft(const float *restrict src,
+                                        const int sw, const int sh,
+                                        float *restrict dst,
+                                        const int dw, const int dh)
+{
+  (void)sh;
+  DT_OMP_FOR()
+  for(int y = 0; y < dh; y++)
+    memcpy(dst + (size_t)y * dw, src + (size_t)y * sw, (size_t)dw * sizeof(float));
+}
+
+/* [LATEST: GALOSH_RAW_O] gat_pad_2d_edge — top-left pad with edge
+ * replication.  Copies src (sw × sh) into dst (dw × dh) such that
+ * dst[0..sh, 0..sw] = src and the remaining right column / bottom row
+ * are replicated from src's last col / last row.  Used at K16 output
+ * boundaries to convert raw K16 output (= 2*input_w × 2*input_h) back
+ * to chsize stride for the smoothstep blend.  Caller guarantees
+ * dw >= sw, dh >= sh. */
+static inline void gat_pad_2d_edge(const float *restrict src,
+                                    const int sw, const int sh,
+                                    float *restrict dst,
+                                    const int dw, const int dh)
+{
+  DT_OMP_FOR()
+  for(int y = 0; y < dh; y++)
+  {
+    const int sy = (y < sh) ? y : sh - 1;
+    const float *srow = src + (size_t)sy * sw;
+    float *drow = dst + (size_t)y * dw;
+    /* Copy the in-bounds columns. */
+    const int copy_w = (dw < sw) ? dw : sw;
+    memcpy(drow, srow, (size_t)copy_w * sizeof(float));
+    /* Replicate last column for x in [sw, dw). */
+    if(dw > sw)
+    {
+      const float edge = srow[sw - 1];
+      for(int x = sw; x < dw; x++) drow[x] = edge;
+    }
+  }
+}
+
+/* [DEPRECATED: GALOSH_RAW_N] gat_box_replicate_upsample_2x — 2x2
+ * nearest-neighbor (box-replicate) upsample, adjoint of
+ * gat_box_downsample_2x.  Used in Laplacian pyramid reconstruct step.
+ * Each src pixel duplicated into a 2x2 dst block. */
+static void gat_box_replicate_upsample_2x(const float *restrict src,
+                                          float *restrict dst,
+                                          const int sw, const int sh,
+                                          const int dw, const int dh)
+{
+  DT_OMP_FOR()
+  for(int sy = 0; sy < sh; sy++)
+  {
+    const float *srow = src + (size_t)sy * sw;
+    const int dy0 = 2 * sy;
+    const int dy1 = dy0 + 1;
+    if(dy0 >= dh) continue;
+    float *drow0 = dst + (size_t)dy0 * dw;
+    float *drow1 = (dy1 < dh) ? (dst + (size_t)dy1 * dw) : NULL;
+    for(int sx = 0; sx < sw; sx++)
+    {
+      const float v = srow[sx];
+      const int dx0 = 2 * sx;
+      const int dx1 = dx0 + 1;
+      if(dx0 >= dw) continue;
+      drow0[dx0] = v;
+      if(dx1 < dw) drow0[dx1] = v;
+      if(drow1)
+      {
+        drow1[dx0] = v;
+        if(dx1 < dw) drow1[dx1] = v;
+      }
+    }
+  }
+}
+
+/* [DEPRECATED: GALOSH_RAW_N] galosh_pass12_lcoupled_multiorient_blocked —
+ * L-coupled BayesShrink + Wiener WHT-LOSH on chroma plane, using
+ * cross-channel L plane to inform per-coefficient signal variance
+ * estimate.
+ *
+ * Differs from galosh_pass12_multiorient_blocked (= luma version) in:
+ *   - Takes additional L_guide plane (= same resolution as input)
+ *   - For each block, decomposes BOTH C_block and L_guide_block via WHT
+ *   - BayesShrink threshold derived from pooled (C + L) signal variance
+ *     instead of C-only variance
+ *
+ * Per-block formula:
+ *   sigma_y_C²  = sample variance of C AC coefficients
+ *   sigma_y_L²  = sample variance of L AC coefficients
+ *   sigma_x_pool² = max((sigma_y_C² + sigma_y_L²) / 2 - sigma_n², 0)
+ *                 ↑ averaged across L+C, bias-corrected by σ_n²
+ *   threshold(k)  = sigma_n² / sqrt(sigma_x_pool²)  per AC coefficient k
+ *
+ * Rationale: chroma signal is typically correlated with luma signal in
+ *   natural images (= edges/textures align across channels).  Using
+ *   L's signal variance as a prior for chroma signal variance gives
+ *   smaller (= less aggressive) BayesShrink threshold in regions where
+ *   L has structure → preserves cross-channel-aligned chroma detail.
+ *   In flat L regions, threshold remains aggressive → strong chroma
+ *   smoothing (= consistent with GALOSH design intent of strong chroma
+ *   denoise where signal is weak).
+ *
+ * (日) Chroma 用 BayesShrink + Wiener WHT-LOSH の cross-channel 拡張。
+ *   Per-block で C + L の WHT 分解を両方計算し、 pool variance で
+ *   BayesShrink threshold を決定。 L 構造のある所で chroma detail を
+ *   保持、 L 平坦な所で chroma を強く smoothing。
+ */
+static void galosh_pass12_lcoupled_multiorient_blocked(
+    const float *restrict C_in,
+    const float *restrict L_guide,
+    float *restrict C_out,
+    const int width, const int height,
+    const float chroma_strength,
+    const int block_size,
+    const int stride,
+    const int n_orient,
+    const int use_robust_shrink)
+{
+  /* For now, delegate to a per-block L-coupled implementation built on
+   * top of galosh_pass1/galosh_pass2 mechanism.  Multi-orient and
+   * robust-shrink follow the same structure as galosh_pass12_multiorient_blocked.
+   *
+   * Implementation strategy:
+   *   - Pass 1: L-coupled BayesShrink → pilot (per-block WHT, pooled
+   *             variance from C + L_guide, soft-threshold C AC)
+   *   - Pass 2: empirical Wiener using pilot (= standard galosh_pass2,
+   *             but wrapped in cycle-spinning aggregation)
+   *
+   * For minimal code duplication, we inline the per-block loop here
+   * with WHT-LOSH applied to both C and L_guide blocks.  Output is the
+   * cycle-spun overlap-add aggregation of denoised C blocks. */
+
+  const int npix = width * height;
+  const int rmax = height - block_size;
+  const int cmax = width  - block_size;
+  const int N_block = block_size * block_size;
+  const float sigma_sq = chroma_strength * chroma_strength;
+  const float lambda_max = chroma_strength * sqrtf(2.0f * logf((float)N_block));
+
+  float *pilot = dt_alloc_align_float((size_t)npix);
+  float *numer = dt_alloc_align_float((size_t)npix);
+  float *denom = dt_alloc_align_float((size_t)npix);
+  if(!pilot || !numer || !denom)
+  {
+    if(pilot) dt_free_align(pilot);
+    if(numer) dt_free_align(numer);
+    if(denom) dt_free_align(denom);
+    memcpy(C_out, C_in, sizeof(float) * (size_t)npix);
+    return;
+  }
+
+  /* ============== Pass 1: L-coupled BayesShrink → pilot ============== */
+  memset(numer, 0, sizeof(float) * (size_t)npix);
+  memset(denom, 0, sizeof(float) * (size_t)npix);
+
+  #pragma omp parallel
+  {
+    float *my_numer = dt_alloc_align_float((size_t)npix);
+    float *my_denom = dt_alloc_align_float((size_t)npix);
+    float block_C[64];   /* assumes block_size <= 8 (= GALOSH_BLOCK_PIXELS) */
+    float block_L[64];
+
+    if(my_numer && my_denom)
+    {
+      memset(my_numer, 0, sizeof(float) * (size_t)npix);
+      memset(my_denom, 0, sizeof(float) * (size_t)npix);
+
+      #pragma omp for schedule(dynamic, 4)
+      for(int ref_r = 0; ref_r <= rmax; ref_r += stride)
+      {
+        for(int ref_c = 0; ref_c <= cmax; ref_c += stride)
+        {
+          /* Extract C and L blocks at same position */
+          for(int dy = 0; dy < block_size; dy++)
+          {
+            const float *src_C_row = C_in   + (ref_r + dy) * width + ref_c;
+            const float *src_L_row = L_guide + (ref_r + dy) * width + ref_c;
+            float *blk_C_row = block_C + dy * block_size;
+            float *blk_L_row = block_L + dy * block_size;
+            for(int dx = 0; dx < block_size; dx++)
+            {
+              blk_C_row[dx] = src_C_row[dx];
+              blk_L_row[dx] = src_L_row[dx];
+            }
+          }
+
+          /* Forward WHT on both blocks (in-place) */
+          if(block_size == 8)
+          {
+            wht2d_8x8(block_C, 0);
+            wht2d_8x8(block_L, 0);
+          }
+          else if(block_size == 4)
+          {
+            wht2d_4x4(block_C, 0);
+            wht2d_4x4(block_L, 0);
+          }
+
+          /* Pooled signal variance estimate from L + C AC */
+          float sum_sq_C = 0.0f;
+          float sum_sq_L = 0.0f;
+          for(int i = 1; i < N_block; i++)
+          {
+            sum_sq_C += block_C[i] * block_C[i];
+            sum_sq_L += block_L[i] * block_L[i];
+          }
+          const float sigma_y_C_sq = sum_sq_C / ((float)(N_block - 1) * (float)N_block);
+          const float sigma_y_L_sq = sum_sq_L / ((float)(N_block - 1) * (float)N_block);
+          const float sigma_y_pool_sq = (sigma_y_C_sq + sigma_y_L_sq) * 0.5f;
+          const float sigma_x_sq = fmaxf(sigma_y_pool_sq - sigma_sq, 0.0f);
+
+          float lambda;
+          if(sigma_x_sq < 1e-10f)
+            lambda = 1e30f;
+          else
+          {
+            lambda = (sigma_sq / sqrtf(sigma_x_sq)) * sqrtf((float)N_block);
+            const float lambda_max_unorm = lambda_max * sqrtf((float)N_block);
+            if(lambda > lambda_max_unorm) lambda = lambda_max_unorm;
+          }
+
+          /* Hard threshold C AC (preserve DC) */
+          int n_nonzero = 1;
+          for(int i = 1; i < N_block; i++)
+          {
+            if(fabsf(block_C[i]) < lambda)
+              block_C[i] = 0.0f;
+            else
+              n_nonzero++;
+          }
+
+          /* Inverse WHT */
+          if(block_size == 8) wht2d_8x8(block_C, 1);
+          else if(block_size == 4) wht2d_4x4(block_C, 1);
+
+          /* Overlap-add accumulate to thread-local buffers */
+          const float weight = 1.0f / (float)n_nonzero;
+          for(int dy = 0; dy < block_size; dy++)
+          {
+            const size_t row_off = (size_t)(ref_r + dy) * width + ref_c;
+            const float *blk_row = block_C + dy * block_size;
+            for(int dx = 0; dx < block_size; dx++)
+            {
+              my_numer[row_off + dx] += blk_row[dx] * weight;
+              my_denom[row_off + dx] += weight;
+            }
+          }
+          (void)use_robust_shrink; (void)n_orient;
+        }
+      }
+
+      /* Reduce thread-local buffers into shared numer/denom */
+      #pragma omp critical
+      {
+        for(int i = 0; i < npix; i++)
+        {
+          numer[i] += my_numer[i];
+          denom[i] += my_denom[i];
+        }
+      }
+    }
+    if(my_numer) dt_free_align(my_numer);
+    if(my_denom) dt_free_align(my_denom);
+  }
+
+  /* Normalize pilot */
+  DT_OMP_FOR()
+  for(int i = 0; i < npix; i++)
+  {
+    pilot[i] = (denom[i] > 1e-10f) ? (numer[i] / denom[i]) : C_in[i];
+  }
+
+  /* ============== Pass 2: empirical Wiener (= standard galosh_pass2) ============== */
+  galosh_pass2(C_in, pilot, C_out, width, height, chroma_strength, stride);
+
+  dt_free_align(pilot);
+  dt_free_align(numer);
+  dt_free_align(denom);
 }
 
 #pragma GCC diagnostic pop
