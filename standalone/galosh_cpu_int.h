@@ -950,11 +950,30 @@ static inline void fxp_gat_precompute(fxp_gat_params *p,
    * fxp_recip(α) を経由しない: Q11.20 では α<4.88e-4 で 1/α が範囲外、
    * fxp_recip が saturate して σ²/α=0 になる SIDD s04 系の破綻バグの修正。
    * 結果値 σ²/α, 2σ/α 自体は Q11.20 範囲に収まるので直接除算で計算。 */
-  p->sigma_sq_over_alpha = fxp_div_q20(sigma_sq, alpha);
+  /* σ²/α from the ORIGINAL σ² (p->sigma_sq), NOT the sqrt-floored sigma_sq=1.
+   * On super-clean super-dark scenes Phase 0 returns σ²≈0 (true ~6e-8 < Q11.20
+   * 1 ulp → stored 0).  The `sigma_sq<=0 ? 1` floor (needed only for sigma_raw's
+   * sqrt) would otherwise make σ²/α = 1ulp/α ≈ 0.24 for tiny α — a huge spurious
+   * DC that compresses the GAT signal range (T≈505±8 instead of 56..134) so
+   * Phase-5 shrink + Phase-10 inverse collapse the output to 0 → magenta render.
+   * FP32 keeps σ²/α≈0.009 here and is fine.  Using the un-floored σ² gives
+   * σ²/α≈0, matching FP32 and preventing the collapse (RawNIND low-ISO 26 scenes).
+   * 超clean(σ²≈0)で floor 値 1ulp を使うと tiny-α で σ²/α 巨大化→GAT 信号圧縮→
+   * 出力ゼロ崩壊。floor 前の σ² で計算し σ²/α≈0 とする。 */
+  p->sigma_sq_over_alpha = fxp_div_q20(p->sigma_sq > 0 ? p->sigma_sq : 0, alpha);
   /* y_break = -3α/8 (= -p->three_alpha_8). */
   p->y_break = -p->three_alpha_8;
-  /* t_break = 2σ / α. */
-  p->t_break = fxp_div_q20(p->sigma_raw + p->sigma_raw, alpha);
+  /* t_break = 2σ / α from the ORIGINAL σ (not the sqrt-floored sigma_raw).
+   * t_break is the inverse-GAT branch boundary (= the D value at x=y_break); it
+   * must match the σ²/α used in the forward.  With the floored sigma_raw it
+   * inflates (e.g. 487) so super-clean sqrt-branch outputs D∈[0, t_break] get
+   * routed to the LINEAR inverse → x = y_break + σ(D−t_break) ≪ 0 → clamp 0 →
+   * zero collapse (same tiny-α / σ²≈0 root as sigma_sq_over_alpha above).
+   * inv_sigma_raw (linear-branch slope) keeps the floored sigma_raw (needs >0).
+   * t_break も floored σ を使うと膨張し super-clean で逆 GAT が linear 誤分岐→
+   * ゼロ崩壊。元 σ から算出して σ²/α と整合させる。 */
+  fxp32 sigma_raw_true = fxp_sqrt(p->sigma_sq > 0 ? p->sigma_sq : 0);
+  p->t_break = fxp_div_q20(sigma_raw_true + sigma_raw_true, alpha);
   p->inv_sigma_raw = fxp_recip(p->sigma_raw);
 }
 
