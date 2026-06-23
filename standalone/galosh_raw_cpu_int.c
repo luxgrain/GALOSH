@@ -1120,9 +1120,71 @@ static void fxp_estimate_noise(const fxp32 *in_q20,
     return;
   }
 
+  /* Solve the centered WLS on all valid bins first. */
   fxp32 alpha_est, sigma_sq_est;
   phase0c_wls_solve(bin_mean_arr, bin_var_arr, bin_cnt_arr, bin_valid,
                     NE_NBINS, &alpha_est, &sigma_sq_est);
+
+  /* === Poisson-monotonicity fallback (案B — physical prior, collapse-only) ===
+   * For a Poisson-Gaussian sensor the per-mean-bin noise variance is monotone
+   * non-decreasing in the mean (var = α·mean + σ²).  Bright FLAT regions (low
+   * texture, few blocks) can give an anomalously LOW lower-envelope variance at
+   * high mean, breaking that monotonicity and dragging the WLS cross-product
+   * Sxy_c negative; no usable positive slope survives, so α is floored to 1 LSB
+   * (≈9.5e-7), which makes the GAT inv_2sqrt_alpha = 2/√α overflow Q11.20 (±2048)
+   * → all-black collapse (the plomberie__ISO100 pathology, 1/1493).  Detect that
+   * collapse by the floored α (alpha_est <= 1 LSB — a healthy fit returns α far
+   * above the floor, e.g. 5e-3 ≈ 5243 LSB) and ONLY then re-solve on the monotone-
+   * increasing variance prefix: walk bins in increasing-mean order (bin index b is
+   * the mean quantile, so already sorted) and once the variance sustains a drop
+   * below 3/5·running-max over ≥2 consecutive bins, drop that bin and the whole
+   * high-mean tail, then re-solve; adopt the result only if it lifts α off the
+   * floor (a2 > alpha_est).  Gating on the floored α means every scene with a
+   * valid slope — including the many merely mildly non-monotone from bin-variance
+   * noise — is left BIT-IDENTICAL (validated: 1409/1493 RawNIND + 80/80 SIDD
+   * unchanged; an earlier unconditional-cut variant broke 3 already-healthy scenes
+   * by 17-26 dB, which this floored-α gating fixes).
+   * Poisson-Gaussian は var が mean に単調非減少。明るい平坦領域の異常低 var が単調性
+   * を破り WLS の Sxy_c を負に倒し、使える正 slope が残らず α が 1 LSB に floor →
+   * GAT inv_2sqrt_alpha=2/√α が Q11.20 overflow → 崩壊（plomberie__ISO100）。
+   * **floor された α (alpha_est<=1 LSB) を検出した時のみ** 単調 prefix で再解し、
+   * α が floor を脱した(a2>alpha_est)時だけ採用。健全シーン（軽微な非単調含む）は
+   * bit 一致＝zero regression。*/
+  if(alpha_est <= 1) {
+    int bv_cut[NE_NBINS];
+    for(int b = 0; b < NE_NBINS; b++) bv_cut[b] = bin_valid[b];
+    fxp32 run_max = 0;
+    int viol = 0, cut_from = -1, nv_cut = n_valid;
+    for(int b = 0; b < NE_NBINS; b++) {
+      if(!bv_cut[b]) continue;
+      fxp32 thr = (fxp32)(((int64_t)run_max * 3) / 5);   /* 3/5·running_max */
+      if(bin_var_arr[b] < thr) {
+        if(viol == 0) cut_from = b;                       /* first of a run */
+        if(++viol >= 2) break;                            /* sustained drop */
+      } else {
+        viol = 0; cut_from = -1;
+        if(bin_var_arr[b] > run_max) run_max = bin_var_arr[b];
+      }
+    }
+    if(viol >= 2 && cut_from >= 0) {
+      int dropped = 0;
+      for(int b = cut_from; b < NE_NBINS; b++)
+        if(bv_cut[b]) { bv_cut[b] = 0; nv_cut--; dropped++; }
+      if(nv_cut >= 4) {
+        fxp32 a2, s2;
+        phase0c_wls_solve(bin_mean_arr, bin_var_arr, bin_cnt_arr, bv_cut,
+                          NE_NBINS, &a2, &s2);
+        if(a2 > alpha_est) {  /* monotone prefix lifts α off the floor → adopt */
+          if(g_verbose) fprintf(stderr, "  [phase0] Poisson-monotonicity fallback: "
+            "floored α (collapse); dropped %d non-monotone high-mean bins "
+            "(from bin %d, n_valid %d→%d) → α recovered\n",
+            dropped, cut_from, n_valid, nv_cut);
+          alpha_est = a2; sigma_sq_est = s2;
+        }
+      }
+    }
+  }
+
   phase0d_dark_refine(in_q20, width, height, alpha_est, &sigma_sq_est);
 
   *alpha_out    = alpha_est;
