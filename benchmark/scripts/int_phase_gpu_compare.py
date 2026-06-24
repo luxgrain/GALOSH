@@ -40,7 +40,7 @@ def ints_after(text, phase):
 def run_cpu(in_p, out_p, w, h, phase):
     env = dict(SUBENV); env["GALOSH_INT_RAW_DUMP_DIR"] = str(TMP)
     cmd = [str(CPU_EXE), str(in_p), str(out_p), str(w), str(h),
-           "galosh", "1.0", "1.0", "1.0", "0", "0", "--variant=r32"]
+           "galosh", "1.0", "1.0", "1.0", "0", "0"]  # public r32 = single pipeline (no --variant CLI)
     r = subprocess.run(cmd, capture_output=True, timeout=240, env=env)
     return ints_after(r.stderr.decode("utf-8", "replace"), phase)
 

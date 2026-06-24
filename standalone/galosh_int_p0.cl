@@ -206,6 +206,32 @@ void k_p0_estimate(__global const int *in_q20, int width, int height,
     phase0c_wls_solve(bin_mean_arr, bin_var_arr, bin_cnt_arr, bin_valid,
                       NE_NBINS, C->alpha_init, C->huber_factor_q,
                       &alpha_est, &sigma_sq_est);
+    /* Poisson-monotonicity fallback (案B) — mirrors galosh_raw_cpu_int.c.  Only
+     * when the full-bin solve floors alpha (collapse) do we re-solve on the
+     * monotone-increasing variance prefix and adopt it iff it lifts alpha off the
+     * floor; gating on the floored alpha keeps healthy scenes bit-identical
+     * (plomberie__ISO100 collapse fix).  bin_valid is dead after this point
+     * (phase-0d does not read it), so we invalidate the tail IN PLACE rather than
+     * a private bv_cut copy — keeps the kernel within its reqd_work_group_size
+     * register budget; the adopted alpha is identical to the CPU copy form. */
+    if(alpha_est <= 1) {
+      int run_max = 0, viol = 0, cut_from = -1, nv_cut = n_valid;
+      for(int b = 0; b < NE_NBINS; b++) {
+        if(!bin_valid[b]) continue;
+        int thr = (int)(((long)run_max * 3) / 5);
+        if(bin_var_arr[b] < thr) { if(viol == 0) cut_from = b; if(++viol >= 2) break; }
+        else { viol = 0; cut_from = -1; if(bin_var_arr[b] > run_max) run_max = bin_var_arr[b]; }
+      }
+      if(viol >= 2 && cut_from >= 0) {
+        for(int b = cut_from; b < NE_NBINS; b++) if(bin_valid[b]) { bin_valid[b] = 0; nv_cut--; }
+        if(nv_cut >= 4) {
+          int a2, s2;
+          phase0c_wls_solve(bin_mean_arr, bin_var_arr, bin_cnt_arr, bin_valid,
+                            NE_NBINS, C->alpha_init, C->huber_factor_q, &a2, &s2);
+          if(a2 > alpha_est) { alpha_est = a2; sigma_sq_est = s2; }
+        }
+      }
+    }
     l_alpha = alpha_est;
     l_sigma = sigma_sq_est;   /* phase-0d may overwrite below */
 p0_serial_done: ;
@@ -497,6 +523,26 @@ __kernel void k_p0_estimate_serial(__global const int *in_q20, int width, int he
   phase0c_wls_solve(bin_mean_arr, bin_var_arr, bin_cnt_arr, bin_valid,
                     NE_NBINS, C->alpha_init, C->huber_factor_q,
                     &alpha_est, &sigma_sq_est);
+  /* Poisson-monotonicity fallback (案B) — see k_p0_estimate / galosh_raw_cpu_int.c.
+   * bin_valid is dead after this point so the tail is invalidated in place. */
+  if(alpha_est <= 1) {
+    int run_max = 0, viol = 0, cut_from = -1, nv_cut = n_valid;
+    for(int b = 0; b < NE_NBINS; b++) {
+      if(!bin_valid[b]) continue;
+      int thr = (int)(((long)run_max * 3) / 5);
+      if(bin_var_arr[b] < thr) { if(viol == 0) cut_from = b; if(++viol >= 2) break; }
+      else { viol = 0; cut_from = -1; if(bin_var_arr[b] > run_max) run_max = bin_var_arr[b]; }
+    }
+    if(viol >= 2 && cut_from >= 0) {
+      for(int b = cut_from; b < NE_NBINS; b++) if(bin_valid[b]) { bin_valid[b] = 0; nv_cut--; }
+      if(nv_cut >= 4) {
+        int a2, s2;
+        phase0c_wls_solve(bin_mean_arr, bin_var_arr, bin_cnt_arr, bin_valid,
+                          NE_NBINS, C->alpha_init, C->huber_factor_q, &a2, &s2);
+        if(a2 > alpha_est) { alpha_est = a2; sigma_sq_est = s2; }
+      }
+    }
+  }
   phase0d_dark_refine(in_q20, width, height, alpha_est, &sigma_sq_est,
                       thresh_hist, lap_hist, var_scale_combined,
                       C->dark_offset_002);

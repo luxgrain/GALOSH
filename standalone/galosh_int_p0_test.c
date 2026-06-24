@@ -161,7 +161,8 @@ int main(int argc, char **argv) {
   err = clEnqueueNDRangeKernel(q, kbs, 1, NULL, &gws_bs, NULL, 0, NULL, NULL);
   CLCHK(err, "nd block_stats");
 
-  /* --- k_p0_estimate (single work-item) --- */
+  /* --- k_p0_estimate (single workgroup of P0_WG threads — the optimized kernel
+   *     has reqd_work_group_size(P0_WG), so launch global=local=P0_WG) --- */
   cl_kernel kes = clCreateKernel(prog, "k_p0_estimate", &err); CLCHK(err, "kes");
   ai = 0;
   clSetKernelArg(kes, ai++, sizeof(cl_mem), &b_in);
@@ -179,8 +180,8 @@ int main(int argc, char **argv) {
   clSetKernelArg(kes, ai++, sizeof(cl_mem), &b_lh);
   clSetKernelArg(kes, ai++, sizeof(cl_mem), &b_a);
   clSetKernelArg(kes, ai++, sizeof(cl_mem), &b_s);
-  size_t gws_e = 1;
-  err = clEnqueueNDRangeKernel(q, kes, 1, NULL, &gws_e, NULL, 0, NULL, NULL);
+  size_t gws_e = 256, lws_e = 256;   /* = P0_WG in galosh_int_p0.cl */
+  err = clEnqueueNDRangeKernel(q, kes, 1, NULL, &gws_e, &lws_e, 0, NULL, NULL);
   CLCHK(err, "nd estimate");
 
   int32_t alpha = 0, sigma = 0;

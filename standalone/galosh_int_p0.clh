@@ -110,9 +110,21 @@ inline void wls_centered_pass(const int *bin_mean_arr,
   fxp_acc Sx_acc = fxp_acc_zero();
   fxp_acc Sy_acc = fxp_acc_zero();
   fxp_acc Sw_acc = fxp_acc_zero();
+  /* wshift: right-shift every count by a common amount so the largest weight
+   * stays inside Q11.20 (count >> wshift < 1024) — mirrors galosh_raw_cpu_int.c,
+   * avoids the full-frame `count * FXP_ONE` int32 overflow that drives Sxx_c
+   * negative → slope skipped → alpha collapse on bright full frames. */
+  int wshift = 0;
+  {
+    int max_cnt = 0;
+    for(int b = 0; b < n_total_bins; b++)
+      if(bin_valid[b] && bin_cnt_arr[b] > max_cnt) max_cnt = bin_cnt_arr[b];
+    while((max_cnt >> wshift) >= 1024) wshift++;
+  }
   for(int b = 0; b < n_total_bins; b++) {
     if(!bin_valid[b]) continue;
-    int w_int = bin_cnt_arr[b];
+    int w_int = bin_cnt_arr[b] >> wshift;
+    if(w_int < 1) w_int = 1;
     int w_q = w_int * FXP_ONE;
     if(huber_k_q < FXP_MAX_INT) {
       int pred = fxp_mul(alpha_in, bin_mean_arr[b]) + sigma_sq_in;
@@ -138,7 +150,8 @@ inline void wls_centered_pass(const int *bin_mean_arr,
   fxp_acc Sxy_c_acc = fxp_acc_zero();
   for(int b = 0; b < n_total_bins; b++) {
     if(!bin_valid[b]) continue;
-    int w_int = bin_cnt_arr[b];
+    int w_int = bin_cnt_arr[b] >> wshift;
+    if(w_int < 1) w_int = 1;
     int w_q = w_int * FXP_ONE;
     if(huber_k_q < FXP_MAX_INT) {
       int pred = fxp_mul(alpha_in, bin_mean_arr[b]) + sigma_sq_in;
