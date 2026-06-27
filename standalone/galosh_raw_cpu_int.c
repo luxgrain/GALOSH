@@ -2308,6 +2308,9 @@ static void phase4_chroma_halfres(const fxp32 *in_gat_q20,
  * in Stage 1c.  The output image is meaningful only for smoke checking that
  * GAT_int matches GAT_fp32 within precision.
  * ========================================================================== */
+#ifdef GALOSH_OPCOUNT
+long long g_n_mac = 0, g_n_sf = 0;   /* op-count instrumentation (see galosh_cpu_int.h) */
+#endif
 int main(int argc, char **argv) {
   g_verbose = (getenv("GALOSH_VERBOSE") != NULL);
   /* Strip --variant flag from argv. */
@@ -2980,6 +2983,12 @@ int main(int argc, char **argv) {
   if(g_verbose) fprintf(stderr, "  Output: %s (Phase 1 GAT-domain, clamped /4 for viewing)\n",
           output_file);
 
+#ifdef GALOSH_OPCOUNT
+  { long long px = (long long)width * height;
+    fprintf(stderr, "[OPCOUNT] pixels=%lld  MAC=%lld (%.1f/px)  SF=%lld (%.2f/px)\n",
+            px, g_n_mac, (double)g_n_mac / (double)px,
+            g_n_sf, (double)g_n_sf / (double)px); }
+#endif
   free(in_f32); free(out_f32); free(in_q20); free(out_q20);
   return 0;
 }

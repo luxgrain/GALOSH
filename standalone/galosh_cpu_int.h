@@ -138,7 +138,22 @@ static inline void fxp_acc_sub_i32(fxp_acc *a, int32_t v) {
  * Caveat: -INT32_MIN is undefined; we assume callers don't pass INT32_MIN.
  * For our pipeline this is safe (typical magnitudes < 2^28).
  */
+/* --- op-count instrumentation (diagnostic; -DGALOSH_OPCOUNT) -----------------
+ * Counts the ALGORITHMIC fixed-point ops the pipeline performs, independent of
+ * how the GPU/CPU emulates 64-bit: g_n_mac = multiply-accumulates (madd), g_n_sf
+ * = special-function calls (exp/sqrt/recip/gat LUT).  Used to model ISP-native
+ * throughput (MAC/pixel / MAC-array-rate), decoupled from FP-hardware emulation. */
+#ifdef GALOSH_OPCOUNT
+extern long long g_n_mac, g_n_sf;
+#define OPCNT_MAC() (g_n_mac++)
+#define OPCNT_SF()  (g_n_sf++)
+#else
+#define OPCNT_MAC() ((void)0)
+#define OPCNT_SF()  ((void)0)
+#endif
+
 static inline void fxp_acc_madd(fxp_acc *acc, int32_t a, int32_t b) {
+  OPCNT_MAC();
   int sign = ((a < 0) ^ (b < 0)) ? -1 : 1;
   uint32_t ua = (uint32_t)((a < 0) ? -a : a);
   uint32_t ub = (uint32_t)((b < 0) ? -b : b);
@@ -165,7 +180,6 @@ static inline void fxp_acc_madd(fxp_acc *acc, int32_t a, int32_t b) {
     lo_part = ~lo_part + 1u;
     hi_part = ~hi_part + ((lo_part == 0u) ? 1u : 0u);
   }
-
   /* Add to acc. */
   uint32_t old_lo = acc->lo;
   acc->lo = old_lo + lo_part;
@@ -374,6 +388,7 @@ static inline fxp32 fxp_exp(fxp32 x);
  *     Precision ~1% (LUT-limited), acceptable for typical use.
  * ========================================================================== */
 static inline fxp32 fxp_sqrt(fxp32 x) {
+  OPCNT_SF();
   if(x <= 0) return 0;
 
   if(x < FXP_ONE) {
@@ -411,6 +426,7 @@ static inline fxp32 fxp_sqrt(fxp32 x) {
  * Precision: ~24 bits after 5 iterations (matches FP32).
  * ========================================================================== */
 static inline fxp32 fxp_recip(fxp32 x) {
+  OPCNT_SF();
   if(x == 0) return FXP_MAX_INT;
   int32_t sign = (x < 0) ? -1 : 1;
   fxp32 ax = (x < 0) ? -x : x;
@@ -617,6 +633,7 @@ static inline void fxp_exp_lut_init(void) {
 }
 
 static inline fxp32 fxp_exp(fxp32 x) {
+  OPCNT_SF();
   if(x <= FXP_EXP_DOMAIN_LO) return 0;
   if(x >= 0) return FXP_ONE;
   /* Compute exp(x) for x ∈ (-16, 0) directly via:
@@ -979,6 +996,7 @@ static inline void fxp_gat_precompute(fxp_gat_params *p,
 
 static inline fxp32 fxp_gat_forward(fxp32 x_q20,
                                     const fxp_gat_params *p) {
+  OPCNT_SF();
   if(x_q20 >= p->y_break) {
     /* sqrt branch: GAT = inv_2sqrt_alpha * sqrt(x + 3α/8 + σ²/α). */
     fxp32 u = x_q20 + p->three_alpha_8 + p->sigma_sq_over_alpha;
@@ -1015,6 +1033,7 @@ static inline fxp32 fxp_gat_forward(fxp32 x_q20,
  * approximation when LUT is not available. */
 static inline fxp32 fxp_gat_inverse_algebraic(fxp32 d_q20,
                                               const fxp_gat_params *p) {
+  OPCNT_SF();
   if(d_q20 >= p->t_break) {
     /* sqrt branch inverse: x = (α/4) * D² - 3α/8 - σ²/α.
      *
