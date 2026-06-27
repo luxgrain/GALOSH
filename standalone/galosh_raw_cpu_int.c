@@ -1719,6 +1719,11 @@ static void fxp_loess_chroma_3ch_r(const fxp32 *y_guide,
       fxp_acc sumW = fxp_acc_zero();
       fxp_acc sumY = fxp_acc_zero();
       fxp_acc sumC1 = fxp_acc_zero(), sumC2 = fxp_acc_zero(), sumC3 = fxp_acc_zero();
+      /* GALOSH_CHROMA_CLAMP (canonical, = FP32 galosh_loess_chroma_3ch_r): full-
+       * window input chroma range (in the 1/16-scaled space, same as the a·Y+b
+       * regression) to clamp the degree-1 extrapolation overshoot. */
+      fxp32 cmin1 = 0x7fffffff, cmin2 = 0x7fffffff, cmin3 = 0x7fffffff;
+      fxp32 cmax1 = -0x7fffffff, cmax2 = -0x7fffffff, cmax3 = -0x7fffffff;
 
       for(int dy = -R; dy <= R; dy++) {
         int yi = fxp_reflect_idx(y + dy, height);
@@ -1751,6 +1756,9 @@ static void fxp_loess_chroma_3ch_r(const fxp32 *y_guide,
 
           w_buf[nb] = w; Y_buf[nb] = Yi;
           C1_buf[nb] = C1i; C2_buf[nb] = C2i; C3_buf[nb] = C3i; nb++;
+          if(C1i < cmin1) cmin1 = C1i; if(C1i > cmax1) cmax1 = C1i;
+          if(C2i < cmin2) cmin2 = C2i; if(C2i > cmax2) cmax2 = C2i;
+          if(C3i < cmin3) cmin3 = C3i; if(C3i > cmax3) cmax3 = C3i;
           fxp_acc_add_i32(&sumW, w);
           fxp_acc_madd(&sumY,  w, Yi);
           fxp_acc_madd(&sumC1, w, C1i);
@@ -1799,10 +1807,17 @@ static void fxp_loess_chroma_3ch_r(const fxp32 *y_guide,
       fxp32 b_c3 = meanC3 - fxp_mul(a_c3, meanY);
 
       /* output_scaled = a · Y_c_scaled + b (= k * actual_output).
-       * Unscale: output = output_scaled × 16 (= << 4). */
-      c1_out[cx] = (fxp_mul(a_c1, Y_c) + b_c1) << 4;
-      c2_out[cx] = (fxp_mul(a_c2, Y_c) + b_c2) << 4;
-      c3_out[cx] = (fxp_mul(a_c3, Y_c) + b_c3) << 4;
+       * Clamp the regression to the local input chroma band (scaled space),
+       * then unscale: output = output_scaled × 16 (= << 4). */
+      fxp32 os1 = fxp_mul(a_c1, Y_c) + b_c1;
+      fxp32 os2 = fxp_mul(a_c2, Y_c) + b_c2;
+      fxp32 os3 = fxp_mul(a_c3, Y_c) + b_c3;
+      if(cmax1 >= cmin1){ if(os1 < cmin1) os1 = cmin1; else if(os1 > cmax1) os1 = cmax1; }
+      if(cmax2 >= cmin2){ if(os2 < cmin2) os2 = cmin2; else if(os2 > cmax2) os2 = cmax2; }
+      if(cmax3 >= cmin3){ if(os3 < cmin3) os3 = cmin3; else if(os3 > cmax3) os3 = cmax3; }
+      c1_out[cx] = os1 << 4;
+      c2_out[cx] = os2 << 4;
+      c3_out[cx] = os3 << 4;
     }
   }
 }
@@ -1833,6 +1848,10 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
         fxp_acc sum_c1 = fxp_acc_zero();
         fxp_acc sum_c2 = fxp_acc_zero();
         fxp_acc sum_c3 = fxp_acc_zero();
+        /* GALOSH_CHROMA_CLAMP (canonical, = FP32 gat_k16_joint_bilateral_upsample):
+         * full-window input chroma range to clamp the jinc-ringing overshoot. */
+        fxp32 cmin1 = 0x7fffffff, cmin2 = 0x7fffffff, cmin3 = 0x7fffffff;
+        fxp32 cmax1 = -0x7fffffff, cmax2 = -0x7fffffff, cmax3 = -0x7fffffff;
 
         for(int dy = -W; dy <= W; dy++) {
           int hyi = hy + dy;
@@ -1866,6 +1885,10 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
             fxp_acc_madd(&sum_c1, w, c1_h[hp]);
             fxp_acc_madd(&sum_c2, w, c2_h[hp]);
             fxp_acc_madd(&sum_c3, w, c3_h[hp]);
+            { fxp32 v1=c1_h[hp], v2=c2_h[hp], v3=c3_h[hp];
+              if(v1<cmin1)cmin1=v1; if(v1>cmax1)cmax1=v1;
+              if(v2<cmin2)cmin2=v2; if(v2>cmax2)cmax2=v2;
+              if(v3<cmin3)cmin3=v3; if(v3>cmax3)cmax3=v3; }
           }
         }
 
@@ -1888,9 +1911,16 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
          * jinc 負ローブ相殺で Σ重み≈0 → 1/sw が Q11.20 を溢れ recip 飽和して
          * chroma が 2048 に張り付くバグ。比 sc/sw を fxp_div_q20 で直接計算。 */
         size_t fp = (size_t)fr * fw + fc;
-        c1_full[fp] = fxp_div_q20(sc1, sw);
-        c2_full[fp] = fxp_div_q20(sc2, sw);
-        c3_full[fp] = fxp_div_q20(sc3, sw);
+        fxp32 oc1 = fxp_div_q20(sc1, sw);
+        fxp32 oc2 = fxp_div_q20(sc2, sw);
+        fxp32 oc3 = fxp_div_q20(sc3, sw);
+        /* clamp jinc-ringing overshoot to the local input chroma band */
+        if(cmax1>=cmin1){ if(oc1<cmin1)oc1=cmin1; else if(oc1>cmax1)oc1=cmax1; }
+        if(cmax2>=cmin2){ if(oc2<cmin2)oc2=cmin2; else if(oc2>cmax2)oc2=cmax2; }
+        if(cmax3>=cmin3){ if(oc3<cmin3)oc3=cmin3; else if(oc3>cmax3)oc3=cmax3; }
+        c1_full[fp] = oc1;
+        c2_full[fp] = oc2;
+        c3_full[fp] = oc3;
       }
     }
   }

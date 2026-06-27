@@ -3942,6 +3942,11 @@ kernel void galosh_o_loess_chroma_3p_fp16_tiled(
   half sumW = (half)0.0f, sumY = (half)0.0f, sumYY = (half)0.0f;
   half sumC1 = (half)0.0f, sumC2 = (half)0.0f, sumC3 = (half)0.0f;
   half sumYC1 = (half)0.0f, sumYC2 = (half)0.0f, sumYC3 = (half)0.0f;
+  /* GALOSH_CHROMA_CLAMP mirror (= CPU galosh_loess_chroma_3ch_r): full-window
+   * input chroma range (in SCALED space) to clamp the degree-1 regression
+   * extrapolation below. */
+  float cmin1= 1e30f, cmin2= 1e30f, cmin3= 1e30f;
+  float cmax1=-1e30f, cmax2=-1e30f, cmax3=-1e30f;
 
   for(int dy = -GALOSH_O_LOESS_R; dy <= GALOSH_O_LOESS_R; dy++)
   {
@@ -3954,6 +3959,9 @@ kernel void galosh_o_loess_chroma_3p_fp16_tiled(
       const half C1i = tile_C1[p];
       const half C2i = tile_C2[p];
       const half C3i = tile_C3[p];
+      cmin1=fmin(cmin1,(float)C1i); cmax1=fmax(cmax1,(float)C1i);
+      cmin2=fmin(cmin2,(float)C2i); cmax2=fmax(cmax2,(float)C2i);
+      cmin3=fmin(cmin3,(float)C3i); cmax3=fmax(cmax3,(float)C3i);
       const half dY  = Yi - Y_c;
       const half w = (half)native_exp(-(float)dY * (float)dY * inv_2sigma_sq);
       sumW   += w;
@@ -4005,11 +4013,18 @@ kernel void galosh_o_loess_chroma_3p_fp16_tiled(
   const float b_c3_s = mean_C3_s - a_c3 * mean_Y_s;
   const float Yc_f_s = (float)Y_c;   /* scaled */
 
-  /* Output in scaled space, multiply by PRESCALE to restore original. */
+  /* Output in scaled space; clamp the regression extrapolation to the local
+   * input chroma band (scaled), then multiply by PRESCALE to restore original. */
+  float os1 = a_c1 * Yc_f_s + b_c1_s;
+  float os2 = a_c2 * Yc_f_s + b_c2_s;
+  float os3 = a_c3 * Yc_f_s + b_c3_s;
+  if(cmax1>=cmin1) os1 = clamp(os1, cmin1, cmax1);
+  if(cmax2>=cmin2) os2 = clamp(os2, cmin2, cmax2);
+  if(cmax3>=cmin3) os3 = clamp(os3, cmin3, cmax3);
   const size_t op = (size_t)oy * width + ox;
-  c1_out[op] = (half)((a_c1 * Yc_f_s + b_c1_s) * LOESS_PRESCALE);
-  c2_out[op] = (half)((a_c2 * Yc_f_s + b_c2_s) * LOESS_PRESCALE);
-  c3_out[op] = (half)((a_c3 * Yc_f_s + b_c3_s) * LOESS_PRESCALE);
+  c1_out[op] = (half)(os1 * LOESS_PRESCALE);
+  c2_out[op] = (half)(os2 * LOESS_PRESCALE);
+  c3_out[op] = (half)(os3 * LOESS_PRESCALE);
 }
 
 
@@ -4067,6 +4082,10 @@ kernel void galosh_o_k16_joint_bilateral_upsample_3p(
 
   half sum_w  = (half)0.0f;
   half sum_c1 = (half)0.0f, sum_c2 = (half)0.0f, sum_c3 = (half)0.0f;
+  /* GALOSH_CHROMA_CLAMP mirror (canonical, = CPU gat_k16_joint_bilateral_upsample):
+   * track the FULL-window input chroma range, clamp the jinc-ringing output to it. */
+  float cmin1= 1e30f, cmin2= 1e30f, cmin3= 1e30f;
+  float cmax1=-1e30f, cmax2=-1e30f, cmax3=-1e30f;
 
   for(int dy = -2; dy <= 2; dy++)
   {
@@ -4077,6 +4096,11 @@ kernel void galosh_o_k16_joint_bilateral_upsample_3p(
       int hxi = hx + dx;
       hxi = clamp(hxi, 0, in_w - 1);
       const int hi = hyi * in_w + hxi;
+      /* full-window input range (every sample, before the zero-weight skip) */
+      const float iv1=(float)c1_in[hi], iv2=(float)c2_in[hi], iv3=(float)c3_in[hi];
+      cmin1=fmin(cmin1,iv1); cmax1=fmax(cmax1,iv1);
+      cmin2=fmin(cmin2,iv2); cmax2=fmax(cmax2,iv2);
+      cmin3=fmin(cmin3,iv3); cmax3=fmax(cmax3,iv3);
       const float w_jinc = galosh_ewajl3_w[si * 25 + (dy + 2) * 5 + (dx + 2)];
       if(w_jinc == 0.0f) continue;
 
@@ -4097,12 +4121,21 @@ kernel void galosh_o_k16_joint_bilateral_upsample_3p(
     }
   }
 
-  /* Post-loop division in FP32 scalar. */
-  const float invSw = 1.0f / fmax((float)sum_w, 1e-10f);
+  /* Post-loop division in FP32 scalar, SIGN-PRESERVING |sum_w| floor (the old
+   * fmax(...,1e-10) dropped the sign and flipped chroma when the jinc negative
+   * lobes cancelled -> magenta spike). */
+  const float swf = (float)sum_w;
+  const float safe_sw = (fabs(swf) > 1e-10f) ? swf : ((swf < 0.0f) ? -1e-10f : 1e-10f);
+  const float invSw = 1.0f / safe_sw;
+  float oc1 = (float)sum_c1 * invSw, oc2 = (float)sum_c2 * invSw, oc3 = (float)sum_c3 * invSw;
+  /* clamp jinc-ringing overshoot to the local input chroma band */
+  if(cmax1>=cmin1) oc1 = clamp(oc1, cmin1, cmax1);
+  if(cmax2>=cmin2) oc2 = clamp(oc2, cmin2, cmax2);
+  if(cmax3>=cmin3) oc3 = clamp(oc3, cmin3, cmax3);
   const size_t op = (size_t)fy * out_w + fx;
-  c1_out[op] = (half)((float)sum_c1 * invSw);
-  c2_out[op] = (half)((float)sum_c2 * invSw);
-  c3_out[op] = (half)((float)sum_c3 * invSw);
+  c1_out[op] = (half)oc1;
+  c2_out[op] = (half)oc2;
+  c3_out[op] = (half)oc3;
 }
 
 
@@ -5566,6 +5599,10 @@ kernel void galosh_o32_loess_chroma_3p_tiled(
   float sumW = 0.0f, sumY = 0.0f, sumYY = 0.0f;
   float sumC1 = 0.0f, sumC2 = 0.0f, sumC3 = 0.0f;
   float sumYC1 = 0.0f, sumYC2 = 0.0f, sumYC3 = 0.0f;
+  /* GALOSH_CHROMA_CLAMP mirror (= CPU galosh_loess_chroma_3ch_r): full-window
+   * input chroma range to clamp the degree-1 regression extrapolation below. */
+  float cmin1= 1e30f, cmin2= 1e30f, cmin3= 1e30f;
+  float cmax1=-1e30f, cmax2=-1e30f, cmax3=-1e30f;
 
   for(int dy = -GALOSH_O_LOESS_R; dy <= GALOSH_O_LOESS_R; dy++)
   {
@@ -5578,6 +5615,9 @@ kernel void galosh_o32_loess_chroma_3p_tiled(
       const float C1i = t_C1[p];
       const float C2i = t_C2[p];
       const float C3i = t_C3[p];
+      cmin1=fmin(cmin1,C1i); cmax1=fmax(cmax1,C1i);
+      cmin2=fmin(cmin2,C2i); cmax2=fmax(cmax2,C2i);
+      cmin3=fmin(cmin3,C3i); cmax3=fmax(cmax3,C3i);
       const float dY  = Yi - Y_c;
       /* Use spec-compliant exp instead of native_exp (= matches CPU expf). */
       const float w = exp(-dY * dY * inv_2sigma_sq);
@@ -5615,10 +5655,17 @@ kernel void galosh_o32_loess_chroma_3p_tiled(
   const float b_c2 = mean_C2 - a_c2 * mean_Y;
   const float b_c3 = mean_C3 - a_c3 * mean_Y;
 
+  float oc1 = a_c1 * Y_c + b_c1;
+  float oc2 = a_c2 * Y_c + b_c2;
+  float oc3 = a_c3 * Y_c + b_c3;
+  /* clamp degree-1 regression extrapolation to the local input chroma band */
+  if(cmax1>=cmin1) oc1 = clamp(oc1, cmin1, cmax1);
+  if(cmax2>=cmin2) oc2 = clamp(oc2, cmin2, cmax2);
+  if(cmax3>=cmin3) oc3 = clamp(oc3, cmin3, cmax3);
   const size_t op = (size_t)oy * width + ox;
-  c1_out[op] = a_c1 * Y_c + b_c1;
-  c2_out[op] = a_c2 * Y_c + b_c2;
-  c3_out[op] = a_c3 * Y_c + b_c3;
+  c1_out[op] = oc1;
+  c2_out[op] = oc2;
+  c3_out[op] = oc3;
 }
 
 
@@ -5675,6 +5722,10 @@ kernel void galosh_o32_k16_joint_bilateral_upsample_3p(
 
   float sum_w  = 0.0f;
   float sum_c1 = 0.0f, sum_c2 = 0.0f, sum_c3 = 0.0f;
+  /* GALOSH_CHROMA_CLAMP mirror (canonical, = CPU gat_k16_joint_bilateral_upsample):
+   * track the FULL-window input chroma range, clamp the jinc-ringing output to it. */
+  float cmin1= 1e30f, cmin2= 1e30f, cmin3= 1e30f;
+  float cmax1=-1e30f, cmax2=-1e30f, cmax3=-1e30f;
 
   for(int dy = -2; dy <= 2; dy++)
   {
@@ -5685,6 +5736,11 @@ kernel void galosh_o32_k16_joint_bilateral_upsample_3p(
       int hxi = hx + dx;
       hxi = clamp(hxi, 0, in_w - 1);
       const int hi = hyi * in_w + hxi;
+      /* full-window input range (every sample, before the zero-weight skip) */
+      const float iv1=c1_in[hi], iv2=c2_in[hi], iv3=c3_in[hi];
+      cmin1=fmin(cmin1,iv1); cmax1=fmax(cmax1,iv1);
+      cmin2=fmin(cmin2,iv2); cmax2=fmax(cmax2,iv2);
+      cmin3=fmin(cmin3,iv3); cmax3=fmax(cmax3,iv3);
       const float w_jinc = galosh_o32_k16_jbu_w[si * 25 + (dy + 2) * 5 + (dx + 2)];
       if(w_jinc == 0.0f) continue;
 
@@ -5707,14 +5763,19 @@ kernel void galosh_o32_k16_joint_bilateral_upsample_3p(
     }
   }
 
-  /* Safety: |sum_w| floor avoids divide-by-zero where bilateral kills
-   * nearly all weights (= matches CPU 1e-6 floor). */
-  const float safe_w = (fabs(sum_w) > 1e-6f) ? sum_w : 1e-6f;
+  /* SIGN-PRESERVING |sum_w| floor (the old fmax-style positive floor flipped the
+   * chroma sign when the jinc negative lobes cancelled -> magenta spike). */
+  const float safe_w = (fabs(sum_w) > 1e-6f) ? sum_w : ((sum_w < 0.0f) ? -1e-6f : 1e-6f);
   const float inv_w = 1.0f / safe_w;
+  float oc1 = sum_c1 * inv_w, oc2 = sum_c2 * inv_w, oc3 = sum_c3 * inv_w;
+  /* clamp jinc-ringing overshoot to the local input chroma band */
+  if(cmax1>=cmin1) oc1 = clamp(oc1, cmin1, cmax1);
+  if(cmax2>=cmin2) oc2 = clamp(oc2, cmin2, cmax2);
+  if(cmax3>=cmin3) oc3 = clamp(oc3, cmin3, cmax3);
   const size_t op = (size_t)fy * out_w + fx;
-  c1_out[op] = sum_c1 * inv_w;
-  c2_out[op] = sum_c2 * inv_w;
-  c3_out[op] = sum_c3 * inv_w;
+  c1_out[op] = oc1;
+  c2_out[op] = oc2;
+  c3_out[op] = oc3;
 }
 
 

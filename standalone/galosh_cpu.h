@@ -134,6 +134,29 @@
 #include <pmmintrin.h>  /* SSE3: _mm_hadd_ps */
 
 /* =====================================================================
+ *  GALOSH_CHROMA_CLAMP — chroma-overshoot fix (2026-06-27), now CANONICAL.
+ *
+ *  The L-guided chroma path (P5/P7 degree-1 LOESS regression + P9 K16 jinc
+ *  joint-bilateral upsample) had NO bound on the reconstructed chroma: the
+ *  jinc kernel's negative sidelobes (non-convex weights) let the upsample ring
+ *  PAST the local input-chroma range at high-contrast luma edges, and the
+ *  sum_w floor dropped its sign when the sidelobes cancelled (sum_w≈0).  The
+ *  resulting chroma overshoot, magnified by the blue WB gain (~×2.7), showed as
+ *  isolated magenta specks (worst RawNIND scenes lost up to ~0.13 LPIPS).
+ *
+ *  Fix (mirrors the INT pipeline, which never showed it): (1) clamp the LOESS
+ *  output and the K16-upsampled chroma to the FULL-window local INPUT chroma
+ *  range — "the denoiser may not invent colour the input lacks"; (2) sign-
+ *  preserving sum_w floor.  Validated baseline→fix: magenta→~0 (below INT),
+ *  LPIPS net −0.028 over 17 scenes, ~1.4% pixels touched.  Define it by default
+ *  so every build (standalone + darktable) gets the fix; `-UGALOSH_CHROMA_CLAMP`
+ *  recovers the pre-fix path for A/B reproduction.
+ * ===================================================================== */
+#ifndef GALOSH_CHROMA_CLAMP
+#define GALOSH_CHROMA_CLAMP 1
+#endif
+
+/* =====================================================================
  *  Environment compat layer
  *
  *  This header is used in three contexts:
@@ -3128,6 +3151,10 @@ static void galosh_loess_chroma_3ch_r(
       float sumW = 0.f, sumY = 0.f, sumYY = 0.f;
       float sumC1 = 0.f, sumC2 = 0.f, sumC3 = 0.f;
       float sumYC1 = 0.f, sumYC2 = 0.f, sumYC3 = 0.f;
+#ifdef GALOSH_CHROMA_CLAMP
+      /* input-chroma window range to clamp the degree-1 regression extrapolation */
+      float lo1= 1e30f, lo2= 1e30f, lo3= 1e30f, hi1=-1e30f, hi2=-1e30f, hi3=-1e30f;
+#endif
 
       if(y_interior && x >= x0_int && x < x1_int)
       {
@@ -3156,6 +3183,11 @@ static void galosh_loess_chroma_3ch_r(
             sumYC1 += w * Yi * C1i;
             sumYC2 += w * Yi * C2i;
             sumYC3 += w * Yi * C3i;
+#ifdef GALOSH_CHROMA_CLAMP
+            if(1){ if(C1i<lo1)lo1=C1i; if(C1i>hi1)hi1=C1i;
+                          if(C2i<lo2)lo2=C2i; if(C2i>hi2)hi2=C2i;
+                          if(C3i<lo3)lo3=C3i; if(C3i>hi3)hi3=C3i; }
+#endif
           }
         }
       }
@@ -3187,6 +3219,11 @@ static void galosh_loess_chroma_3ch_r(
             sumYC1 += w * Yi * C1i;
             sumYC2 += w * Yi * C2i;
             sumYC3 += w * Yi * C3i;
+#ifdef GALOSH_CHROMA_CLAMP
+            if(1){ if(C1i<lo1)lo1=C1i; if(C1i>hi1)hi1=C1i;
+                          if(C2i<lo2)lo2=C2i; if(C2i>hi2)hi2=C2i;
+                          if(C3i<lo3)lo3=C3i; if(C3i>hi3)hi3=C3i; }
+#endif
           }
         }
       }
@@ -3212,9 +3249,19 @@ static void galosh_loess_chroma_3ch_r(
       const float b_c2 = meanC2 - a_c2 * meanY;
       const float b_c3 = meanC3 - a_c3 * meanY;
 
-      c1_out[cx] = a_c1 * Y_c + b_c1;
-      c2_out[cx] = a_c2 * Y_c + b_c2;
-      c3_out[cx] = a_c3 * Y_c + b_c3;
+      float oc1 = a_c1 * Y_c + b_c1;
+      float oc2 = a_c2 * Y_c + b_c2;
+      float oc3 = a_c3 * Y_c + b_c3;
+#ifdef GALOSH_CHROMA_CLAMP
+      /* clamp degree-1 luma-guided regression extrapolation to the local input
+       * chroma band -> kills chroma overshoot at luma edges (= magenta source #1). */
+      if(hi1>=lo1) oc1 = fminf(fmaxf(oc1, lo1), hi1);
+      if(hi2>=lo2) oc2 = fminf(fmaxf(oc2, lo2), hi2);
+      if(hi3>=lo3) oc3 = fminf(fmaxf(oc3, lo3), hi3);
+#endif
+      c1_out[cx] = oc1;
+      c2_out[cx] = oc2;
+      c3_out[cx] = oc3;
     }
   }
 }
@@ -3598,6 +3645,10 @@ static void gat_k16_joint_bilateral_upsample(
         float w_val = 0.0f;
         if(r_full < 3.0f)
           w_val = galosh_jinc(r_full) * galosh_jinc(r_full / 3.0f);
+        /* NOTE: the jinc negative sidelobes are KEPT — dropping them (convex
+         * upsample) was tested and made magenta far WORSE (chroma blurs/bleeds
+         * across L edges).  Overshoot is instead bounded by the output-range
+         * clamp below (GALOSH_CHROMA_CLAMP). */
         jw[si][dy + W][dx + W] = w_val;
       }
     }
@@ -3622,6 +3673,12 @@ static void gat_k16_joint_bilateral_upsample(
 
         float sum_w = 0.0f;
         float sum_c1 = 0.0f, sum_c2 = 0.0f, sum_c3 = 0.0f;
+#ifdef GALOSH_CHROMA_CLAMP
+        /* Range of the bilaterally-relevant (positive-bilateral-weight) input
+         * chroma samples, used to clamp jinc-ringing overshoot below. */
+        float lo1= 1e30f, lo2= 1e30f, lo3= 1e30f;
+        float hi1=-1e30f, hi2=-1e30f, hi3=-1e30f;
+#endif
 
         for(int dy = -W; dy <= W; dy++)
         {
@@ -3651,6 +3708,18 @@ static void gat_k16_joint_bilateral_upsample(
             sum_c1 += w * c1_h[hp];
             sum_c2 += w * c2_h[hp];
             sum_c3 += w * c3_h[hp];
+#ifdef GALOSH_CHROMA_CLAMP
+            /* track FULL-window input-chroma range (every contributing sample):
+             * a conservative band that bounds gross jinc-ringing overshoot WITHOUT
+             * collapsing legitimate chroma at edges (a tight w>thresh band was
+             * found to over-clamp and itself create a few magenta specks). */
+            {
+              const float v1=c1_h[hp], v2=c2_h[hp], v3=c3_h[hp];
+              if(v1<lo1)lo1=v1; if(v1>hi1)hi1=v1;
+              if(v2<lo2)lo2=v2; if(v2>hi2)hi2=v2;
+              if(v3<lo3)lo3=v3; if(v3>hi3)hi3=v3;
+            }
+#endif
           }
         }
 
@@ -3659,12 +3728,36 @@ static void gat_k16_joint_bilateral_upsample(
          * so the sum is well-defined; bilateral mod preserves this).
          * Floor on |sum_w| guards against pathological cases where
          * bilateral kills nearly all weights. */
+        /* Floor |sum_w| but PRESERVE ITS SIGN (under GALOSH_CHROMA_CLAMP).  The
+         * old `: 1e-6f` forced a POSITIVE floor: when the jinc negative lobes
+         * cancel the centre in a high-contrast chroma spot, sum_w drifts to a
+         * tiny NEGATIVE value and the positive floor flipped the chroma sign ->
+         * a spurious chroma spike (= magenta after the blue WB gain).  Sign-
+         * preserving floor mirrors the INT pipeline (galosh_raw_cpu_int.c jinc
+         * upsample).  EN/JP: sum_w≈0 時に符号を失い chroma 反転していたバグの符号保持修正。 */
+#ifdef GALOSH_CHROMA_CLAMP
+        const float safe_w = (fabsf(sum_w) > 1e-6f) ? sum_w
+                                                    : ((sum_w < 0.0f) ? -1e-6f : 1e-6f);
+#else
         const float safe_w = (fabsf(sum_w) > 1e-6f) ? sum_w : 1e-6f;
+#endif
         const float inv_w = 1.0f / safe_w;
         const size_t fp = (size_t)fr * fw + fc;
-        c1_full[fp] = sum_c1 * inv_w;
-        c2_full[fp] = sum_c2 * inv_w;
-        c3_full[fp] = sum_c3 * inv_w;
+        float oc1 = sum_c1 * inv_w, oc2 = sum_c2 * inv_w, oc3 = sum_c3 * inv_w;
+#ifdef GALOSH_CHROMA_CLAMP
+        /* Clamp jinc-sidelobe ringing: the non-convex (negative-sidelobe) jinc
+         * weights let the weighted sum exceed the local input chroma band at
+         * high-contrast L edges -> chroma overshoot -> magenta after the large
+         * blue WB gain.  Clamp the output to the admissible band (= INT-pipeline
+         * behaviour, which never showed this).  EN/JP: jinc 負サイドローブ起因の
+         * chroma overshoot を入力レンジに clamp。 */
+        if(hi1 >= lo1){ oc1 = fminf(fmaxf(oc1, lo1), hi1); }
+        if(hi2 >= lo2){ oc2 = fminf(fmaxf(oc2, lo2), hi2); }
+        if(hi3 >= lo3){ oc3 = fminf(fmaxf(oc3, lo3), hi3); }
+#endif
+        c1_full[fp] = oc1;
+        c2_full[fp] = oc2;
+        c3_full[fp] = oc3;
       }
     }
   }

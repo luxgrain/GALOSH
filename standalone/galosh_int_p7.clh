@@ -35,6 +35,10 @@ inline void p7_loess_pixel(__global const lbuf_t *y_guide,
   int nb = 0;
   fxp_acc sumW = fxp_acc_zero(), sumY = fxp_acc_zero();
   fxp_acc sumC1 = fxp_acc_zero(), sumC2 = fxp_acc_zero(), sumC3 = fxp_acc_zero();
+  /* GALOSH_CHROMA_CLAMP (= r32 fxp_loess_chroma_3ch_r): full-window input chroma
+   * range (1/16-scaled) to clamp the degree-1 regression extrapolation. */
+  int cmin1 = 0x7fffffff, cmin2 = 0x7fffffff, cmin3 = 0x7fffffff;
+  int cmax1 = -0x7fffffff, cmax2 = -0x7fffffff, cmax3 = -0x7fffffff;
 
   for(int dy = -R; dy <= R; dy++) {
     int yi = fxp_reflect_idx(y + dy, height);
@@ -61,6 +65,9 @@ inline void p7_loess_pixel(__global const lbuf_t *y_guide,
 
       w_buf[nb] = w; Y_buf[nb] = Yi;
       C1_buf[nb] = C1i; C2_buf[nb] = C2i; C3_buf[nb] = C3i; nb++;
+      if(C1i<cmin1)cmin1=C1i; if(C1i>cmax1)cmax1=C1i;
+      if(C2i<cmin2)cmin2=C2i; if(C2i>cmax2)cmax2=C2i;
+      if(C3i<cmin3)cmin3=C3i; if(C3i>cmax3)cmax3=C3i;
       fxp_acc_add_i32(&sumW, w);
       fxp_acc_madd(&sumY,  w, Yi);
       fxp_acc_madd(&sumC1, w, C1i);
@@ -104,9 +111,15 @@ inline void p7_loess_pixel(__global const lbuf_t *y_guide,
   int b_c2 = meanC2 - fxp_mul(a_c2, meanY);
   int b_c3 = meanC3 - fxp_mul(a_c3, meanY);
 
-  *o1 = (fxp_mul(a_c1, Y_c) + b_c1) << 4;
-  *o2 = (fxp_mul(a_c2, Y_c) + b_c2) << 4;
-  *o3 = (fxp_mul(a_c3, Y_c) + b_c3) << 4;
+  int os1 = fxp_mul(a_c1, Y_c) + b_c1;
+  int os2 = fxp_mul(a_c2, Y_c) + b_c2;
+  int os3 = fxp_mul(a_c3, Y_c) + b_c3;
+  if(cmax1>=cmin1){ if(os1<cmin1)os1=cmin1; else if(os1>cmax1)os1=cmax1; }
+  if(cmax2>=cmin2){ if(os2<cmin2)os2=cmin2; else if(os2>cmax2)os2=cmax2; }
+  if(cmax3>=cmin3){ if(os3<cmin3)os3=cmin3; else if(os3>cmax3)os3=cmax3; }
+  *o1 = os1 << 4;
+  *o2 = os2 << 4;
+  *o3 = os3 << 4;
 }
 
 /* K16 jinc-windowed-jinc weights (Q11.20), 4 sub-pixel offsets x 5x5 window.
@@ -133,6 +146,10 @@ inline void p7_k16_pixel(__global const lbuf_t *c1_h, __global const lbuf_t *c2_
 
   fxp_acc sum_w = fxp_acc_zero();
   fxp_acc sum_c1 = fxp_acc_zero(), sum_c2 = fxp_acc_zero(), sum_c3 = fxp_acc_zero();
+  /* GALOSH_CHROMA_CLAMP (= r32 fxp_k16_jinc_upsample): full-window input chroma
+   * range to clamp the jinc-ringing overshoot. */
+  int cmin1 = 0x7fffffff, cmin2 = 0x7fffffff, cmin3 = 0x7fffffff;
+  int cmax1 = -0x7fffffff, cmax2 = -0x7fffffff, cmax3 = -0x7fffffff;
   for(int dy = -W; dy <= W; dy++) {
     int hyi = hy + dy;
     if(hyi < 0) hyi = 0;
@@ -157,9 +174,13 @@ inline void p7_k16_pixel(__global const lbuf_t *c1_h, __global const lbuf_t *c2_
       int w = fxp_mul(jw, w_bilat);
       size_t hp = (size_t)hyi * halfwidth + hxi;
       fxp_acc_add_i32(&sum_w, w);
-      fxp_acc_madd(&sum_c1, w, LDB(c1_h, hp));
-      fxp_acc_madd(&sum_c2, w, LDB(c2_h, hp));
-      fxp_acc_madd(&sum_c3, w, LDB(c3_h, hp));
+      int v1 = LDB(c1_h, hp), v2 = LDB(c2_h, hp), v3 = LDB(c3_h, hp);
+      fxp_acc_madd(&sum_c1, w, v1);
+      fxp_acc_madd(&sum_c2, w, v2);
+      fxp_acc_madd(&sum_c3, w, v3);
+      if(v1<cmin1)cmin1=v1; if(v1>cmax1)cmax1=v1;
+      if(v2<cmin2)cmin2=v2; if(v2>cmax2)cmax2=v2;
+      if(v3<cmin3)cmin3=v3; if(v3>cmax3)cmax3=v3;
     }
   }
   int sw  = fxp_acc_extract_q20(&sum_w);
@@ -168,9 +189,15 @@ inline void p7_k16_pixel(__global const lbuf_t *c1_h, __global const lbuf_t *c2_
   int sc3 = fxp_acc_to_fxp32(&sum_c3);
   int abs_sw = (sw < 0) ? -sw : sw;
   if(abs_sw < 1) sw = (sw < 0) ? -1 : 1;
-  *o1 = fxp_div_q20(sc1, sw);
-  *o2 = fxp_div_q20(sc2, sw);
-  *o3 = fxp_div_q20(sc3, sw);
+  int oc1 = fxp_div_q20(sc1, sw);
+  int oc2 = fxp_div_q20(sc2, sw);
+  int oc3 = fxp_div_q20(sc3, sw);
+  if(cmax1>=cmin1){ if(oc1<cmin1)oc1=cmin1; else if(oc1>cmax1)oc1=cmax1; }
+  if(cmax2>=cmin2){ if(oc2<cmin2)oc2=cmin2; else if(oc2>cmax2)oc2=cmax2; }
+  if(cmax3>=cmin3){ if(oc3<cmin3)oc3=cmin3; else if(oc3>cmax3)oc3=cmax3; }
+  *o1 = oc1;
+  *o2 = oc2;
+  *o3 = oc3;
 }
 
 #endif  /* GALOSH_INT_P7_CLH */
