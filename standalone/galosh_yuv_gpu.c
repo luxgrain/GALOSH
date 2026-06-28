@@ -23,6 +23,15 @@
 
 
 /* ================================================================
+ * Pipeline-variant selector flag (= mirror of CPU --variant).
+ * Forward declared here so run_yuv_gat_gpu() (= defined below) can
+ * reference it; main() (= defined later) parses the CLI flag and
+ * sets it before calling run_yuv_gat_gpu.
+ * ================================================================ */
+static int g_galosh_yuv_q_gpu = 0;
+
+
+/* ================================================================
  * YUV-GAT mode: linear-domain Y-GAT + Y-driven chroma VST
  *
  * EN: Full GALOSH pipeline for sRGB inputs. Converts sRGB → linear
@@ -84,6 +93,16 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
      *   3) apply_x          : 1D x-pass over (a, b) coefficient planes
      *   4) apply_y          : 1D y-pass + output = mean_a·Y + mean_b
      * Reduces per-pixel work from O((2r+1)²)=225 to O(2·(2r+1))=30 at r=7. */
+    /* Step 7 chroma: replaced separable mean-only guided filter with a single
+     * non-separable bilateral LOESS kernel that mirrors CPU
+     * galosh_loess_chroma — adds exp(-(Y_i-Y_c)²/2σ²) bilateral weighting
+     * which excludes specular highlights (e.g. silver windows) from the
+     * regression.  CPU bench shows this is the chroma denoise path that
+     * GALOSH_YUV_G adopts; the legacy 4-kernel separable pipeline (mean-
+     * only, no bilateral) was a GPU shortcut that diverged from CPU. */
+    cl_kernel k_guided_loess = NULL;
+    /* Legacy 4-kernel separable pipeline kept declared so the existing buffer
+     * allocations + cleanup compile unchanged; not registered any more. */
     cl_kernel k_guided_moments_x   = NULL;
     cl_kernel k_guided_moments_yab = NULL;
     cl_kernel k_guided_apply_x     = NULL;
@@ -106,6 +125,36 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     cl_mem dark_hist_buf = NULL, lap_hist_buf = NULL;
     cl_mem params_buf = NULL;
     cl_mem lut_d_buf = NULL, lut_x_buf = NULL, lut_params_buf = NULL;
+    /* [LATEST: GALOSH_YUV_Q] chroma pyramid buffers (FP16 throughout
+     * to honor the LDS ≤ 32KB / FP16 strict embedded constraint).
+     * Allocated lazily when g_galosh_yuv_q_gpu is set; remain NULL
+     * for the [LATEST: GALOSH_YUV_O] path. */
+    cl_mem q_y_snap_f = NULL;       /* FP32 snapshot of pre-LOSH Y_stab */
+    cl_mem q_y_h16 = NULL;          /* full-res Y_stab guide, FP16 */
+    cl_mem q_cb_h16 = NULL, q_cr_h16 = NULL;       /* full-res input Cb/Cr, FP16 */
+    cl_mem q_cb_full_d = NULL, q_cr_full_d = NULL; /* Anchor 0 output, FP16 */
+    cl_mem q_dummy_full = NULL, q_dummy_h = NULL, q_dummy_q = NULL;
+    cl_mem q_dummy_kfh = NULL, q_dummy_kfq = NULL;
+    /* half-res */
+    cl_mem q_y_half = NULL, q_cb_half = NULL, q_cr_half = NULL;
+    cl_mem q_cb_half_d = NULL, q_cr_half_d = NULL;
+    cl_mem q_y_for_h = NULL;
+    cl_mem q_cb_h_up_raw = NULL, q_cr_h_up_raw = NULL;
+    cl_mem q_cb_h_up = NULL, q_cr_h_up = NULL;
+    /* quarter-res */
+    cl_mem q_y_qrt = NULL, q_cb_qrt = NULL, q_cr_qrt = NULL;
+    cl_mem q_cb_qrt_d = NULL, q_cr_qrt_d = NULL;
+    cl_mem q_y_for_q = NULL;
+    cl_mem q_cb_q_to_h_raw = NULL, q_cr_q_to_h_raw = NULL;
+    cl_mem q_cb_q_to_h = NULL, q_cr_q_to_h = NULL;
+    cl_mem q_cb_q_up_raw = NULL, q_cr_q_up_raw = NULL;
+    cl_mem q_cb_q_up = NULL, q_cr_q_up = NULL;
+    /* smoothstep blend output (FP16) + FP32 conversion buffers */
+    cl_mem q_cb_blend = NULL, q_cr_blend = NULL;
+    cl_mem q_cb_blend_f = NULL, q_cr_blend_f = NULL;
+    /* smoothstep blend kernel handle (= reused from §4) */
+    cl_kernel k_o_smoothstep_3p = NULL;
+    /* explicit f2h/h2f for chroma planes (= existing k_f2h, k_h2f). */
 
     /* Platform / device enumeration */
     err = clGetPlatformIDs(8, platforms, &n_plat);
@@ -188,10 +237,39 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     YG_KERNEL(k_lut_fin,      "galosh_lut_finalize");         /* from fused.cl */
     YG_KERNEL(k_makitalo,     "galosh_yuv_makitalo_inverse_Y");
     YG_KERNEL(k_fused,        "galosh_fused_pass12");         /* from fused.cl */
-    YG_KERNEL(k_guided_moments_x,   "galosh_yuv_guided_moments_x");
-    YG_KERNEL(k_guided_moments_yab, "galosh_yuv_guided_moments_y_ab");
-    YG_KERNEL(k_guided_apply_x,     "galosh_yuv_guided_apply_x");
-    YG_KERNEL(k_guided_apply_y,     "galosh_yuv_guided_apply_y");
+    YG_KERNEL(k_guided_loess,       "galosh_yuv_guided_loess");
+    /* Separable guided-filter kernels: still present in galosh.cl for
+     * archived bench reproduction but no longer used by the production
+     * GALOSH_YUV_G pipeline. */
+
+    /* [LATEST: GALOSH_YUV_Q] Q-variant kernels — Laplacian-MAD σ +
+     * unified_sigma normalize + chroma pyramid via reused galosh_o_*
+     * kernels (= mirror of RAW O Phase 7-9). */
+    cl_kernel k_q_lap_mad     = NULL;
+    cl_kernel k_q_synth_alpha = NULL;
+    cl_kernel k_q_norm        = NULL;
+    cl_kernel k_q_denorm      = NULL;
+    cl_kernel k_o_box_3p      = NULL;
+    cl_kernel k_o_loess_3p    = NULL;
+    cl_kernel k_o_k16_3p      = NULL;
+    cl_kernel k_o_pad         = NULL;
+    cl_kernel k_o_crop        = NULL;
+    /* MAD noise-est kernels created UNCONDITIONALLY: the default (GAT) mode now uses
+     * the Laplacian-MAD path too (matches canonical CPU YUV_G; the block-mean/var
+     * regression floors/underestimates on single-plane Y — see noise-est block). */
+    YG_KERNEL(k_q_lap_mad,      "galosh_yuv_q_lap_mad");
+    YG_KERNEL(k_q_synth_alpha,  "galosh_yuv_q_synth_alpha_sigma_sq");
+    if(g_galosh_yuv_q_gpu)
+    {
+        YG_KERNEL(k_q_norm,         "galosh_yuv_q_unified_sigma_norm");
+        YG_KERNEL(k_q_denorm,       "galosh_yuv_q_unified_sigma_denorm");
+        YG_KERNEL(k_o_box_3p,       "galosh_o_box_downsample_2x_3p");
+        YG_KERNEL(k_o_loess_3p,     "galosh_o_loess_chroma_3p_fp16_tiled");
+        YG_KERNEL(k_o_k16_3p,       "galosh_o_k16_joint_bilateral_upsample_3p");
+        YG_KERNEL(k_o_pad,          "galosh_o_pad_2d_edge");
+        YG_KERNEL(k_o_crop,         "galosh_o_crop_2d_topleft");
+        YG_KERNEL(k_o_smoothstep_3p,"galosh_o_smoothstep_blend_3p");
+    }
 #undef YG_KERNEL
 
     /* --- Allocate GPU buffers --- */
@@ -241,6 +319,81 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
         if(err) { fprintf(stderr, "[YUV_GAT] alloc lut bufs err=%d\n", err); goto yg_cleanup; }
     }
 
+    /* [LATEST: GALOSH_YUV_Q] FP16 chroma pyramid buffer alloc.
+     * gat_box_downsample_2x convention: dw = sw/2 (floor); pyramid
+     * uses /2 dimensions for half/quarter scales.  K16 stride
+     * correction via galosh_o_pad_2d_edge / galosh_o_crop_2d_topleft. */
+    if(g_galosh_yuv_q_gpu)
+    {
+        const int hw = width  / 2;
+        const int hh = height / 2;
+        const int qw = hw / 2;
+        const int qh = hh / 2;
+        const int kfw_half = 2 * hw;
+        const int kfh_half = 2 * hh;
+        const int kfw_q    = 2 * qw;
+        const int kfh_q    = 2 * qh;
+        const size_t fb = npix * sizeof(float);
+        const size_t hb = npix * sizeof(cl_half);
+        const size_t hh_h_sz = (size_t)hw * hh * sizeof(cl_half);
+        const size_t hh_q_sz = (size_t)qw * qh * sizeof(cl_half);
+        const size_t hh_kfh  = (size_t)kfw_half * kfh_half * sizeof(cl_half);
+        const size_t hh_kfq  = (size_t)kfw_q    * kfh_q    * sizeof(cl_half);
+
+        q_y_snap_f = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        q_y_h16    = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cb_h16   = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cr_h16   = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cb_full_d = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cr_full_d = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_dummy_full = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_dummy_h    = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_dummy_q    = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_q_sz, NULL, &err);
+        q_dummy_kfh  = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfh, NULL, &err);
+        q_dummy_kfq  = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfq, NULL, &err);
+
+        q_y_half  = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_cb_half = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_cr_half = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_cb_half_d = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_cr_half_d = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_y_for_h     = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfh, NULL, &err);
+        q_cb_h_up_raw = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfh, NULL, &err);
+        q_cr_h_up_raw = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfh, NULL, &err);
+        q_cb_h_up     = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cr_h_up     = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+
+        q_y_qrt     = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_q_sz, NULL, &err);
+        q_cb_qrt    = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_q_sz, NULL, &err);
+        q_cr_qrt    = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_q_sz, NULL, &err);
+        q_cb_qrt_d  = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_q_sz, NULL, &err);
+        q_cr_qrt_d  = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_q_sz, NULL, &err);
+        q_y_for_q   = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfq, NULL, &err);
+        q_cb_q_to_h_raw = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfq, NULL, &err);
+        q_cr_q_to_h_raw = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfq, NULL, &err);
+        q_cb_q_to_h     = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_cr_q_to_h     = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_h_sz, NULL, &err);
+        q_cb_q_up_raw   = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfh, NULL, &err);
+        q_cr_q_up_raw   = clCreateBuffer(context, CL_MEM_READ_WRITE, hh_kfh, NULL, &err);
+        q_cb_q_up       = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cr_q_up       = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+
+        q_cb_blend   = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cr_blend   = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        q_cb_blend_f = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        q_cr_blend_f = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+
+        if(err) { fprintf(stderr, "[YUV_Q] chroma pyramid buf alloc err=%d\n", err); goto yg_cleanup; }
+
+        /* Zero-fill the dummy buffers (= K16/box/LOESS 3p require 3rd channel). */
+        cl_half hzero = 0;
+        clEnqueueFillBuffer(queue, q_dummy_full, &hzero, sizeof(cl_half), 0, hb,      0, NULL, NULL);
+        clEnqueueFillBuffer(queue, q_dummy_h,    &hzero, sizeof(cl_half), 0, hh_h_sz, 0, NULL, NULL);
+        clEnqueueFillBuffer(queue, q_dummy_q,    &hzero, sizeof(cl_half), 0, hh_q_sz, 0, NULL, NULL);
+        clEnqueueFillBuffer(queue, q_dummy_kfh,  &hzero, sizeof(cl_half), 0, hh_kfh,  0, NULL, NULL);
+        clEnqueueFillBuffer(queue, q_dummy_kfq,  &hzero, sizeof(cl_half), 0, hh_kfq,  0, NULL, NULL);
+    }
+
     /* --- Upload sRGB data + init params --- */
     clEnqueueWriteBuffer(queue, srgb_buf, CL_FALSE, 0,
                          3 * npix * sizeof(float), srgb, 0, NULL, NULL);
@@ -268,8 +421,46 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     dispatch_1d_named(queue, k_srgb2ycbcr, align_up(npix, 256), 256, "YG1 srgb2ycbcr");
 
     /* ================================================================
-     * Phase 2: Y blind noise estimation (Foi+Alenius 2008)
+     * Phase 2: Y blind noise estimation.
+     *
+     * [LATEST: GALOSH_YUV_O] (default) — Foi+Alenius 2008 block-based.
+     * [LATEST: GALOSH_YUV_Q] (--variant=q) — Laplacian-MAD on Y plane,
+     *   matching CPU galosh_yuv_cpu --variant=q.  Single-workgroup
+     *   histogram median; output σ_lin → params[P_YG_SIGMA_Y], then
+     *   synth_alpha derives α/σ² → params[P_ALPHA] / params[P_SIGMA_SQ].
      * ================================================================ */
+    /* Noise est = Laplacian-MAD → synth α/σ², which MATCHES the canonical CPU
+     * galosh_yuv_cpu (YUV_G): GPU-MAD α≈0.00177 vs CPU 0.00170 (verified 2026-06-28).
+     * The legacy block-mean/var Foi-Alenius regression (else branch below, reusing
+     * the RAW-Bayer galosh_noise_estimate kernel) FLOORS / systematically
+     * underestimates on the SINGLE-PLANE Y (α=1e-4 floor on small frames, 0.0006 vs
+     * CPU 0.0021 on full frames) → GPU under-denoised by ~4.6 dB.  Both default and
+     * --variant=q now use the MAD path; the block path is kept [DEPRECATED]. */
+    if(1)  /* was: if(g_galosh_yuv_q_gpu) */
+    {
+        /* Q Stage 1: Laplacian-MAD on linear Y → σ_lin. */
+        const int x_stride = 3;
+        const float lap_max = 0.5f;       /* clip range for linear-domain Y */
+        const int sigma_idx = P_YG_SIGMA_Y;
+        clSetKernelArg(k_q_lap_mad, 0, sizeof(cl_mem), &y_buf);
+        clSetKernelArg(k_q_lap_mad, 1, sizeof(int), &width);
+        clSetKernelArg(k_q_lap_mad, 2, sizeof(int), &height);
+        clSetKernelArg(k_q_lap_mad, 3, sizeof(int), &x_stride);
+        clSetKernelArg(k_q_lap_mad, 4, sizeof(float), &lap_max);
+        clSetKernelArg(k_q_lap_mad, 5, sizeof(int), &sigma_idx);
+        clSetKernelArg(k_q_lap_mad, 6, sizeof(cl_mem), &params_buf);
+        dispatch_1d_named(queue, k_q_lap_mad, 64, 64, "YGQ2a lap_mad_lin");
+
+        /* Q Stage 1 derive α/σ² from σ_lin (= synthetic, matches CPU). */
+        const int alpha_idx    = P_ALPHA;
+        const int sigma_sq_idx = P_SIGMA_SQ;
+        clSetKernelArg(k_q_synth_alpha, 0, sizeof(cl_mem), &params_buf);
+        clSetKernelArg(k_q_synth_alpha, 1, sizeof(int), &sigma_idx);
+        clSetKernelArg(k_q_synth_alpha, 2, sizeof(int), &alpha_idx);
+        clSetKernelArg(k_q_synth_alpha, 3, sizeof(int), &sigma_sq_idx);
+        dispatch_1d_named(queue, k_q_synth_alpha, 1, 0, "YGQ2b synth_alpha");
+    }
+    else
     {
         const int ne_n_bx = width / 16;
         const int ne_n_by = height / 16;
@@ -345,7 +536,8 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
                             PARAMS_SIZE * sizeof(float), est, 0, NULL, NULL);
         alpha_y    = est[P_ALPHA];
         sigma_sq_y = est[P_SIGMA_SQ];
-        fprintf(stderr, "[YUV_GAT] Blind est: alpha=%.6f sigma_sq=%.8f\n",
+        fprintf(stderr, "[YUV_%s] Blind est: alpha=%.6f sigma_sq=%.8f\n",
+                g_galosh_yuv_q_gpu ? "Q" : "GAT",
                 alpha_y, sigma_sq_y);
     }
 
@@ -364,6 +556,39 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     clSetKernelArg(k_gat_fwd, 2, sizeof(cl_mem), &params_buf);
     clSetKernelArg(k_gat_fwd, 3, sizeof(int), &npix_i);
     dispatch_1d_named(queue, k_gat_fwd, align_up(npix, 256), 256, "YG4a gat_fwd");
+
+    /* 4a': [LATEST: GALOSH_YUV_Q] Stage 2 unified_sigma normalize.
+     * Mirrors CPU galosh_yuv_cpu Stage 2: Laplacian-MAD on Y_stab →
+     * σ_gat → divide Y_stab by σ_gat for unit-variance in GAT space.
+     * Skipped for GALOSH_YUV_O (= the Foi-Alenius path doesn't have
+     * an analogous post-GAT scalar normalize). */
+    if(g_galosh_yuv_q_gpu)
+    {
+        const int x_stride = 3;
+        const float lap_max = 8.0f;       /* clip range for GAT-domain σ ≈ 1 */
+        const int sigma_gat_idx = P_YG_SIGMA_CB; /* repurposed slot for σ_gat */
+        clSetKernelArg(k_q_lap_mad, 0, sizeof(cl_mem), &y_stab_buf);
+        clSetKernelArg(k_q_lap_mad, 1, sizeof(int), &width);
+        clSetKernelArg(k_q_lap_mad, 2, sizeof(int), &height);
+        clSetKernelArg(k_q_lap_mad, 3, sizeof(int), &x_stride);
+        clSetKernelArg(k_q_lap_mad, 4, sizeof(float), &lap_max);
+        clSetKernelArg(k_q_lap_mad, 5, sizeof(int), &sigma_gat_idx);
+        clSetKernelArg(k_q_lap_mad, 6, sizeof(cl_mem), &params_buf);
+        dispatch_1d_named(queue, k_q_lap_mad, 64, 64, "YGQ4a' lap_mad_gat");
+
+        clSetKernelArg(k_q_norm, 0, sizeof(cl_mem), &y_stab_buf);
+        clSetKernelArg(k_q_norm, 1, sizeof(cl_mem), &params_buf);
+        clSetKernelArg(k_q_norm, 2, sizeof(int), &sigma_gat_idx);
+        clSetKernelArg(k_q_norm, 3, sizeof(int), &npix_i);
+        dispatch_1d_named(queue, k_q_norm, align_up(npix, 256), 256, "YGQ4a'' unified_sigma_norm");
+
+        /* Snapshot post-unified_sigma, pre-LOSH Y_stab for chroma path
+         * (= mirrors CPU Q which uses Y_stab as guide; Phase 4f LOSH
+         * overwrites y_stab_buf via h2f, so we need this snapshot
+         * before Phase 4b f2h consumes it). */
+        clEnqueueCopyBuffer(queue, y_stab_buf, q_y_snap_f, 0, 0,
+                            npix * sizeof(float), 0, NULL, NULL);
+    }
 
     /* 4b: float → half */
     clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &y_stab_buf);
@@ -406,6 +631,21 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     clSetKernelArg(k_h2f, 2, sizeof(int), &npix_i);
     dispatch_1d_named(queue, k_h2f, align_up(npix, 256), 256, "YG4g h2f_Y");
 
+    /* 4g': [LATEST: GALOSH_YUV_Q] denormalize Y_stab by unified_sigma
+     * before Makitalo (= mirrors CPU `gat_inverse_exact(Y_den * unified_sigma)`).
+     * Stage 2 normalize divided Y_stab by σ_gat to give unit variance for LOSH;
+     * the inverse GAT operates on the original GAT-domain scale, so we
+     * multiply by σ_gat here to undo the normalization. */
+    if(g_galosh_yuv_q_gpu)
+    {
+        const int sigma_gat_idx = P_YG_SIGMA_CB;
+        clSetKernelArg(k_q_denorm, 0, sizeof(cl_mem), &y_stab_buf);
+        clSetKernelArg(k_q_denorm, 1, sizeof(cl_mem), &params_buf);
+        clSetKernelArg(k_q_denorm, 2, sizeof(int), &sigma_gat_idx);
+        clSetKernelArg(k_q_denorm, 3, sizeof(int), &npix_i);
+        dispatch_1d_named(queue, k_q_denorm, align_up(npix, 256), 256, "YGQ4g' denorm");
+    }
+
     /* 4h: Makitalo-Foi inverse GAT */
     clSetKernelArg(k_makitalo, 0, sizeof(cl_mem), &y_stab_buf);
     clSetKernelArg(k_makitalo, 1, sizeof(cl_mem), &y_buf);   /* overwrite with denoised Y */
@@ -433,73 +673,316 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
      *   scale_cr_buf ← b_Cr
      * Final output lands in cb_biv_buf / cr_biv_buf for ycbcr2srgb.
      * ================================================================ */
-    /* Step 1: moments_x — 1D x-pass writes 6 intermediate sum buffers. */
-    clSetKernelArg(k_guided_moments_x,  0, sizeof(cl_mem), &y_buf);
-    clSetKernelArg(k_guided_moments_x,  1, sizeof(cl_mem), &cb_buf);
-    clSetKernelArg(k_guided_moments_x,  2, sizeof(cl_mem), &cr_buf);
-    clSetKernelArg(k_guided_moments_x,  3, sizeof(cl_mem), &gf_sum_Y_x);
-    clSetKernelArg(k_guided_moments_x,  4, sizeof(cl_mem), &gf_sum_YY_x);
-    clSetKernelArg(k_guided_moments_x,  5, sizeof(cl_mem), &gf_sum_Cb_x);
-    clSetKernelArg(k_guided_moments_x,  6, sizeof(cl_mem), &gf_sum_Cr_x);
-    clSetKernelArg(k_guided_moments_x,  7, sizeof(cl_mem), &gf_sum_YCb_x);
-    clSetKernelArg(k_guided_moments_x,  8, sizeof(cl_mem), &gf_sum_YCr_x);
-    clSetKernelArg(k_guided_moments_x,  9, sizeof(int),    &width);
-    clSetKernelArg(k_guided_moments_x, 10, sizeof(int),    &height);
-    dispatch_2d_named(queue, k_guided_moments_x,
-                      align_up(width, 16), align_up(height, 16),
-                      16, 16, "YG5a moments_x");
+    cl_mem cb_final = NULL;
+    cl_mem cr_final = NULL;
+    /* Mark legacy separable kernels as intentionally unused. */
+    (void)k_guided_moments_x; (void)k_guided_moments_yab;
+    (void)k_guided_apply_x;   (void)k_guided_apply_y;
 
-    /* Step 2: moments_y + (a, b) — 1D y-pass + local linear regression. */
-    clSetKernelArg(k_guided_moments_yab,  0, sizeof(cl_mem), &gf_sum_Y_x);
-    clSetKernelArg(k_guided_moments_yab,  1, sizeof(cl_mem), &gf_sum_YY_x);
-    clSetKernelArg(k_guided_moments_yab,  2, sizeof(cl_mem), &gf_sum_Cb_x);
-    clSetKernelArg(k_guided_moments_yab,  3, sizeof(cl_mem), &gf_sum_Cr_x);
-    clSetKernelArg(k_guided_moments_yab,  4, sizeof(cl_mem), &gf_sum_YCb_x);
-    clSetKernelArg(k_guided_moments_yab,  5, sizeof(cl_mem), &gf_sum_YCr_x);
-    clSetKernelArg(k_guided_moments_yab,  6, sizeof(cl_mem), &y_buf);
-    clSetKernelArg(k_guided_moments_yab,  7, sizeof(cl_mem), &params_buf);
-    clSetKernelArg(k_guided_moments_yab,  8, sizeof(float),  &strength_c);
-    clSetKernelArg(k_guided_moments_yab,  9, sizeof(cl_mem), &cb_stab_buf);   /* a_Cb */
-    clSetKernelArg(k_guided_moments_yab, 10, sizeof(cl_mem), &scale_cb_buf);  /* b_Cb */
-    clSetKernelArg(k_guided_moments_yab, 11, sizeof(cl_mem), &cr_stab_buf);   /* a_Cr */
-    clSetKernelArg(k_guided_moments_yab, 12, sizeof(cl_mem), &scale_cr_buf);  /* b_Cr */
-    clSetKernelArg(k_guided_moments_yab, 13, sizeof(int),    &width);
-    clSetKernelArg(k_guided_moments_yab, 14, sizeof(int),    &height);
-    dispatch_2d_named(queue, k_guided_moments_yab,
-                      align_up(width, 16), align_up(height, 16),
-                      16, 16, "YG5b moments_y_ab");
+    if(g_galosh_yuv_q_gpu)
+    {
+        /* ============================================================
+         * [LATEST: GALOSH_YUV_Q] Phase 5 — multi-scale chroma pyramid.
+         *
+         * 3 anchors with smoothstep slider walk (cs ∈ [0, 3]):
+         *   anchor 0: noisy  (= cb_buf / cr_buf, raw input, no denoise)
+         *   anchor 1: C_full (= LOESS at full-res with Y_stab guide)
+         *   anchor 2: C_h_up (= half-res LOESS + EWA Jinc up to full)
+         *   anchor 3: C_q_up (= quarter-res LOESS + 2 K16 ups to full)
+         *
+         * Lazy compute: skip anchors not adjacent to current cs segment.
+         * cs=1.0 (= calibrated default) → only anchor 1 (= C_full).
+         *
+         * FP16 throughout (= LDS ≤ 32KB constraint, mirrors RAW O port).
+         * Reuses §4 galosh_o_* kernels (= scale-agnostic, work for both
+         * RAW O's half-base pyramid and YUV Q's full-base pyramid).
+         * ============================================================ */
+        const int hw = width  / 2;
+        const int hh = height / 2;
+        const int qw = hw / 2;
+        const int qh = hh / 2;
+        const int kfw_half = 2 * hw;
+        const int kfh_half = 2 * hh;
+        const int kfw_q    = 2 * qw;
+        const int kfh_q    = 2 * qh;
 
-    /* Step 3: apply_x — 1D x-pass over (a, b) coefficient planes. */
-    clSetKernelArg(k_guided_apply_x, 0, sizeof(cl_mem), &cb_stab_buf);
-    clSetKernelArg(k_guided_apply_x, 1, sizeof(cl_mem), &scale_cb_buf);
-    clSetKernelArg(k_guided_apply_x, 2, sizeof(cl_mem), &cr_stab_buf);
-    clSetKernelArg(k_guided_apply_x, 3, sizeof(cl_mem), &scale_cr_buf);
-    clSetKernelArg(k_guided_apply_x, 4, sizeof(cl_mem), &gf_a_cb_x);
-    clSetKernelArg(k_guided_apply_x, 5, sizeof(cl_mem), &gf_b_cb_x);
-    clSetKernelArg(k_guided_apply_x, 6, sizeof(cl_mem), &gf_a_cr_x);
-    clSetKernelArg(k_guided_apply_x, 7, sizeof(cl_mem), &gf_b_cr_x);
-    clSetKernelArg(k_guided_apply_x, 8, sizeof(int),    &width);
-    clSetKernelArg(k_guided_apply_x, 9, sizeof(int),    &height);
-    dispatch_2d_named(queue, k_guided_apply_x,
-                      align_up(width, 16), align_up(height, 16),
-                      16, 16, "YG5c apply_x");
+        const float cs = (strength_c < 0.0f) ? 0.0f
+                       : (strength_c > 3.0f) ? 3.0f : strength_c;
+        const int need_full = (cs <= 2.0f);  /* segments 1, 2 */
+        const int need_h_up = (cs >  1.0f);  /* segments 2, 3 */
+        const int need_q_up = (cs >  2.0f);  /* segment 3 */
 
-    /* Step 4: apply_y — 1D y-pass + output = mean_a·Y + mean_b. */
-    clSetKernelArg(k_guided_apply_y, 0, sizeof(cl_mem), &gf_a_cb_x);
-    clSetKernelArg(k_guided_apply_y, 1, sizeof(cl_mem), &gf_b_cb_x);
-    clSetKernelArg(k_guided_apply_y, 2, sizeof(cl_mem), &gf_a_cr_x);
-    clSetKernelArg(k_guided_apply_y, 3, sizeof(cl_mem), &gf_b_cr_x);
-    clSetKernelArg(k_guided_apply_y, 4, sizeof(cl_mem), &y_buf);
-    clSetKernelArg(k_guided_apply_y, 5, sizeof(cl_mem), &cb_biv_buf);
-    clSetKernelArg(k_guided_apply_y, 6, sizeof(cl_mem), &cr_biv_buf);
-    clSetKernelArg(k_guided_apply_y, 7, sizeof(int),    &width);
-    clSetKernelArg(k_guided_apply_y, 8, sizeof(int),    &height);
-    dispatch_2d_named(queue, k_guided_apply_y,
-                      align_up(width, 16), align_up(height, 16),
-                      16, 16, "YG5d apply_y");
+        /* Convert Y_stab snap + Cb + Cr from FP32 to FP16. */
+        clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &q_y_snap_f);
+        clSetKernelArg(k_f2h, 1, sizeof(cl_mem), &q_y_h16);
+        clSetKernelArg(k_f2h, 2, sizeof(int), &npix_i);
+        dispatch_1d_named(queue, k_f2h, align_up(npix, 256), 256, "YGQ5a f2h_Y");
+        clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &cb_buf);
+        clSetKernelArg(k_f2h, 1, sizeof(cl_mem), &q_cb_h16);
+        clSetKernelArg(k_f2h, 2, sizeof(int), &npix_i);
+        dispatch_1d_named(queue, k_f2h, align_up(npix, 256), 256, "YGQ5b f2h_Cb");
+        clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &cr_buf);
+        clSetKernelArg(k_f2h, 1, sizeof(cl_mem), &q_cr_h16);
+        clSetKernelArg(k_f2h, 2, sizeof(int), &npix_i);
+        dispatch_1d_named(queue, k_f2h, align_up(npix, 256), 256, "YGQ5c f2h_Cr");
 
-    cl_mem cb_final = cb_biv_buf;
-    cl_mem cr_final = cr_biv_buf;
+        /* Anchor 1: full-res LOESS (= equivalent to CPU C_full). */
+        if(need_full)
+        {
+            clSetKernelArg(k_o_loess_3p, 0, sizeof(cl_mem), &q_y_h16);
+            clSetKernelArg(k_o_loess_3p, 1, sizeof(cl_mem), &q_cb_h16);
+            clSetKernelArg(k_o_loess_3p, 2, sizeof(cl_mem), &q_cr_h16);
+            clSetKernelArg(k_o_loess_3p, 3, sizeof(cl_mem), &q_dummy_full);
+            clSetKernelArg(k_o_loess_3p, 4, sizeof(cl_mem), &q_cb_full_d);
+            clSetKernelArg(k_o_loess_3p, 5, sizeof(cl_mem), &q_cr_full_d);
+            clSetKernelArg(k_o_loess_3p, 6, sizeof(cl_mem), &q_dummy_full);
+            clSetKernelArg(k_o_loess_3p, 7, sizeof(int),    &width);
+            clSetKernelArg(k_o_loess_3p, 8, sizeof(int),    &height);
+            const float scs = 1.0f;
+            clSetKernelArg(k_o_loess_3p, 9, sizeof(float),  &scs);
+            dispatch_2d_named(queue, k_o_loess_3p,
+                              align_up(width, 16), align_up(height, 16), 16, 16, "YGQ5d loess_full");
+        }
+
+        /* Anchor 2: half-res LOESS + EWA Jinc bilateral up to full. */
+        if(need_h_up)
+        {
+            /* Box-down full → half (3-channel: Y, Cb, Cr). */
+            clSetKernelArg(k_o_box_3p, 0, sizeof(cl_mem), &q_y_h16);
+            clSetKernelArg(k_o_box_3p, 1, sizeof(cl_mem), &q_cb_h16);
+            clSetKernelArg(k_o_box_3p, 2, sizeof(cl_mem), &q_cr_h16);
+            clSetKernelArg(k_o_box_3p, 3, sizeof(cl_mem), &q_y_half);
+            clSetKernelArg(k_o_box_3p, 4, sizeof(cl_mem), &q_cb_half);
+            clSetKernelArg(k_o_box_3p, 5, sizeof(cl_mem), &q_cr_half);
+            clSetKernelArg(k_o_box_3p, 6, sizeof(int),    &width);
+            clSetKernelArg(k_o_box_3p, 7, sizeof(int),    &height);
+            dispatch_2d_named(queue, k_o_box_3p,
+                              align_up(hw, 16), align_up(hh, 16), 16, 16, "YGQ5e box_full2half");
+
+            /* LOESS at half-res. */
+            clSetKernelArg(k_o_loess_3p, 0, sizeof(cl_mem), &q_y_half);
+            clSetKernelArg(k_o_loess_3p, 1, sizeof(cl_mem), &q_cb_half);
+            clSetKernelArg(k_o_loess_3p, 2, sizeof(cl_mem), &q_cr_half);
+            clSetKernelArg(k_o_loess_3p, 3, sizeof(cl_mem), &q_dummy_h);
+            clSetKernelArg(k_o_loess_3p, 4, sizeof(cl_mem), &q_cb_half_d);
+            clSetKernelArg(k_o_loess_3p, 5, sizeof(cl_mem), &q_cr_half_d);
+            clSetKernelArg(k_o_loess_3p, 6, sizeof(cl_mem), &q_dummy_h);
+            clSetKernelArg(k_o_loess_3p, 7, sizeof(int),    &hw);
+            clSetKernelArg(k_o_loess_3p, 8, sizeof(int),    &hh);
+            const float scs = 1.0f;
+            clSetKernelArg(k_o_loess_3p, 9, sizeof(float),  &scs);
+            dispatch_2d_named(queue, k_o_loess_3p,
+                              align_up(hw, 16), align_up(hh, 16), 16, 16, "YGQ5f loess_half");
+
+            /* Crop full-res Y_stab guide → kfw_half × kfh_half for K16 stride.
+             * Kernel sig: (src, dst, sw, sh, dw, dh) -- args 0..5 strict. */
+            clSetKernelArg(k_o_crop, 0, sizeof(cl_mem), &q_y_h16);     /* src */
+            clSetKernelArg(k_o_crop, 1, sizeof(cl_mem), &q_y_for_h);   /* dst */
+            clSetKernelArg(k_o_crop, 2, sizeof(int),    &width);        /* sw */
+            clSetKernelArg(k_o_crop, 3, sizeof(int),    &height);       /* sh */
+            clSetKernelArg(k_o_crop, 4, sizeof(int),    &kfw_half);     /* dw */
+            clSetKernelArg(k_o_crop, 5, sizeof(int),    &kfh_half);     /* dh */
+            dispatch_2d_named(queue, k_o_crop,
+                              align_up(kfw_half, 16), align_up(kfh_half, 16), 16, 16, "YGQ5g crop_Yh");
+
+            /* K16 EWA Jinc bilateral: half-res → full-res (kfw_half × kfh_half). */
+            const float bw = 3.0f;
+            clSetKernelArg(k_o_k16_3p, 0, sizeof(cl_mem), &q_cb_half_d);
+            clSetKernelArg(k_o_k16_3p, 1, sizeof(cl_mem), &q_cr_half_d);
+            clSetKernelArg(k_o_k16_3p, 2, sizeof(cl_mem), &q_dummy_h);
+            clSetKernelArg(k_o_k16_3p, 3, sizeof(cl_mem), &q_y_for_h);
+            clSetKernelArg(k_o_k16_3p, 4, sizeof(cl_mem), &q_cb_h_up_raw);
+            clSetKernelArg(k_o_k16_3p, 5, sizeof(cl_mem), &q_cr_h_up_raw);
+            clSetKernelArg(k_o_k16_3p, 6, sizeof(cl_mem), &q_dummy_kfh);
+            clSetKernelArg(k_o_k16_3p, 7, sizeof(int),    &hw);
+            clSetKernelArg(k_o_k16_3p, 8, sizeof(int),    &hh);
+            clSetKernelArg(k_o_k16_3p, 9, sizeof(float),  &bw);
+            dispatch_2d_named(queue, k_o_k16_3p,
+                              align_up(kfw_half, 16), align_up(kfh_half, 16), 16, 16, "YGQ5h k16_h2full");
+
+            /* Pad raw output to native full-res (width × height).
+             * Kernel sig: (src, dst, sw, sh, dw, dh) -- args 0..5 strict. */
+            clSetKernelArg(k_o_pad, 0, sizeof(cl_mem), &q_cb_h_up_raw);  /* src */
+            clSetKernelArg(k_o_pad, 1, sizeof(cl_mem), &q_cb_h_up);      /* dst */
+            clSetKernelArg(k_o_pad, 2, sizeof(int),    &kfw_half);        /* sw */
+            clSetKernelArg(k_o_pad, 3, sizeof(int),    &kfh_half);        /* sh */
+            clSetKernelArg(k_o_pad, 4, sizeof(int),    &width);           /* dw */
+            clSetKernelArg(k_o_pad, 5, sizeof(int),    &height);          /* dh */
+            dispatch_2d_named(queue, k_o_pad,
+                              align_up(width, 16), align_up(height, 16), 16, 16, "YGQ5i pad_Cb_h");
+            clSetKernelArg(k_o_pad, 0, sizeof(cl_mem), &q_cr_h_up_raw);  /* src */
+            clSetKernelArg(k_o_pad, 1, sizeof(cl_mem), &q_cr_h_up);      /* dst */
+            dispatch_2d_named(queue, k_o_pad,
+                              align_up(width, 16), align_up(height, 16), 16, 16, "YGQ5j pad_Cr_h");
+        }
+
+        /* Anchor 3: quarter-res LOESS + K16 q→h + K16 h→full. */
+        if(need_q_up)
+        {
+            /* Box-down half → quarter. */
+            clSetKernelArg(k_o_box_3p, 0, sizeof(cl_mem), &q_y_half);
+            clSetKernelArg(k_o_box_3p, 1, sizeof(cl_mem), &q_cb_half);
+            clSetKernelArg(k_o_box_3p, 2, sizeof(cl_mem), &q_cr_half);
+            clSetKernelArg(k_o_box_3p, 3, sizeof(cl_mem), &q_y_qrt);
+            clSetKernelArg(k_o_box_3p, 4, sizeof(cl_mem), &q_cb_qrt);
+            clSetKernelArg(k_o_box_3p, 5, sizeof(cl_mem), &q_cr_qrt);
+            clSetKernelArg(k_o_box_3p, 6, sizeof(int),    &hw);
+            clSetKernelArg(k_o_box_3p, 7, sizeof(int),    &hh);
+            dispatch_2d_named(queue, k_o_box_3p,
+                              align_up(qw, 16), align_up(qh, 16), 16, 16, "YGQ5k box_h2q");
+
+            /* LOESS at quarter-res. */
+            clSetKernelArg(k_o_loess_3p, 0, sizeof(cl_mem), &q_y_qrt);
+            clSetKernelArg(k_o_loess_3p, 1, sizeof(cl_mem), &q_cb_qrt);
+            clSetKernelArg(k_o_loess_3p, 2, sizeof(cl_mem), &q_cr_qrt);
+            clSetKernelArg(k_o_loess_3p, 3, sizeof(cl_mem), &q_dummy_q);
+            clSetKernelArg(k_o_loess_3p, 4, sizeof(cl_mem), &q_cb_qrt_d);
+            clSetKernelArg(k_o_loess_3p, 5, sizeof(cl_mem), &q_cr_qrt_d);
+            clSetKernelArg(k_o_loess_3p, 6, sizeof(cl_mem), &q_dummy_q);
+            clSetKernelArg(k_o_loess_3p, 7, sizeof(int),    &qw);
+            clSetKernelArg(k_o_loess_3p, 8, sizeof(int),    &qh);
+            const float scs = 1.0f;
+            clSetKernelArg(k_o_loess_3p, 9, sizeof(float),  &scs);
+            dispatch_2d_named(queue, k_o_loess_3p,
+                              align_up(qw, 16), align_up(qh, 16), 16, 16, "YGQ5l loess_qrt");
+
+            /* Crop half-res Y_stab → kfw_q × kfh_q for K16 q→h.
+             * Kernel sig: (src, dst, sw, sh, dw, dh) -- args 0..5 strict. */
+            clSetKernelArg(k_o_crop, 0, sizeof(cl_mem), &q_y_half);    /* src */
+            clSetKernelArg(k_o_crop, 1, sizeof(cl_mem), &q_y_for_q);   /* dst */
+            clSetKernelArg(k_o_crop, 2, sizeof(int),    &hw);           /* sw */
+            clSetKernelArg(k_o_crop, 3, sizeof(int),    &hh);           /* sh */
+            clSetKernelArg(k_o_crop, 4, sizeof(int),    &kfw_q);        /* dw */
+            clSetKernelArg(k_o_crop, 5, sizeof(int),    &kfh_q);        /* dh */
+            dispatch_2d_named(queue, k_o_crop,
+                              align_up(kfw_q, 16), align_up(kfh_q, 16), 16, 16, "YGQ5m crop_Yq");
+
+            /* K16 q→h. */
+            const float bw = 3.0f;
+            clSetKernelArg(k_o_k16_3p, 0, sizeof(cl_mem), &q_cb_qrt_d);
+            clSetKernelArg(k_o_k16_3p, 1, sizeof(cl_mem), &q_cr_qrt_d);
+            clSetKernelArg(k_o_k16_3p, 2, sizeof(cl_mem), &q_dummy_q);
+            clSetKernelArg(k_o_k16_3p, 3, sizeof(cl_mem), &q_y_for_q);
+            clSetKernelArg(k_o_k16_3p, 4, sizeof(cl_mem), &q_cb_q_to_h_raw);
+            clSetKernelArg(k_o_k16_3p, 5, sizeof(cl_mem), &q_cr_q_to_h_raw);
+            clSetKernelArg(k_o_k16_3p, 6, sizeof(cl_mem), &q_dummy_kfq);
+            clSetKernelArg(k_o_k16_3p, 7, sizeof(int),    &qw);
+            clSetKernelArg(k_o_k16_3p, 8, sizeof(int),    &qh);
+            clSetKernelArg(k_o_k16_3p, 9, sizeof(float),  &bw);
+            dispatch_2d_named(queue, k_o_k16_3p,
+                              align_up(kfw_q, 16), align_up(kfh_q, 16), 16, 16, "YGQ5n k16_q2h");
+
+            /* Pad raw q→h output (kfw_q × kfh_q) → half-res (hw × hh).
+             * Kernel sig: (src, dst, sw, sh, dw, dh) -- args 0..5 strict. */
+            clSetKernelArg(k_o_pad, 0, sizeof(cl_mem), &q_cb_q_to_h_raw); /* src */
+            clSetKernelArg(k_o_pad, 1, sizeof(cl_mem), &q_cb_q_to_h);     /* dst */
+            clSetKernelArg(k_o_pad, 2, sizeof(int),    &kfw_q);            /* sw */
+            clSetKernelArg(k_o_pad, 3, sizeof(int),    &kfh_q);            /* sh */
+            clSetKernelArg(k_o_pad, 4, sizeof(int),    &hw);               /* dw */
+            clSetKernelArg(k_o_pad, 5, sizeof(int),    &hh);               /* dh */
+            dispatch_2d_named(queue, k_o_pad,
+                              align_up(hw, 16), align_up(hh, 16), 16, 16, "YGQ5o pad_Cb_qh");
+            clSetKernelArg(k_o_pad, 0, sizeof(cl_mem), &q_cr_q_to_h_raw); /* src */
+            clSetKernelArg(k_o_pad, 1, sizeof(cl_mem), &q_cr_q_to_h);     /* dst */
+            dispatch_2d_named(queue, k_o_pad,
+                              align_up(hw, 16), align_up(hh, 16), 16, 16, "YGQ5p pad_Cr_qh");
+
+            /* K16 h→full (= reuses q_y_for_h crop computed in Anchor 2). */
+            clSetKernelArg(k_o_k16_3p, 0, sizeof(cl_mem), &q_cb_q_to_h);
+            clSetKernelArg(k_o_k16_3p, 1, sizeof(cl_mem), &q_cr_q_to_h);
+            clSetKernelArg(k_o_k16_3p, 2, sizeof(cl_mem), &q_dummy_h);
+            clSetKernelArg(k_o_k16_3p, 3, sizeof(cl_mem), &q_y_for_h);
+            clSetKernelArg(k_o_k16_3p, 4, sizeof(cl_mem), &q_cb_q_up_raw);
+            clSetKernelArg(k_o_k16_3p, 5, sizeof(cl_mem), &q_cr_q_up_raw);
+            clSetKernelArg(k_o_k16_3p, 6, sizeof(cl_mem), &q_dummy_kfh);
+            clSetKernelArg(k_o_k16_3p, 7, sizeof(int),    &hw);
+            clSetKernelArg(k_o_k16_3p, 8, sizeof(int),    &hh);
+            clSetKernelArg(k_o_k16_3p, 9, sizeof(float),  &bw);
+            dispatch_2d_named(queue, k_o_k16_3p,
+                              align_up(kfw_half, 16), align_up(kfh_half, 16), 16, 16, "YGQ5q k16_q2full");
+
+            /* Pad to full-res.
+             * Kernel sig: (src, dst, sw, sh, dw, dh) -- args 0..5 strict. */
+            clSetKernelArg(k_o_pad, 0, sizeof(cl_mem), &q_cb_q_up_raw);  /* src */
+            clSetKernelArg(k_o_pad, 1, sizeof(cl_mem), &q_cb_q_up);      /* dst */
+            clSetKernelArg(k_o_pad, 2, sizeof(int),    &kfw_half);        /* sw */
+            clSetKernelArg(k_o_pad, 3, sizeof(int),    &kfh_half);        /* sh */
+            clSetKernelArg(k_o_pad, 4, sizeof(int),    &width);           /* dw */
+            clSetKernelArg(k_o_pad, 5, sizeof(int),    &height);          /* dh */
+            dispatch_2d_named(queue, k_o_pad,
+                              align_up(width, 16), align_up(height, 16), 16, 16, "YGQ5r pad_Cb_q");
+            clSetKernelArg(k_o_pad, 0, sizeof(cl_mem), &q_cr_q_up_raw);  /* src */
+            clSetKernelArg(k_o_pad, 1, sizeof(cl_mem), &q_cr_q_up);      /* dst */
+            dispatch_2d_named(queue, k_o_pad,
+                              align_up(width, 16), align_up(height, 16), 16, 16, "YGQ5s pad_Cr_q");
+        }
+
+        /* Smoothstep walk blend: 4 anchors a/b/c/d ∈ {noisy, C_full, C_h_up, C_q_up}.
+         * Unused anchors fall back to existing buffers as no-op (= the kernel
+         * always reads all 4 anchor sources, so we point unused ones to
+         * computed anchors to avoid undefined behavior). */
+        cl_mem a_cb = q_cb_h16;
+        cl_mem a_cr = q_cr_h16;
+        cl_mem b_cb = need_full ? q_cb_full_d : a_cb;
+        cl_mem b_cr = need_full ? q_cr_full_d : a_cr;
+        cl_mem c_cb = need_h_up ? q_cb_h_up   : b_cb;
+        cl_mem c_cr = need_h_up ? q_cr_h_up   : b_cr;
+        cl_mem d_cb = need_q_up ? q_cb_q_up   : c_cb;
+        cl_mem d_cr = need_q_up ? q_cr_q_up   : c_cr;
+
+        /* Smoothstep blend (3-channel: Cb / Cr / dummy). */
+        clSetKernelArg(k_o_smoothstep_3p,  0, sizeof(cl_mem), &a_cb);
+        clSetKernelArg(k_o_smoothstep_3p,  1, sizeof(cl_mem), &a_cr);
+        clSetKernelArg(k_o_smoothstep_3p,  2, sizeof(cl_mem), &q_dummy_full);
+        clSetKernelArg(k_o_smoothstep_3p,  3, sizeof(cl_mem), &b_cb);
+        clSetKernelArg(k_o_smoothstep_3p,  4, sizeof(cl_mem), &b_cr);
+        clSetKernelArg(k_o_smoothstep_3p,  5, sizeof(cl_mem), &q_dummy_full);
+        clSetKernelArg(k_o_smoothstep_3p,  6, sizeof(cl_mem), &c_cb);
+        clSetKernelArg(k_o_smoothstep_3p,  7, sizeof(cl_mem), &c_cr);
+        clSetKernelArg(k_o_smoothstep_3p,  8, sizeof(cl_mem), &q_dummy_full);
+        clSetKernelArg(k_o_smoothstep_3p,  9, sizeof(cl_mem), &d_cb);
+        clSetKernelArg(k_o_smoothstep_3p, 10, sizeof(cl_mem), &d_cr);
+        clSetKernelArg(k_o_smoothstep_3p, 11, sizeof(cl_mem), &q_dummy_full);
+        clSetKernelArg(k_o_smoothstep_3p, 12, sizeof(cl_mem), &q_cb_blend);
+        clSetKernelArg(k_o_smoothstep_3p, 13, sizeof(cl_mem), &q_cr_blend);
+        clSetKernelArg(k_o_smoothstep_3p, 14, sizeof(cl_mem), &q_dummy_full);
+        clSetKernelArg(k_o_smoothstep_3p, 15, sizeof(int),    &width);
+        clSetKernelArg(k_o_smoothstep_3p, 16, sizeof(int),    &height);
+        clSetKernelArg(k_o_smoothstep_3p, 17, sizeof(float),  &cs);
+        dispatch_2d_named(queue, k_o_smoothstep_3p,
+                          align_up(width, 16), align_up(height, 16), 16, 16, "YGQ5t smoothstep");
+
+        /* Convert blend output FP16 → FP32 for ycbcr2srgb consumption. */
+        clSetKernelArg(k_h2f, 0, sizeof(cl_mem), &q_cb_blend);
+        clSetKernelArg(k_h2f, 1, sizeof(cl_mem), &q_cb_blend_f);
+        clSetKernelArg(k_h2f, 2, sizeof(int),    &npix_i);
+        dispatch_1d_named(queue, k_h2f, align_up(npix, 256), 256, "YGQ5u h2f_Cb");
+        clSetKernelArg(k_h2f, 0, sizeof(cl_mem), &q_cr_blend);
+        clSetKernelArg(k_h2f, 1, sizeof(cl_mem), &q_cr_blend_f);
+        clSetKernelArg(k_h2f, 2, sizeof(int),    &npix_i);
+        dispatch_1d_named(queue, k_h2f, align_up(npix, 256), 256, "YGQ5v h2f_Cr");
+
+        cb_final = q_cb_blend_f;
+        cr_final = q_cr_blend_f;
+    }
+    else
+    {
+        /* GALOSH_YUV_O chroma: single-pass non-separable bilateral LOESS. */
+        clSetKernelArg(k_guided_loess, 0, sizeof(cl_mem), &y_buf);
+        clSetKernelArg(k_guided_loess, 1, sizeof(cl_mem), &cb_buf);
+        clSetKernelArg(k_guided_loess, 2, sizeof(cl_mem), &cr_buf);
+        clSetKernelArg(k_guided_loess, 3, sizeof(cl_mem), &params_buf);
+        clSetKernelArg(k_guided_loess, 4, sizeof(float),  &strength_c);
+        clSetKernelArg(k_guided_loess, 5, sizeof(cl_mem), &cb_biv_buf);
+        clSetKernelArg(k_guided_loess, 6, sizeof(cl_mem), &cr_biv_buf);
+        clSetKernelArg(k_guided_loess, 7, sizeof(int),    &width);
+        clSetKernelArg(k_guided_loess, 8, sizeof(int),    &height);
+        dispatch_2d_named(queue, k_guided_loess,
+                          align_up(width, 16), align_up(height, 16),
+                          16, 16, "YG5 loess_bilateral");
+        cb_final = cb_biv_buf;
+        cr_final = cr_biv_buf;
+    }
 
     /* ================================================================
      * Phase 9: YCbCr → sRGB
@@ -575,6 +1058,8 @@ yg_cleanup:
     if(scale_cb_buf)   clReleaseMemObject(scale_cb_buf);
     if(scale_cr_buf)   clReleaseMemObject(scale_cr_buf);
     if(half_in_buf)    clReleaseMemObject(half_in_buf);
+    if(k_guided_loess)       clReleaseKernel(k_guided_loess);
+    /* Separable kernels were not registered in this build; safe no-op. */
     if(k_guided_moments_x)   clReleaseKernel(k_guided_moments_x);
     if(k_guided_moments_yab) clReleaseKernel(k_guided_moments_yab);
     if(k_guided_apply_x)     clReleaseKernel(k_guided_apply_x);
@@ -601,6 +1086,57 @@ yg_cleanup:
     if(lut_x_buf)      clReleaseMemObject(lut_x_buf);
     if(lut_params_buf) clReleaseMemObject(lut_params_buf);
 
+    /* [LATEST: GALOSH_YUV_Q] release Q-specific kernels + chroma pyramid buffers. */
+    if(k_q_lap_mad)       clReleaseKernel(k_q_lap_mad);
+    if(k_q_synth_alpha)   clReleaseKernel(k_q_synth_alpha);
+    if(k_q_norm)          clReleaseKernel(k_q_norm);
+    if(k_q_denorm)        clReleaseKernel(k_q_denorm);
+    if(k_o_box_3p)        clReleaseKernel(k_o_box_3p);
+    if(k_o_loess_3p)      clReleaseKernel(k_o_loess_3p);
+    if(k_o_k16_3p)        clReleaseKernel(k_o_k16_3p);
+    if(k_o_pad)           clReleaseKernel(k_o_pad);
+    if(k_o_crop)          clReleaseKernel(k_o_crop);
+    if(k_o_smoothstep_3p) clReleaseKernel(k_o_smoothstep_3p);
+    if(q_y_snap_f)        clReleaseMemObject(q_y_snap_f);
+    if(q_y_h16)           clReleaseMemObject(q_y_h16);
+    if(q_cb_h16)          clReleaseMemObject(q_cb_h16);
+    if(q_cr_h16)          clReleaseMemObject(q_cr_h16);
+    if(q_cb_full_d)       clReleaseMemObject(q_cb_full_d);
+    if(q_cr_full_d)       clReleaseMemObject(q_cr_full_d);
+    if(q_dummy_full)      clReleaseMemObject(q_dummy_full);
+    if(q_dummy_h)         clReleaseMemObject(q_dummy_h);
+    if(q_dummy_q)         clReleaseMemObject(q_dummy_q);
+    if(q_dummy_kfh)       clReleaseMemObject(q_dummy_kfh);
+    if(q_dummy_kfq)       clReleaseMemObject(q_dummy_kfq);
+    if(q_y_half)          clReleaseMemObject(q_y_half);
+    if(q_cb_half)         clReleaseMemObject(q_cb_half);
+    if(q_cr_half)         clReleaseMemObject(q_cr_half);
+    if(q_cb_half_d)       clReleaseMemObject(q_cb_half_d);
+    if(q_cr_half_d)       clReleaseMemObject(q_cr_half_d);
+    if(q_y_for_h)         clReleaseMemObject(q_y_for_h);
+    if(q_cb_h_up_raw)     clReleaseMemObject(q_cb_h_up_raw);
+    if(q_cr_h_up_raw)     clReleaseMemObject(q_cr_h_up_raw);
+    if(q_cb_h_up)         clReleaseMemObject(q_cb_h_up);
+    if(q_cr_h_up)         clReleaseMemObject(q_cr_h_up);
+    if(q_y_qrt)           clReleaseMemObject(q_y_qrt);
+    if(q_cb_qrt)          clReleaseMemObject(q_cb_qrt);
+    if(q_cr_qrt)          clReleaseMemObject(q_cr_qrt);
+    if(q_cb_qrt_d)        clReleaseMemObject(q_cb_qrt_d);
+    if(q_cr_qrt_d)        clReleaseMemObject(q_cr_qrt_d);
+    if(q_y_for_q)         clReleaseMemObject(q_y_for_q);
+    if(q_cb_q_to_h_raw)   clReleaseMemObject(q_cb_q_to_h_raw);
+    if(q_cr_q_to_h_raw)   clReleaseMemObject(q_cr_q_to_h_raw);
+    if(q_cb_q_to_h)       clReleaseMemObject(q_cb_q_to_h);
+    if(q_cr_q_to_h)       clReleaseMemObject(q_cr_q_to_h);
+    if(q_cb_q_up_raw)     clReleaseMemObject(q_cb_q_up_raw);
+    if(q_cr_q_up_raw)     clReleaseMemObject(q_cr_q_up_raw);
+    if(q_cb_q_up)         clReleaseMemObject(q_cb_q_up);
+    if(q_cr_q_up)         clReleaseMemObject(q_cr_q_up);
+    if(q_cb_blend)        clReleaseMemObject(q_cb_blend);
+    if(q_cr_blend)        clReleaseMemObject(q_cr_blend);
+    if(q_cb_blend_f)      clReleaseMemObject(q_cb_blend_f);
+    if(q_cr_blend_f)      clReleaseMemObject(q_cr_blend_f);
+
     if(prog)    clReleaseProgram(prog);
     if(queue)   clReleaseCommandQueue(queue);
     if(context) clReleaseContext(context);
@@ -611,13 +1147,41 @@ yg_cleanup:
 
 
 /* ================================================================
- * main: thin CLI wrapper around run_yuv_gat_gpu.
+ * main: CLI wrapper.  Parses --variant=o|q before positional args.
+ *
+ * Pipeline-variant flag g_galosh_yuv_q_gpu (= forward-declared near
+ * top of file) selects:
+ *   0 → [LATEST: GALOSH_YUV_O] = production (Foi-Alenius σ + single-
+ *       scale chroma LOESS, current galosh_yuv_guided_loess kernel).
+ *   1 → [LATEST: GALOSH_YUV_Q] = production candidate (Laplacian MAD σ
+ *       + unified_sigma normalize + 3-anchor multi-scale chroma pyramid
+ *       via galosh_o_* kernels with YUV-specific full/half/quarter scale
+ *       layout; FP16 + LDS ≤ 32KB inherited from RAW O constraints).
  * ================================================================ */
 int main(int argc, char **argv)
 {
+    /* Strip --variant flag before positional parsing. */
+    int new_argc = 0;
+    char *positional[32];
+    for(int i = 0; i < argc; i++)
+    {
+        const char *a = argv[i];
+        if(strncmp(a, "--variant=", 10) == 0)
+        {
+            const char ch = (a[10] == 'Q') ? 'q' : (a[10] == 'O') ? 'o' : a[10];
+            g_galosh_yuv_q_gpu = (ch == 'q') ? 1 : 0;
+        }
+        else
+        {
+            if(new_argc < 32) positional[new_argc++] = (char *)a;
+        }
+    }
+    argv = positional;
+    argc = new_argc;
+
     if(argc < 7) {
         fprintf(stderr,
-            "Usage: %s <in.bin> <out.bin> <W> <H> <s_y> <s_c> [cl_dev]\n",
+            "Usage: %s <in.bin> <out.bin> <W> <H> <s_y> <s_c> [cl_dev] [--variant=o|q]\n",
             argv[0]);
         return 1;
     }
@@ -628,5 +1192,9 @@ int main(int argc, char **argv)
     const float sy          = (float)atof(argv[5]);
     const float sc          = (float)atof(argv[6]);
     const int   dev         = (argc > 7) ? atoi(argv[7]) : 0;
+    fprintf(stderr, "[YUV_GPU_%c] variant=%s\n",
+            g_galosh_yuv_q_gpu ? 'Q' : 'O',
+            g_galosh_yuv_q_gpu ? "Q (Laplacian-MAD σ + multi-scale chroma)" :
+                                 "O (Foi-Alenius σ + single-scale chroma)");
     return run_yuv_gat_gpu(input_file, output_file, width, height, sy, sc, dev);
 }

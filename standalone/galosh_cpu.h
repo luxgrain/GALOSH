@@ -2758,6 +2758,11 @@ static void galosh_loess_chroma_r(const float *restrict y_guide,
       float sumW = 0.f, sumY = 0.f, sumYY = 0.f;
       float sumCb = 0.f, sumCr = 0.f;
       float sumYCb = 0.f, sumYCr = 0.f;
+#ifdef GALOSH_CHROMA_CLAMP
+      /* full-window input-chroma range, to clamp the degree-1 LOESS extrapolation
+       * overshoot (mirrors galosh_loess_chroma_3ch_r; reflected to YUV/RGB). */
+      float lo_cb=1e30f, hi_cb=-1e30f, lo_cr=1e30f, hi_cr=-1e30f;
+#endif
 
       if(y_interior && x >= x0_int && x < x1_int)
       {
@@ -2775,6 +2780,10 @@ static void galosh_loess_chroma_r(const float *restrict y_guide,
             const float Yi  = rowY [xi];
             const float Cbi = rowCb[xi];
             const float Cri = rowCr[xi];
+#ifdef GALOSH_CHROMA_CLAMP
+            if(Cbi<lo_cb)lo_cb=Cbi; if(Cbi>hi_cb)hi_cb=Cbi;
+            if(Cri<lo_cr)lo_cr=Cri; if(Cri>hi_cr)hi_cr=Cri;
+#endif
             const float dY  = Yi - Y_c;
             const float w   = expf(-dY * dY * inv_2sigma_sq);
             sumW   += w;
@@ -2802,6 +2811,10 @@ static void galosh_loess_chroma_r(const float *restrict y_guide,
             const float Yi  = rowY [xi];
             const float Cbi = rowCb[xi];
             const float Cri = rowCr[xi];
+#ifdef GALOSH_CHROMA_CLAMP
+            if(Cbi<lo_cb)lo_cb=Cbi; if(Cbi>hi_cb)hi_cb=Cbi;
+            if(Cri<lo_cr)lo_cr=Cri; if(Cri>hi_cr)hi_cr=Cri;
+#endif
             const float dY  = Yi - Y_c;
             const float w   = expf(-dY * dY * inv_2sigma_sq);
             sumW   += w;
@@ -2832,8 +2845,17 @@ static void galosh_loess_chroma_r(const float *restrict y_guide,
       const float b_cb    = mean_Cb - a_cb * mean_Y;
       const float b_cr    = mean_Cr - a_cr * mean_Y;
 
-      cb_out[cx] = a_cb * Y_c + b_cb;
-      cr_out[cx] = a_cr * Y_c + b_cr;
+      float ocb = a_cb * Y_c + b_cb;
+      float ocr = a_cr * Y_c + b_cr;
+#ifdef GALOSH_CHROMA_CLAMP
+      /* clamp degree-1 luma-guided regression extrapolation to the local input
+       * chroma band -> kills chroma overshoot at luma edges (= RAW chroma-clamp
+       * reflected to the YUV/RGB canonical pipeline, 2026-06-28). */
+      if(hi_cb>=lo_cb) ocb = fminf(fmaxf(ocb, lo_cb), hi_cb);
+      if(hi_cr>=lo_cr) ocr = fminf(fmaxf(ocr, lo_cr), hi_cr);
+#endif
+      cb_out[cx] = ocb;
+      cr_out[cx] = ocr;
     }
   }
 }

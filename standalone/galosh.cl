@@ -3567,6 +3567,9 @@ kernel void galosh_yuv_guided_loess(
   float sumW   = 0.0f, sumY   = 0.0f, sumYY  = 0.0f;
   float sumCb  = 0.0f, sumCr  = 0.0f;
   float sumYCb = 0.0f, sumYCr = 0.0f;
+  /* full-window input-chroma range, to clamp the degree-1 LOESS extrapolation
+   * overshoot (mirrors CPU galosh_loess_chroma_r; RAW chroma-clamp reflected to YUV). */
+  float lo_cb = 1e30f, hi_cb = -1e30f, lo_cr = 1e30f, hi_cr = -1e30f;
 
   for(int dy = -YG_LOESS_RADIUS; dy <= YG_LOESS_RADIUS; dy++){
     int yi = y + dy;
@@ -3580,6 +3583,8 @@ kernel void galosh_yuv_guided_loess(
       const float Yi  = y_guide[p];
       const float Cbi = cb_in[p];
       const float Cri = cr_in[p];
+      lo_cb = fmin(lo_cb, Cbi); hi_cb = fmax(hi_cb, Cbi);
+      lo_cr = fmin(lo_cr, Cri); hi_cr = fmax(hi_cr, Cri);
       const float dY  = Yi - Y_c;
       const float w   = native_exp(-dY * dY * inv_2sigma_sq);
       sumW   += w;
@@ -3615,8 +3620,14 @@ kernel void galosh_yuv_guided_loess(
   const float b_cb    = mean_Cb - a_cb * mean_Y;
   const float b_cr    = mean_Cr - a_cr * mean_Y;
 
-  cb_out[cx] = a_cb * Y_c + b_cb;
-  cr_out[cx] = a_cr * Y_c + b_cr;
+  float ocb = a_cb * Y_c + b_cb;
+  float ocr = a_cr * Y_c + b_cr;
+  /* clamp the degree-1 luma-guided extrapolation to the local input chroma band
+   * -> kills chroma overshoot at luma edges (= RAW chroma-clamp reflected to YUV). */
+  if(hi_cb >= lo_cb) ocb = clamp(ocb, lo_cb, hi_cb);
+  if(hi_cr >= lo_cr) ocr = clamp(ocr, lo_cr, hi_cr);
+  cb_out[cx] = ocb;
+  cr_out[cx] = ocr;
 }
 
 
