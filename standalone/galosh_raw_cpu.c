@@ -1908,35 +1908,6 @@ static void galosh_raw_denoise(const float *const restrict in,
                                 + SIGNS[slot][2] * C3_aligned[pos])
                         + ch_dark_ref[slot];
         out[pos] = gat_inverse_exact(val * unified_sigma);
-#ifdef GALOSH_CHROMA_CLAMP
-        /* Final-output CFA clamp (GALOSH_CHROMA_CLAMP).  The per-channel WHT-domain
-         * chroma clamp cannot stop the JOINT inverse-WHT combination from over-
-         * shooting one output Bayer channel (e.g. B = L - C1 - C2 + C3), which the
-         * large blue WB gain then renders as a residual magenta speck.  Denoising is
-         * a local smoothing, so the clean value always lies within the local NOISY
-         * input range; clamp the output to the same-Bayer-channel [min,max] of `in`
-         * over a 3x3 stride-2 window.  Removes the residual joint overshoot at no
-         * cost to legitimate denoising (the smoothed value is already in range).
-         * EN/JP: 逆WHT の joint 結合による出力チャネル overshoot を同色チャネルの
-         * 局所入力レンジに clamp して除去（残存 magenta の全数解決）。 */
-        {
-          float ilo = in[pos], ihi = in[pos];
-          for(int dy = -2; dy <= 2; dy += 2)
-          {
-            const int yy = fr + dy;
-            if(yy < 0 || yy >= height) continue;
-            for(int dx = -2; dx <= 2; dx += 2)
-            {
-              const int xx = fc + dx;
-              if(xx < 0 || xx >= width) continue;
-              const float v = in[(size_t)yy * width + xx];
-              if(v < ilo) ilo = v; else if(v > ihi) ihi = v;
-            }
-          }
-          if(out[pos] < ilo) out[pos] = ilo;
-          else if(out[pos] > ihi) out[pos] = ihi;
-        }
-#endif
       }
     }
   }
