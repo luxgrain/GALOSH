@@ -146,8 +146,12 @@ inline void p7_k16_pixel(__global const lbuf_t *c1_h, __global const lbuf_t *c2_
 
   fxp_acc sum_w = fxp_acc_zero();
   fxp_acc sum_c1 = fxp_acc_zero(), sum_c2 = fxp_acc_zero(), sum_c3 = fxp_acc_zero();
-  /* GALOSH_CHROMA_CLAMP (= r32 fxp_k16_jinc_upsample): full-window input chroma
-   * range to clamp the jinc-ringing overshoot. */
+  /* Anti-ringing (= r32 fxp_k16_jinc_upsample): clamp the jinc side-lobe
+   * overshoot to the convex hull of the NEAREST 2x2 source chroma samples
+   * (ImageMagick/mpv "+clamp" antiring) -> removes the ring-magenta GALOSH made
+   * from clean input at high-contrast L edges while preserving jinc sharpness.
+   * bit-exact with r32 (identical nearest-2x2 mask, sub = fr&1 / fc&1 = si). */
+  int sub_dy = fr & 1, sub_dx = fc & 1;
   int cmin1 = 0x7fffffff, cmin2 = 0x7fffffff, cmin3 = 0x7fffffff;
   int cmax1 = -0x7fffffff, cmax2 = -0x7fffffff, cmax3 = -0x7fffffff;
   for(int dy = -W; dy <= W; dy++) {
@@ -178,9 +182,11 @@ inline void p7_k16_pixel(__global const lbuf_t *c1_h, __global const lbuf_t *c2_
       fxp_acc_madd(&sum_c1, w, v1);
       fxp_acc_madd(&sum_c2, w, v2);
       fxp_acc_madd(&sum_c3, w, v3);
-      if(v1<cmin1)cmin1=v1; if(v1>cmax1)cmax1=v1;
-      if(v2<cmin2)cmin2=v2; if(v2>cmax2)cmax2=v2;
-      if(v3<cmin3)cmin3=v3; if(v3>cmax3)cmax3=v3;
+      /* nearest-2x2 source-sample hull (anti-ringing), = r32 condition */
+      if(((dy==0)||(sub_dy&&dy==1)) && ((dx==0)||(sub_dx&&dx==1))) {
+        if(v1<cmin1)cmin1=v1; if(v1>cmax1)cmax1=v1;
+        if(v2<cmin2)cmin2=v2; if(v2>cmax2)cmax2=v2;
+        if(v3<cmin3)cmin3=v3; if(v3>cmax3)cmax3=v3; }
     }
   }
   int sw  = fxp_acc_extract_q20(&sum_w);

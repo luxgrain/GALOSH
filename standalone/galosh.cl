@@ -5722,8 +5722,11 @@ kernel void galosh_o32_k16_joint_bilateral_upsample_3p(
 
   float sum_w  = 0.0f;
   float sum_c1 = 0.0f, sum_c2 = 0.0f, sum_c3 = 0.0f;
-  /* GALOSH_CHROMA_CLAMP mirror (canonical, = CPU gat_k16_joint_bilateral_upsample):
-   * track the FULL-window input chroma range, clamp the jinc-ringing output to it. */
+  /* Anti-ringing (canonical, = CPU gat_k16_joint_bilateral_upsample): clamp the
+   * jinc side-lobe overshoot to the convex hull of the NEAREST 2x2 source chroma
+   * samples (ImageMagick/mpv "+clamp" antiring) -> removes the ring-magenta GALOSH
+   * made from clean input at high-contrast L edges while preserving jinc sharpness.
+   * Same nearest-2x2 mask as r32/i16 (sub_y=fy&1, sub_x=fx&1 = si). */
   float cmin1= 1e30f, cmin2= 1e30f, cmin3= 1e30f;
   float cmax1=-1e30f, cmax2=-1e30f, cmax3=-1e30f;
 
@@ -5736,11 +5739,13 @@ kernel void galosh_o32_k16_joint_bilateral_upsample_3p(
       int hxi = hx + dx;
       hxi = clamp(hxi, 0, in_w - 1);
       const int hi = hyi * in_w + hxi;
-      /* full-window input range (every sample, before the zero-weight skip) */
-      const float iv1=c1_in[hi], iv2=c2_in[hi], iv3=c3_in[hi];
-      cmin1=fmin(cmin1,iv1); cmax1=fmax(cmax1,iv1);
-      cmin2=fmin(cmin2,iv2); cmax2=fmax(cmax2,iv2);
-      cmin3=fmin(cmin3,iv3); cmax3=fmax(cmax3,iv3);
+      /* nearest-2x2 source-sample hull (anti-ringing), before the zero-weight skip */
+      if(((dy==0)||(sub_y&&dy==1)) && ((dx==0)||(sub_x&&dx==1))) {
+        const float iv1=c1_in[hi], iv2=c2_in[hi], iv3=c3_in[hi];
+        cmin1=fmin(cmin1,iv1); cmax1=fmax(cmax1,iv1);
+        cmin2=fmin(cmin2,iv2); cmax2=fmax(cmax2,iv2);
+        cmin3=fmin(cmin3,iv3); cmax3=fmax(cmax3,iv3);
+      }
       const float w_jinc = galosh_o32_k16_jbu_w[si * 25 + (dy + 2) * 5 + (dx + 2)];
       if(w_jinc == 0.0f) continue;
 

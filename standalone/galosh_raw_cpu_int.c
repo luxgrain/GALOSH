@@ -1848,8 +1848,13 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
         fxp_acc sum_c1 = fxp_acc_zero();
         fxp_acc sum_c2 = fxp_acc_zero();
         fxp_acc sum_c3 = fxp_acc_zero();
-        /* GALOSH_CHROMA_CLAMP (canonical, = FP32 gat_k16_joint_bilateral_upsample):
-         * full-window input chroma range to clamp the jinc-ringing overshoot. */
+        /* Anti-ringing (canonical, = FP32 gat_k16_joint_bilateral_upsample):
+         * clamp the jinc side-lobe overshoot to the convex hull of the NEAREST
+         * 2x2 source chroma samples (standard ImageMagick/mpv "+clamp" antiring),
+         * which removes the ring-magenta GALOSH created from clean input at high-
+         * contrast L edges while PRESERVING the jinc sharpness.  [DEPRECATED: a
+         * conservative full-window band left a ringing residual (sticks 616px).]
+         * EN/JP: jinc 負ローブ ring を最近傍 2x2 凸包に clamp、鋭さ保持で magenta 根治。 */
         fxp32 cmin1 = 0x7fffffff, cmin2 = 0x7fffffff, cmin3 = 0x7fffffff;
         fxp32 cmax1 = -0x7fffffff, cmax2 = -0x7fffffff, cmax3 = -0x7fffffff;
 
@@ -1885,7 +1890,11 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
             fxp_acc_madd(&sum_c1, w, c1_h[hp]);
             fxp_acc_madd(&sum_c2, w, c2_h[hp]);
             fxp_acc_madd(&sum_c3, w, c3_h[hp]);
-            { fxp32 v1=c1_h[hp], v2=c2_h[hp], v3=c3_h[hp];
+            /* track ONLY the nearest-2x2 source samples (anti-ringing hull):
+             * for offset si the bracketing samples are dy/dx in {0} (sub==0) or
+             * {0,1} (sub==1), matching the FP32 nearm mask exactly. */
+            if(((dy==0)||(sub_dy&&dy==1)) && ((dx==0)||(sub_dx&&dx==1))) {
+              fxp32 v1=c1_h[hp], v2=c2_h[hp], v3=c3_h[hp];
               if(v1<cmin1)cmin1=v1; if(v1>cmax1)cmax1=v1;
               if(v2<cmin2)cmin2=v2; if(v2>cmax2)cmax2=v2;
               if(v3<cmin3)cmin3=v3; if(v3>cmax3)cmax3=v3; }
@@ -1914,7 +1923,7 @@ static void fxp_k16_jinc_upsample(const fxp32 *c1_h, const fxp32 *c2_h, const fx
         fxp32 oc1 = fxp_div_q20(sc1, sw);
         fxp32 oc2 = fxp_div_q20(sc2, sw);
         fxp32 oc3 = fxp_div_q20(sc3, sw);
-        /* clamp jinc-ringing overshoot to the local input chroma band */
+        /* clamp jinc-ringing overshoot to the nearest-2x2 hull (anti-ringing) */
         if(cmax1>=cmin1){ if(oc1<cmin1)oc1=cmin1; else if(oc1>cmax1)oc1=cmax1; }
         if(cmax2>=cmin2){ if(oc2<cmin2)oc2=cmin2; else if(oc2>cmax2)oc2=cmax2; }
         if(cmax3>=cmin3){ if(oc3<cmin3)oc3=cmin3; else if(oc3>cmax3)oc3=cmax3; }

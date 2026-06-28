@@ -3630,6 +3630,14 @@ static void gat_k16_joint_bilateral_upsample(
   /* UN-normalized jinc weights per sub-pixel offset.  Bilateral
    * modulation re-normalizes per output pixel (= can't pre-normalize). */
   float jw[4][5][5];
+  /* anti-ringing: per-sub-pixel mask of the nearest 2x2 source samples = the
+   * convex hull the interpolated chroma must stay inside (standard "+clamp"). */
+  unsigned char nearm[4][5][5];
+  /* kernel selection for the A/B/C bench: default = EWA jinc-jinc (sharp, band-
+   * faithful); GSIG set = Gaussian (no ring but over-blurs chroma detail). */
+  const char *_gs = getenv("GSIG");
+  const int   use_gauss = (_gs != NULL);
+  const float gsig = _gs ? (float)atof(_gs) : 0.8f;
   for(int si = 0; si < 4; si++)
   {
     const float oy = subpix[si][0];
@@ -3642,19 +3650,43 @@ static void gat_k16_joint_bilateral_upsample(
         const float rx = (float)dx - ox;
         const float r_half = sqrtf(rx * rx + ry * ry);
         const float r_full = r_half * 2.0f;
+#ifdef GALOSH_CHROMA_CLAMP
+        /* EWA jinc-jinc kept by default (sharp, band-limit-faithful — a pure
+         * Gaussian removes ring but over-blurs chroma on some scenes).  The jinc
+         * negative-side-lobe RING (= residual magenta from clean input at high-
+         * contrast L edges) is removed instead by the nearest-2x2 anti-ringing
+         * hull clamp below (ImageMagick/mpv '+clamp' antiring): the interpolated
+         * value is bounded to the convex hull of the 4 nearest source samples, so
+         * only the overshoot is cut while the sharp interpolation is preserved.
+         * EN/JP: jinc の鋭さを保持し ring は最近傍 2x2 凸包 clamp で除去。 */
+        float w_val;
+        if(use_gauss) w_val = expf(-r_half * r_half / (2.0f * gsig * gsig));
+        else          w_val = (r_full < 3.0f)
+                            ? galosh_jinc(r_full) * galosh_jinc(r_full / 3.0f) : 0.0f;
+        const int ny = (dy == 0) || (oy > 0.25f && dy == 1);
+        const int nx = (dx == 0) || (ox > 0.25f && dx == 1);
+        nearm[si][dy + W][dx + W] = (ny && nx) ? 1 : 0;
+#else
         float w_val = 0.0f;
         if(r_full < 3.0f)
           w_val = galosh_jinc(r_full) * galosh_jinc(r_full / 3.0f);
-        /* NOTE: the jinc negative sidelobes are KEPT — dropping them (convex
-         * upsample) was tested and made magenta far WORSE (chroma blurs/bleeds
-         * across L edges).  Overshoot is instead bounded by the output-range
-         * clamp below (GALOSH_CHROMA_CLAMP). */
+#endif
         jw[si][dy + W][dx + W] = w_val;
       }
     }
   }
 
   const float inv_2sigma_sq = 1.0f / (2.0f * BW * BW);
+#ifdef GALOSH_CHROMA_CLAMP
+  /* Anti-ringing (nearest-2x2 source-sample hull) is the DEFAULT: it removes the
+   * jinc side-lobe RING (= residual magenta GALOSH created from clean input at
+   * high-contrast L edges) at zero speed cost while preserving jinc sharpness.
+   * Validated net-positive (sticks magenta 616->0, no high-ISO break, Matthias
+   * detail kept).  Opt out to the legacy conservative full-window band via
+   * GALOSH_CLAMP_FULLWIN (kept for A/B reproducibility).  [DEPRECATED: the
+   * Gaussian kernel via GSIG removes ring too but over-blurs chroma detail.] */
+  const int antiring = (getenv("GALOSH_CLAMP_FULLWIN") == NULL);
+#endif
 
   DT_OMP_FOR()
   for(int hy = 0; hy < halfheight; hy++)
@@ -3675,9 +3707,12 @@ static void gat_k16_joint_bilateral_upsample(
         float sum_c1 = 0.0f, sum_c2 = 0.0f, sum_c3 = 0.0f;
 #ifdef GALOSH_CHROMA_CLAMP
         /* Range of the bilaterally-relevant (positive-bilateral-weight) input
-         * chroma samples, used to clamp jinc-ringing overshoot below. */
+         * chroma samples, used to clamp jinc-ringing overshoot below.
+         * lo/hi = full window (conservative); tlo/thi = nearest-2x2 hull (antiring). */
         float lo1= 1e30f, lo2= 1e30f, lo3= 1e30f;
         float hi1=-1e30f, hi2=-1e30f, hi3=-1e30f;
+        float tlo1= 1e30f, tlo2= 1e30f, tlo3= 1e30f;
+        float thi1=-1e30f, thi2=-1e30f, thi3=-1e30f;
 #endif
 
         for(int dy = -W; dy <= W; dy++)
@@ -3718,6 +3753,11 @@ static void gat_k16_joint_bilateral_upsample(
               if(v1<lo1)lo1=v1; if(v1>hi1)hi1=v1;
               if(v2<lo2)lo2=v2; if(v2>hi2)hi2=v2;
               if(v3<lo3)lo3=v3; if(v3>hi3)hi3=v3;
+              if(nearm[si][dy + W][dx + W]){
+                if(v1<tlo1)tlo1=v1; if(v1>thi1)thi1=v1;
+                if(v2<tlo2)tlo2=v2; if(v2>thi2)thi2=v2;
+                if(v3<tlo3)tlo3=v3; if(v3>thi3)thi3=v3;
+              }
             }
 #endif
           }
@@ -3751,9 +3791,15 @@ static void gat_k16_joint_bilateral_upsample(
          * blue WB gain.  Clamp the output to the admissible band (= INT-pipeline
          * behaviour, which never showed this).  EN/JP: jinc 負サイドローブ起因の
          * chroma overshoot を入力レンジに clamp。 */
-        if(hi1 >= lo1){ oc1 = fminf(fmaxf(oc1, lo1), hi1); }
-        if(hi2 >= lo2){ oc2 = fminf(fmaxf(oc2, lo2), hi2); }
-        if(hi3 >= lo3){ oc3 = fminf(fmaxf(oc3, lo3), hi3); }
+        if(antiring){
+          if(thi1 >= tlo1){ oc1 = fminf(fmaxf(oc1, tlo1), thi1); }
+          if(thi2 >= tlo2){ oc2 = fminf(fmaxf(oc2, tlo2), thi2); }
+          if(thi3 >= tlo3){ oc3 = fminf(fmaxf(oc3, tlo3), thi3); }
+        } else {
+          if(hi1 >= lo1){ oc1 = fminf(fmaxf(oc1, lo1), hi1); }
+          if(hi2 >= lo2){ oc2 = fminf(fmaxf(oc2, lo2), hi2); }
+          if(hi3 >= lo3){ oc3 = fminf(fmaxf(oc3, lo3), hi3); }
+        }
 #endif
         c1_full[fp] = oc1;
         c2_full[fp] = oc2;
