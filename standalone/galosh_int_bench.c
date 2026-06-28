@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
   char *src = malloc(1 << 20); src[0] = 0; size_t pos = 0;
   for(int i = 0; i < nfiles; i++) {
     size_t l = 0; char *part = load_file(files[i], &l);
-    if(!part) { snprintf(dirbuf, sizeof dirbuf, "C:/Users/luxgrain/GALOSH/standalone/%s", files[i]);
+    if(!part) { snprintf(dirbuf, sizeof dirbuf, "standalone/%s", files[i]);
                 part = load_file(dirbuf, &l); }
     if(!part) { fprintf(stderr, "cannot load %s\n", files[i]); return 1; }
     memcpy(src + pos, part, l); pos += l; src[pos++] = '\n'; free(part);
@@ -180,11 +180,11 @@ int main(int argc, char **argv) {
   const char *build_opts = g_genuine ? "-DGENUINE_I16" : "";
   char cache_path[1024];
   snprintf(cache_path, sizeof cache_path,
-           "C:/Users/luxgrain/GALOSH/standalone/galosh_int_pipe.%s.dev%d.clbin",
+           "standalone/galosh_int_pipe.%s.dev%d.clbin",
            g_genuine ? "i16" : "i32", dev_idx);
   long src_mtime = 0;
   for(int i = 0; i < nfiles; i++) {
-    char ap[1024]; snprintf(ap, sizeof ap, "C:/Users/luxgrain/GALOSH/standalone/%s", files[i]);
+    char ap[1024]; snprintf(ap, sizeof ap, "standalone/%s", files[i]);
     struct stat st; if(stat(ap, &st) == 0 && (long)st.st_mtime > src_mtime) src_mtime = (long)st.st_mtime;
   }
   int built = 0; struct stat cst;

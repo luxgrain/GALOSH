@@ -267,7 +267,7 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
     {
         const char *cl_paths[] = {
             "galosh.cl",
-            "C:/Users/luxgrain/GALOSH/standalone/galosh.cl",
+            "standalone/galosh.cl",
             NULL
         };
         char *source = NULL;

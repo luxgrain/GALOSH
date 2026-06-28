@@ -18,12 +18,13 @@ GALOSH evolution is preserved as galosh_v{4,5,6,6b,6c,6e,6lg05_10,6lg10_10,
 7a_05_10,7a_10_10,7b_05_10,7b_10_10,f,f_05_10,f_full,f_half} so each
 algorithmic generation can be compared.
 """
+import os
 from pathlib import Path
 import json
 import shutil
 import argparse
 
-BASE = Path(r"C:\Users\luxgrain\GALOSH\benchmark")
+BASE = Path(os.path.expanduser(r"~\GALOSH\benchmark"))
 ARCHIVE_J = BASE / "archive" / "results_legacy"
 ARCHIVE_I = BASE / "archive" / "images_legacy"
 

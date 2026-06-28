@@ -15,6 +15,7 @@ Usage:
   python bench_compare.py [noise_sigma] [galosh_sy] [galosh_sc]
 """
 
+import os
 import sys, os, subprocess, time, math
 import numpy as np
 import bm3d
@@ -27,10 +28,10 @@ from PIL import Image
 from skimage.metrics import structural_similarity
 
 # -- Config -------------------------------------------------------------------
-KODAK_DIR  = r"C:\Users\luxgrain\denoise_eval\datasets\kodak"
-EXE        = r"C:\Users\luxgrain\denoise_eval\standalone\yuv_galosh.exe"
+KODAK_DIR  = os.path.expanduser(r"~\denoise_eval\datasets\kodak")
+EXE        = os.path.expanduser(r"~\denoise_eval\standalone\yuv_galosh.exe")
 BASH       = r"C:\msys64\usr\bin\bash.exe"
-WORK_DIR   = r"C:\Users\luxgrain\denoise_eval\standalone\yuv_bench"
+WORK_DIR   = os.path.expanduser(r"~\denoise_eval\standalone\yuv_bench")
 
 noise_sigma  = float(sys.argv[1]) if len(sys.argv) > 1 else 0.05
 galosh_sy    = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0

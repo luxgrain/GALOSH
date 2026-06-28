@@ -1,7 +1,8 @@
+import os
 import numpy as np
 import subprocess, os, tempfile
 
-EXE  = r'C:\Users\luxgrain\denoise_eval\standalone\yuv_galosh.exe'
+EXE  = os.path.expanduser(r'~\denoise_eval\standalone\yuv_galosh.exe')
 BASH = r'C:\msys64\usr\bin\bash.exe'
 
 H, W = 64, 64

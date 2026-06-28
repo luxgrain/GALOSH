@@ -9,7 +9,7 @@ from pathlib import Path
 from skimage.io import imread, imsave
 from skimage.metrics import structural_similarity
 
-EVAL_ROOT = Path(r"C:\Users\luxgrain\denoise_eval")
+EVAL_ROOT = Path(os.path.expanduser(r"~\denoise_eval"))
 STANDALONE = EVAL_ROOT / "standalone" / "rawdenoise.exe"
 KODAK_DIR = EVAL_ROOT / "datasets" / "kodak"
 RESULT_DIR = EVAL_ROOT / "results"

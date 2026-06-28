@@ -16,7 +16,7 @@ os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 ARCH = GALOSH / "standalone" / "archive_int_iter"
 EXE_V0 = ARCH / "galosh_raw_cpu_int_v0_baseline.exe"
 EXE_V1 = ARCH / "galosh_raw_cpu_int_v1_bug11_broken.exe"

@@ -57,8 +57,8 @@ OUTDIR   = BASE / "comparison_images_sidd"
 RESULTS  = BASE / "results"
 RESULTS.mkdir(exist_ok=True)
 OUTDIR.mkdir(exist_ok=True)
-KAIR_DIR    = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\KAIR")
-NAFNET_DIR  = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\NAFNet")
+KAIR_DIR    = Path(os.path.expanduser(r"~\GALOSH\benchmark\external\KAIR"))
+NAFNET_DIR  = Path(os.path.expanduser(r"~\GALOSH\benchmark\external\NAFNet"))
 BASH_EXE    = Path(r"C:\msys64\usr\bin\bash.exe")
 
 # bm3d and skimage NLM use internal threading — must not be called concurrently

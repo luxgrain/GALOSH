@@ -35,7 +35,7 @@ torch.set_num_threads(max(n_cores // 2, 2))
 
 BASE = Path(__file__).parent.parent
 RESULTS = BASE / "results"
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 
 DATASETS = {
     "kodak":    {"path": BASE / "datasets" / "kodak",    "glob": "kodim*.png", "max": 24},

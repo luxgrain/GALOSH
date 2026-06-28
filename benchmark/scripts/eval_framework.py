@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
 
 # ─── Paths ──────────────────────────────────────────────
-EVAL_ROOT = Path(r"C:\Users\luxgrain\denoise_eval")
+EVAL_ROOT = Path(os.path.expanduser(r"~\denoise_eval"))
 DATASET_DIR = EVAL_ROOT / "datasets"
 RESULT_DIR  = EVAL_ROOT / "results"
 COMPARE_DIR = EVAL_ROOT / "comparison_images"

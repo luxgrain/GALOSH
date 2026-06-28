@@ -56,7 +56,7 @@ DATASETS = {
     "mcmaster":{"path": BASE / "datasets" / "mcmaster", "glob": "*.png",     "max": 18},
 }
 
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 
 # ===================== COLOR / NOISE UTILITIES =====================
 

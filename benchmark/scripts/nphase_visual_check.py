@@ -15,7 +15,7 @@ from scipy.io import loadmat
 from skimage.io import imsave
 
 os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 VAL = GALOSH / "benchmark" / "SIDD_Validation"
 OUTD = GALOSH / "benchmark" / "sidd_validation" / "_nphase_visual"
 OUTD.mkdir(parents=True, exist_ok=True)

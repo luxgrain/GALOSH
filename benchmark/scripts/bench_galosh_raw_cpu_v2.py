@@ -38,7 +38,7 @@ from PIL import Image
 
 GALOSH_ROOT = Path(__file__).parent.parent.parent
 EXE         = GALOSH_ROOT / "standalone" / "galosh_raw_cpu.exe"
-BENCH_DIR   = Path(r"C:\Users\luxgrain\datasets\sidd\medium_bench")
+BENCH_DIR   = Path(os.path.expanduser(r"~\datasets\sidd\medium_bench"))
 OUT_ROOT    = GALOSH_ROOT / "benchmark" / "sidd_medium"
 TMP_DIR     = GALOSH_ROOT / "benchmark" / "sidd_medium" / "_tmp_v2bench"
 TMP_DIR.mkdir(parents=True, exist_ok=True)

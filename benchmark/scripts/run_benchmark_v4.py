@@ -46,7 +46,7 @@ OUTDIR = BASE / "comparison_images_v4"
 RESULTS.mkdir(exist_ok=True)
 OUTDIR.mkdir(exist_ok=True)
 
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 
 # ===================== COLOR / NOISE UTILITIES =====================
 

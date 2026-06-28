@@ -16,6 +16,17 @@
 #ifndef GALOSH_BAYER_H
 #define GALOSH_BAYER_H
 
+/* The standalone reference (galosh_raw_cpu.c) is built with -DGALOSH_F,
+ * which selects the half-res L/C + full-res L refinement pipeline
+ * (Phase 4 'GALOSH_F').  Without it the file falls back to the legacy
+ * full-res raw GALOSH (stride=4 + chroma replacement) which has known
+ * colour-cast bugs and is the path that produced the ringing /
+ * colour-shift on the first darktable smoke test.  Force the modern
+ * path for the IOP build so it matches the reference. */
+#ifndef GALOSH_F
+#define GALOSH_F 1
+#endif
+
 /* darktable's introspection parser auto-generates a translation unit that
  * #includes rawdenoise.c (and through it this header) only to walk the
  * params struct.  That TU doesn't call gat_galosh_denoise_rawlc or any of
@@ -434,6 +445,29 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
 
   if(luma_strength <= 0.0f) return;
 
+  /* ----------------------------------------------------------------
+   * Pattern-aware 2x2 channel offsets.
+   *
+   * The standalone reference assumed RGGB (R at TL of each 2x2 block);
+   * darktable's `filters` mosaic mask can also encode BGGR / GRBG / GBRG.
+   * Locate R via FC, derive B as the diagonal partner and the two
+   * greens as the off-diagonal partners.  Channel slot order is kept
+   * canonical (c=0 R, c=1 Gb, c=2 Gr, c=3 B) so the WHT decompose,
+   * shrinkage, compute_L_fullres, and inverse WHT formulas (which all
+   * assume that order) need no change -- only the pixel positions we
+   * read from / write to the full-res `in`/`out` buffers shift to
+   * follow the actual Bayer phase.
+   *
+   * dt_iop_roi_t carries no Bayer phase shift, so FC indices line up
+   * with the input buffer directly. */
+  int rrow = 0, rcol = 0;
+  for(int r = 0; r < 2; r++)
+    for(int c = 0; c < 2; c++)
+      if(FC(r, c, filters) == 0) { rrow = r; rcol = c; }
+  const int brow = 1 - rrow, bcol = 1 - rcol;
+  const int co_row[4] = { rrow, brow, rrow, brow };  /* R, Gb, Gr, B */
+  const int co_col[4] = { rcol, rcol, bcol, bcol };
+
   const int halfwidth = (width + 1) / 2;
   const int halfheight = (height + 1) / 2;
   if(halfwidth < GALOSH_BLOCK_SIZE * 2 || halfheight < GALOSH_BLOCK_SIZE * 2) return;
@@ -455,7 +489,7 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
   float sigma_gat_ch[4];
   for(int c = 0; c < 4; c++)
   {
-    const int row_offset = c & 1, col_offset = (c >> 1) & 1;
+    const int row_offset = co_row[c], col_offset = co_col[c];
     ch_gat[c] = dt_alloc_align_float(chsize);
     if(!ch_gat[c]) goto cleanup_rawlc;
 
@@ -759,14 +793,23 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
     const int halfres_stride = GALOSH_STRIDE;
 #endif
 
-    fprintf(stderr, "[rawdenoise] GALOSH_F: half-res luma Pass1+2 "
-                     "(%dx%d, sigma_L=%.3f, stride=%d)\n",
+    fprintf(stderr, "[GALOSH_RAW_G] half-res luma Pass1+2 "
+                     "(%dx%d, sigma_L=%.3f, stride=%d, MAD-BayesShrink)\n",
                      halfwidth, halfheight, luma_strength, halfres_stride);
 
-    galosh_pass1(luma, l_pilot, halfwidth, halfheight, luma_strength, halfres_stride);
-    galosh_pass2(luma, l_pilot, l_out, halfwidth, halfheight, luma_strength, halfres_stride);
+    /* GALOSH_RAW_G: K13 luma uses Pass1 BayesShrink with MAD-based
+     * sigma_Y estimator (use_robust_shrink=1) -- the partial-selection-sort
+     * robust noise estimator that kills spatial noise clusters fooling
+     * the L2 sum_sq estimator (Donoho-Johnstone 1995).  Single-orientation
+     * collapses to plain pass1+pass2 inside the wrapper; n_orient=1 here.
+     * SIDD Medium 80-pair: +0.21 dB PSNR / -7.7% LPIPS / -2.5% DISTS. */
+    galosh_pass12_multiorient_blocked(luma, l_out, halfwidth, halfheight,
+                                       luma_strength, GALOSH_BLOCK_SIZE,
+                                       halfres_stride, /*n_orient=*/1,
+                                       /*use_robust_shrink=*/1);
+    (void)l_pilot;  /* internal pilot now lives inside the wrapper */
 
-    fprintf(stderr, "[rawdenoise] GALOSH_F: half-res luma done\n");
+    fprintf(stderr, "[GALOSH_RAW_G] half-res luma done\n");
 
     /* Step (b): Compute L_fullres from noisy and pilot half-res L/C.
      *
@@ -837,45 +880,66 @@ static void gat_galosh_denoise_rawlc(const float *const restrict in, float *cons
      *
      * 逆 2x2 WHT: 全解像度 L_den + 半解像度 C_den → RGGB。
      * dark_ref を加算して absolute GAT-norm 空間に戻す。 */
+    /* GALOSH_RAW_G K16: chroma full-res reconstruction.
+     *   Upsample c1/c2/c3 to full-resolution via EWA Jinc-Lanczos-3
+     *   (galosh_upsample_2x_ewajl3 in galosh_core.h), then apply the
+     *   inverse 2x2 WHT per-pixel using the upsampled chroma + Bayer-
+     *   aware sign tables.  Replaces the legacy block-replicated chroma
+     *   inverse (which produced visible 2x2 stair-steps on diagonal
+     *   edges) without breaking K11/K14/K15's var=1 noise invariance.
+     *
+     *   The sign tables are *canonical* (R, Gb, Gr, B in fixed order);
+     *   the Bayer-pattern-aware slot lookup ch_lut[fr&1][fc&1] handles
+     *   RGGB / BGGR / GRBG / GBRG by inverting co_row[] / co_col[]. */
     {
+      const size_t fullsize_k16 = (size_t)width * height;
+      float *C1_full = dt_alloc_align_float(fullsize_k16);
+      float *C2_full = dt_alloc_align_float(fullsize_k16);
+      float *C3_full = dt_alloc_align_float(fullsize_k16);
+      if(!C1_full || !C2_full || !C3_full)
+      {
+        dt_free_align(C1_full); dt_free_align(C2_full); dt_free_align(C3_full);
+        dt_free_align(L_fr_den); dt_free_align(l_out);
+        goto cleanup_rawlc;
+      }
+
+      galosh_upsample_2x_ewajl3(c1_out, C1_full, halfwidth, halfheight);
+      galosh_upsample_2x_ewajl3(c2_out, C2_full, halfwidth, halfheight);
+      galosh_upsample_2x_ewajl3(c3_out, C3_full, halfwidth, halfheight);
+
+      /* Inverse Bayer slot LUT: ch_lut[r%2][c%2] = canonical slot index
+       * (0=R, 1=Gb, 2=Gr, 3=B).  Built by inverting co_row[] / co_col[]. */
+      int ch_lut[2][2] = {{0,0},{0,0}};
+      for(int c = 0; c < 4; c++)
+        ch_lut[co_row[c]][co_col[c]] = c;
+
+      /* Inverse 2x2 WHT signs in canonical (R, Gb, Gr, B) order. */
+      static const float SIGNS[4][3] = {
+        { +1.0f, +1.0f, +1.0f },  /* R  */
+        { -1.0f, +1.0f, -1.0f },  /* Gb */
+        { +1.0f, -1.0f, -1.0f },  /* Gr */
+        { -1.0f, -1.0f, +1.0f },  /* B  */
+      };
+
       const float sg = sigma_gat_ch[0]; /* = unified_sigma */
+
       DT_OMP_FOR()
-      for(int hy = 0; hy < halfheight; hy++)
-        for(int hx = 0; hx < halfwidth; hx++)
+      for(int fr = 0; fr < height; fr++)
+      {
+        for(int fc = 0; fc < width; fc++)
         {
-          const size_t hi = (size_t)hy * halfwidth + hx;
-          const int fr = 2 * hy, fc = 2 * hx;
-
-          /* Half-res chroma (dark-ref-free, sigma-normalized) */
-          const float c1 = c1_out[hi];
-          const float c2 = c2_out[hi];
-          const float c3 = c3_out[hi];
-
-          /* Use block-aligned L only (2hy, 2hx) to avoid pixel shift.
-           *
-           * L_fullres at non-aligned positions is interpolated from adjacent
-           * blocks, but C values are from this block only → spatial mismatch.
-           * Using L at block-aligned position ensures L and C are consistent.
-           * The full-res GALOSH Pass2 still improves L estimation quality
-           * via cross-block spatial context in 8x8 WHT shrinkage.
-           *
-           * ブロック整合位置 (2hy, 2hx) の L のみ使用。非整合位置の
-           * L_fullres は隣接ブロックから補間されており、自ブロックの C と
-           * 空間的に不整合 → ピクセルシフトの原因。 */
-          const float L_block = L_fr_den[(size_t)fr * width + fc];
-
-          /* Inverse 2x2 WHT + dark_ref restore → absolute GAT-norm space.
-           * Then sigma-denormalize (*sg) → inverse GAT → linear raw. */
-          const float val_R  = (L_block + c1 + c2 + c3) * 0.5f + ch_dark_ref[0];
-          const float val_Gb = (L_block - c1 + c2 - c3) * 0.5f + ch_dark_ref[1];
-          const float val_Gr = (L_block + c1 - c2 - c3) * 0.5f + ch_dark_ref[2];
-          const float val_B  = (L_block - c1 - c2 + c3) * 0.5f + ch_dark_ref[3];
-
-          out[(size_t)fr       * width + fc]     = gat_inverse_exact(val_R  * sg);
-          out[(size_t)(fr + 1) * width + fc]     = gat_inverse_exact(val_Gb * sg);
-          out[(size_t)fr       * width + fc + 1] = gat_inverse_exact(val_Gr * sg);
-          out[(size_t)(fr + 1) * width + fc + 1] = gat_inverse_exact(val_B  * sg);
+          const int ch = ch_lut[fr & 1][fc & 1];
+          const size_t pos = (size_t)fr * width + fc;
+          const float val = 0.5f * (L_fr_den[pos]
+                                  + SIGNS[ch][0] * C1_full[pos]
+                                  + SIGNS[ch][1] * C2_full[pos]
+                                  + SIGNS[ch][2] * C3_full[pos])
+                          + ch_dark_ref[ch];
+          out[pos] = gat_inverse_exact(val * sg);
         }
+      }
+
+      dt_free_align(C1_full); dt_free_align(C2_full); dt_free_align(C3_full);
     }
 
     dt_free_align(L_fr_den);  L_fr_den = NULL;
@@ -1052,6 +1116,577 @@ cleanup_rawlc:
   dt_free_align(c1_out);
   dt_free_align(c2_out);
   dt_free_align(c3_out);
+}
+
+
+/* ================================================================
+ * [LATEST: GALOSH_RAW_O] gat_galosh_denoise_rawlc_o — O pipeline entry.
+ *
+ * O = L pipeline + multi-scale LOESS chroma pyramid + smoothstep slider
+ *   walk over 4 anchors:
+ *     slider = 0   → C_h         (= noisy, no denoise)
+ *     slider = 1   → C_loess_h   (= L baseline ≈ 30 raw px receptive field)
+ *     slider = 2   → C_q_up      (= 60 raw px, mid-grain blotch removal)
+ *     slider = 3   → C_e_up      (= 120 raw px, large-grain blotch removal)
+ *
+ *   Smoothstep blend within each segment for C¹-continuous slider feel.
+ *   Math identical to standalone gat_galosh_denoise_rawlc_o; see
+ *   standalone/galosh_raw_cpu.c for full design rationale.
+ *
+ * (日) GALOSH_RAW_O: chroma blotch killer with functional flat-region
+ *   slider.  L パイプラインの chroma LOESS を 3-level LOESS pyramid に
+ *   拡張、 slider 値で smoothstep blend (= 0 noisy / 1 標準 / 3 max)。
+ *   既存 L からの非破壊な改良 (= slider=1 で L と完全一致)。
+ * ================================================================ */
+static void gat_galosh_denoise_rawlc_o(const float *const restrict in,
+                                       float *const restrict out,
+                                       const dt_iop_roi_t *const roi,
+                                       const float luma_strength,
+                                       const float chroma_strength,
+                                       const uint32_t filters)
+{
+  const int width = roi->width, height = roi->height;
+  const size_t npixels = (size_t)width * height;
+  memcpy(out, in, sizeof(float) * npixels);
+
+  if(luma_strength <= 0.0f) return;
+  if(width < GALOSH_BLOCK_SIZE * 2 || height < GALOSH_BLOCK_SIZE * 2) return;
+
+  const int co_row = 0, co_col = 0;
+  (void)filters;
+
+  const int halfwidth  = (width  + 1) / 2;
+  const int halfheight = (height + 1) / 2;
+  const size_t chsize  = (size_t)halfwidth * halfheight;
+
+  float *in_gat = NULL;
+  float *L_cs = NULL;
+  float *L_cs_den = NULL;
+  float *L_pixel = NULL;
+  float *L_h_den = NULL;
+  float *C1_h = NULL, *C2_h = NULL, *C3_h = NULL;
+  float *L_q = NULL, *L_e = NULL;
+  float *C1_q = NULL, *C2_q = NULL, *C3_q = NULL;
+  float *C1_e = NULL, *C2_e = NULL, *C3_e = NULL;
+  float *C1_loess_h = NULL, *C2_loess_h = NULL, *C3_loess_h = NULL;
+  float *C1_loess_q = NULL, *C2_loess_q = NULL, *C3_loess_q = NULL;
+  float *C1_loess_e = NULL, *C2_loess_e = NULL, *C3_loess_e = NULL;
+  float *C1_q_up = NULL, *C2_q_up = NULL, *C3_q_up = NULL;
+  float *C1_e_to_q = NULL, *C2_e_to_q = NULL, *C3_e_to_q = NULL;
+  float *C1_e_up = NULL, *C2_e_up = NULL, *C3_e_up = NULL;
+  float *C1_h_den = NULL, *C2_h_den = NULL, *C3_h_den = NULL;
+  float *C1_aligned = NULL, *C2_aligned = NULL, *C3_aligned = NULL;
+
+  in_gat = dt_alloc_align_float(npixels);
+  if(!in_gat) goto cleanup_rawlc_o;
+
+  /* Phase 0: blind α / σ² */
+  const galosh_noise_params_t np = galosh_estimate_noise(in, width, height);
+  gat_build_inverse_table(np.alpha, np.sigma_sq);
+
+  /* Phase 1: GAT forward + per-CFA σ + RMS unified + scalar normalize */
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npixels; i++)
+    in_gat[i] = gat_forward(in[i], np.alpha, np.sigma_sq);
+
+  float sigma_gat_ch[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  for(int s = 0; s < 4; s++)
+  {
+    const int ro = ((s & 1)        + co_row) & 1;
+    const int co = (((s >> 1) & 1) + co_col) & 1;
+    const int hw = (width  - co + 1) / 2;
+    const int hh = (height - ro + 1) / 2;
+    if(hw < 4 || hh < 4) continue;
+
+    float *tmp = dt_alloc_align_float((size_t)hw * hh);
+    if(!tmp) continue;
+    DT_OMP_FOR()
+    for(int rr = 0; rr < hh; rr++)
+      for(int cc = 0; cc < hw; cc++)
+        tmp[(size_t)rr * hw + cc] = in_gat[(size_t)(ro + 2*rr) * width + (co + 2*cc)];
+    sigma_gat_ch[s] = estimate_gat_sigma_halfres(tmp, hw, hh);
+    dt_free_align(tmp);
+  }
+
+  const float mean_var = 0.25f * (sigma_gat_ch[0]*sigma_gat_ch[0]
+                                + sigma_gat_ch[1]*sigma_gat_ch[1]
+                                + sigma_gat_ch[2]*sigma_gat_ch[2]
+                                + sigma_gat_ch[3]*sigma_gat_ch[3]);
+  const float unified_sigma = sqrtf(fmaxf(mean_var, 1e-12f));
+  const float inv_sg = 1.0f / unified_sigma;
+
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npixels; i++) in_gat[i] *= inv_sg;
+
+  /* Phase 2: dark_ref IRLS + per-pixel CFA-aware subtract */
+  float ch_dark_ref[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  {
+    const double s_init = (double)np.sigma_sq / fmax((double)np.alpha, 1e-12);
+    double s_scale = s_init;
+    const double s_min = 0.05 * s_init;
+    const double s_max = 50.0 * s_init;
+    const int n_iter = 2;
+
+    for(int iter = 0; iter <= n_iter; iter++)
+    {
+      const double inv_s = 1.0 / fmax(s_scale, 1e-20);
+      double sum_w = 0.0;
+      double sum_w0 = 0.0, sum_w1 = 0.0, sum_w2 = 0.0, sum_w3 = 0.0;
+
+      #pragma omp parallel for collapse(2) schedule(static) \
+              reduction(+:sum_w,sum_w0,sum_w1,sum_w2,sum_w3)
+      for(int br = 0; br < height - 1; br += 2)
+        for(int bc = 0; bc < width - 1; bc += 2)
+        {
+          const float g0 = in_gat[(size_t)br     * width + bc    ];
+          const float g1 = in_gat[(size_t)(br+1) * width + bc    ];
+          const float g2 = in_gat[(size_t)br     * width + bc + 1];
+          const float g3 = in_gat[(size_t)(br+1) * width + bc + 1];
+          const float ch_max = fmaxf(fmaxf(g0, g1), fmaxf(g2, g3));
+          const float ch_min = fminf(fminf(g0, g1), fminf(g2, g3));
+          if(ch_max - ch_min > GALOSH_ACHROMATIC_RANGE) continue;
+
+          const float iv0 = in[(size_t)br     * width + bc    ];
+          const float iv1 = in[(size_t)(br+1) * width + bc    ];
+          const float iv2 = in[(size_t)br     * width + bc + 1];
+          const float iv3 = in[(size_t)(br+1) * width + bc + 1];
+          const double L_raw = (iv0 + iv1 + iv2 + iv3) * 0.25;
+          const double r = L_raw * inv_s;
+          const double r2 = r * r;
+          const double w = 1.0 / (1.0 + r2 * r2);
+          sum_w  += w;
+          sum_w0 += w * g0;
+          sum_w1 += w * g1;
+          sum_w2 += w * g2;
+          sum_w3 += w * g3;
+        }
+
+      const double inv_sw = 1.0 / fmax(sum_w, 1e-20);
+      ch_dark_ref[0] = (float)(sum_w0 * inv_sw);
+      ch_dark_ref[1] = (float)(sum_w1 * inv_sw);
+      ch_dark_ref[2] = (float)(sum_w2 * inv_sw);
+      ch_dark_ref[3] = (float)(sum_w3 * inv_sw);
+
+      if(iter == n_iter) break;
+
+      double sum_wresid2 = 0.0;
+      double sum_wW = 0.0;
+      const float dr0 = ch_dark_ref[0], dr1 = ch_dark_ref[1];
+      const float dr2 = ch_dark_ref[2], dr3 = ch_dark_ref[3];
+      #pragma omp parallel for collapse(2) schedule(static) \
+              reduction(+:sum_wresid2,sum_wW)
+      for(int br = 0; br < height - 1; br += 2)
+        for(int bc = 0; bc < width - 1; bc += 2)
+        {
+          const float g0 = in_gat[(size_t)br     * width + bc    ];
+          const float g1 = in_gat[(size_t)(br+1) * width + bc    ];
+          const float g2 = in_gat[(size_t)br     * width + bc + 1];
+          const float g3 = in_gat[(size_t)(br+1) * width + bc + 1];
+          const float ch_max = fmaxf(fmaxf(g0, g1), fmaxf(g2, g3));
+          const float ch_min = fminf(fminf(g0, g1), fminf(g2, g3));
+          if(ch_max - ch_min > GALOSH_ACHROMATIC_RANGE) continue;
+
+          const float iv0 = in[(size_t)br     * width + bc    ];
+          const float iv1 = in[(size_t)(br+1) * width + bc    ];
+          const float iv2 = in[(size_t)br     * width + bc + 1];
+          const float iv3 = in[(size_t)(br+1) * width + bc + 1];
+          const double L_raw = (iv0 + iv1 + iv2 + iv3) * 0.25;
+          const double r = L_raw * inv_s;
+          const double r2 = r * r;
+          const double w = 1.0 / (1.0 + r2 * r2);
+          const double d0 = (double)g0 - dr0;
+          const double d1 = (double)g1 - dr1;
+          const double d2 = (double)g2 - dr2;
+          const double d3 = (double)g3 - dr3;
+          const double resid2 = d0*d0 + d1*d1 + d2*d2 + d3*d3;
+          sum_wW      += w;
+          sum_wresid2 += w * resid2 * 0.25;
+        }
+      const double inv_sw2 = 1.0 / fmax(sum_wW, 1e-20);
+      const double measured_std = sqrt(fmax(sum_wresid2 * inv_sw2, 1e-20));
+      const double ratio = 1.0 / measured_std;
+      s_scale *= sqrt(ratio);
+      if(s_scale < s_min) s_scale = s_min;
+      if(s_scale > s_max) s_scale = s_max;
+    }
+
+    DT_OMP_FOR()
+    for(int r = 0; r < height; r++)
+    {
+      const int r_off = (r - co_row) & 1;
+      for(int c = 0; c < width; c++)
+      {
+        const int c_off = (c - co_col) & 1;
+        const int slot  = r_off | (c_off << 1);
+        in_gat[(size_t)r * width + c] -= ch_dark_ref[slot];
+      }
+    }
+  }
+
+  /* Phase 3: stride=1 forward 2x2 WHT (L-only) */
+  L_cs = dt_alloc_align_float(npixels);
+  if(!L_cs) goto cleanup_rawlc_o;
+  gat_h_forward_l_only_stride1(in_gat, L_cs, width, height);
+
+  /* Phase 4: half-res chroma extract */
+  C1_h = dt_alloc_align_float(chsize);
+  C2_h = dt_alloc_align_float(chsize);
+  C3_h = dt_alloc_align_float(chsize);
+  if(!C1_h || !C2_h || !C3_h) goto cleanup_rawlc_o;
+  gat_j_forward_c_halfres(in_gat, C1_h, C2_h, C3_h,
+                           width, height, halfwidth, halfheight);
+  dt_free_align(in_gat); in_gat = NULL;
+
+  /* Phase 5: single-scale WHT-LOSH on L_cs */
+  L_cs_den = dt_alloc_align_float(npixels);
+  if(!L_cs_den) goto cleanup_rawlc_o;
+  galosh_pass12_multiorient_blocked(L_cs, L_cs_den, width, height,
+                                     luma_strength, /*block=*/8,
+                                     /*stride=*/2, /*n_orient=*/1,
+                                     /*use_robust_shrink=*/1);
+  dt_free_align(L_cs); L_cs = NULL;
+
+  /* Phase 6: L_pixel + L_h_den */
+  L_pixel = dt_alloc_align_float(npixels);
+  L_h_den = dt_alloc_align_float(chsize);
+  if(!L_pixel || !L_h_den) goto cleanup_rawlc_o;
+
+  gat_i_lpixel_overlap_avg(L_cs_den, L_pixel, width, height);
+
+  DT_OMP_FOR()
+  for(int hr = 0; hr < halfheight; hr++)
+  {
+    const int fr = 2 * hr;
+    if(fr >= height) continue;
+    for(int hc = 0; hc < halfwidth; hc++)
+    {
+      const int fc = 2 * hc;
+      if(fc >= width) continue;
+      L_h_den[(size_t)hr * halfwidth + hc] = L_cs_den[(size_t)fr * width + fc];
+    }
+  }
+  dt_free_align(L_cs_den); L_cs_den = NULL;
+
+  /* Phase 7: multi-scale LOESS pyramid + L-guided K16 upsample chain */
+  const int cq_w = halfwidth / 2;
+  const int cq_h = halfheight / 2;
+  const int ce_w = cq_w / 2;
+  const int ce_h = cq_h / 2;
+  const size_t cqsize = (size_t)cq_w * cq_h;
+  const size_t cesize = (size_t)ce_w * ce_h;
+
+  if(cq_w < 4 || cq_h < 4 || ce_w < 4 || ce_h < 4)
+    goto cleanup_rawlc_o;  /* Image too small for 3-level pyramid */
+
+  /* L pyramid */
+  L_q = dt_alloc_align_float(cqsize);
+  L_e = dt_alloc_align_float(cesize);
+  if(!L_q || !L_e) goto cleanup_rawlc_o;
+  gat_box_downsample_2x(L_h_den, L_q, halfwidth, halfheight);
+  gat_box_downsample_2x(L_q,     L_e, cq_w,      cq_h);
+
+  /* Chroma pyramid inputs */
+  C1_q = dt_alloc_align_float(cqsize);
+  C2_q = dt_alloc_align_float(cqsize);
+  C3_q = dt_alloc_align_float(cqsize);
+  C1_e = dt_alloc_align_float(cesize);
+  C2_e = dt_alloc_align_float(cesize);
+  C3_e = dt_alloc_align_float(cesize);
+  if(!C1_q || !C2_q || !C3_q || !C1_e || !C2_e || !C3_e) goto cleanup_rawlc_o;
+  gat_box_downsample_2x(C1_h, C1_q, halfwidth, halfheight);
+  gat_box_downsample_2x(C2_h, C2_q, halfwidth, halfheight);
+  gat_box_downsample_2x(C3_h, C3_q, halfwidth, halfheight);
+  gat_box_downsample_2x(C1_q, C1_e, cq_w, cq_h);
+  gat_box_downsample_2x(C2_q, C2_e, cq_w, cq_h);
+  gat_box_downsample_2x(C3_q, C3_e, cq_w, cq_h);
+
+  /* LOESS at each scale */
+  C1_loess_h = dt_alloc_align_float(chsize);
+  C2_loess_h = dt_alloc_align_float(chsize);
+  C3_loess_h = dt_alloc_align_float(chsize);
+  C1_loess_q = dt_alloc_align_float(cqsize);
+  C2_loess_q = dt_alloc_align_float(cqsize);
+  C3_loess_q = dt_alloc_align_float(cqsize);
+  C1_loess_e = dt_alloc_align_float(cesize);
+  C2_loess_e = dt_alloc_align_float(cesize);
+  C3_loess_e = dt_alloc_align_float(cesize);
+  if(!C1_loess_h || !C2_loess_h || !C3_loess_h ||
+     !C1_loess_q || !C2_loess_q || !C3_loess_q ||
+     !C1_loess_e || !C2_loess_e || !C3_loess_e)
+    goto cleanup_rawlc_o;
+
+  const float loess_strength = 1.0f;  /* fixed; slider walk acts on segment blend below */
+  galosh_loess_chroma_3ch_r(L_h_den, C1_h, C2_h, C3_h,
+                             C1_loess_h, C2_loess_h, C3_loess_h,
+                             halfwidth, halfheight, loess_strength,
+                             GALOSH_LOESS_RADIUS, GALOSH_LOESS_BW);
+  galosh_loess_chroma_3ch_r(L_q, C1_q, C2_q, C3_q,
+                             C1_loess_q, C2_loess_q, C3_loess_q,
+                             cq_w, cq_h, loess_strength,
+                             GALOSH_LOESS_RADIUS, GALOSH_LOESS_BW);
+  galosh_loess_chroma_3ch_r(L_e, C1_e, C2_e, C3_e,
+                             C1_loess_e, C2_loess_e, C3_loess_e,
+                             ce_w, ce_h, loess_strength,
+                             GALOSH_LOESS_RADIUS, GALOSH_LOESS_BW);
+
+  dt_free_align(C1_q); dt_free_align(C2_q); dt_free_align(C3_q);
+  C1_q = C2_q = C3_q = NULL;
+  dt_free_align(C1_e); dt_free_align(C2_e); dt_free_align(C3_e);
+  C1_e = C2_e = C3_e = NULL;
+
+  /* K16 upsample chain (= 3 calls with stride correction) */
+  C1_q_up = dt_alloc_align_float(chsize);
+  C2_q_up = dt_alloc_align_float(chsize);
+  C3_q_up = dt_alloc_align_float(chsize);
+  C1_e_up = dt_alloc_align_float(chsize);
+  C2_e_up = dt_alloc_align_float(chsize);
+  C3_e_up = dt_alloc_align_float(chsize);
+  if(!C1_q_up || !C2_q_up || !C3_q_up ||
+     !C1_e_up || !C2_e_up || !C3_e_up)
+    goto cleanup_rawlc_o;
+
+  /* quarter → half (L_h_den guide) — stride-corrected */
+  {
+    const int fw = 2 * cq_w;
+    const int fh = 2 * cq_h;
+    const size_t fsize = (size_t)fw * fh;
+
+    float *L_for_q = dt_alloc_align_float(fsize);
+    float *C1_q_up_raw = dt_alloc_align_float(fsize);
+    float *C2_q_up_raw = dt_alloc_align_float(fsize);
+    float *C3_q_up_raw = dt_alloc_align_float(fsize);
+    if(!L_for_q || !C1_q_up_raw || !C2_q_up_raw || !C3_q_up_raw)
+    {
+      dt_free_align(L_for_q);
+      dt_free_align(C1_q_up_raw); dt_free_align(C2_q_up_raw); dt_free_align(C3_q_up_raw);
+      goto cleanup_rawlc_o;
+    }
+    gat_crop_2d_topleft(L_h_den, halfwidth, halfheight, L_for_q, fw, fh);
+    gat_k16_joint_bilateral_upsample(C1_loess_q, C2_loess_q, C3_loess_q, L_for_q,
+                                      C1_q_up_raw, C2_q_up_raw, C3_q_up_raw,
+                                      cq_w, cq_h, /*BW=*/1.5f);
+    gat_pad_2d_edge(C1_q_up_raw, fw, fh, C1_q_up, halfwidth, halfheight);
+    gat_pad_2d_edge(C2_q_up_raw, fw, fh, C2_q_up, halfwidth, halfheight);
+    gat_pad_2d_edge(C3_q_up_raw, fw, fh, C3_q_up, halfwidth, halfheight);
+    dt_free_align(L_for_q);
+    dt_free_align(C1_q_up_raw);
+    dt_free_align(C2_q_up_raw);
+    dt_free_align(C3_q_up_raw);
+  }
+
+  /* eighth → quarter → half (chained, stride-corrected) */
+  {
+    const int fw_eq = 2 * ce_w;
+    const int fh_eq = 2 * ce_h;
+    const size_t fsize_eq = (size_t)fw_eq * fh_eq;
+
+    float *L_for_e = dt_alloc_align_float(fsize_eq);
+    float *C1_e_to_q_raw = dt_alloc_align_float(fsize_eq);
+    float *C2_e_to_q_raw = dt_alloc_align_float(fsize_eq);
+    float *C3_e_to_q_raw = dt_alloc_align_float(fsize_eq);
+    if(!L_for_e || !C1_e_to_q_raw || !C2_e_to_q_raw || !C3_e_to_q_raw)
+    {
+      dt_free_align(L_for_e);
+      dt_free_align(C1_e_to_q_raw); dt_free_align(C2_e_to_q_raw); dt_free_align(C3_e_to_q_raw);
+      goto cleanup_rawlc_o;
+    }
+    gat_crop_2d_topleft(L_q, cq_w, cq_h, L_for_e, fw_eq, fh_eq);
+    gat_k16_joint_bilateral_upsample(C1_loess_e, C2_loess_e, C3_loess_e, L_for_e,
+                                      C1_e_to_q_raw, C2_e_to_q_raw, C3_e_to_q_raw,
+                                      ce_w, ce_h, /*BW=*/1.5f);
+    C1_e_to_q = dt_alloc_align_float(cqsize);
+    C2_e_to_q = dt_alloc_align_float(cqsize);
+    C3_e_to_q = dt_alloc_align_float(cqsize);
+    if(!C1_e_to_q || !C2_e_to_q || !C3_e_to_q)
+    {
+      dt_free_align(L_for_e);
+      dt_free_align(C1_e_to_q_raw); dt_free_align(C2_e_to_q_raw); dt_free_align(C3_e_to_q_raw);
+      goto cleanup_rawlc_o;
+    }
+    gat_pad_2d_edge(C1_e_to_q_raw, fw_eq, fh_eq, C1_e_to_q, cq_w, cq_h);
+    gat_pad_2d_edge(C2_e_to_q_raw, fw_eq, fh_eq, C2_e_to_q, cq_w, cq_h);
+    gat_pad_2d_edge(C3_e_to_q_raw, fw_eq, fh_eq, C3_e_to_q, cq_w, cq_h);
+    dt_free_align(L_for_e);
+    dt_free_align(C1_e_to_q_raw);
+    dt_free_align(C2_e_to_q_raw);
+    dt_free_align(C3_e_to_q_raw);
+
+    const int fw_qh = 2 * cq_w;
+    const int fh_qh = 2 * cq_h;
+    const size_t fsize_qh = (size_t)fw_qh * fh_qh;
+
+    float *L_for_q2 = dt_alloc_align_float(fsize_qh);
+    float *C1_e_up_raw = dt_alloc_align_float(fsize_qh);
+    float *C2_e_up_raw = dt_alloc_align_float(fsize_qh);
+    float *C3_e_up_raw = dt_alloc_align_float(fsize_qh);
+    if(!L_for_q2 || !C1_e_up_raw || !C2_e_up_raw || !C3_e_up_raw)
+    {
+      dt_free_align(L_for_q2);
+      dt_free_align(C1_e_up_raw); dt_free_align(C2_e_up_raw); dt_free_align(C3_e_up_raw);
+      goto cleanup_rawlc_o;
+    }
+    gat_crop_2d_topleft(L_h_den, halfwidth, halfheight, L_for_q2, fw_qh, fh_qh);
+    gat_k16_joint_bilateral_upsample(C1_e_to_q, C2_e_to_q, C3_e_to_q, L_for_q2,
+                                      C1_e_up_raw, C2_e_up_raw, C3_e_up_raw,
+                                      cq_w, cq_h, /*BW=*/1.5f);
+    gat_pad_2d_edge(C1_e_up_raw, fw_qh, fh_qh, C1_e_up, halfwidth, halfheight);
+    gat_pad_2d_edge(C2_e_up_raw, fw_qh, fh_qh, C2_e_up, halfwidth, halfheight);
+    gat_pad_2d_edge(C3_e_up_raw, fw_qh, fh_qh, C3_e_up, halfwidth, halfheight);
+    dt_free_align(L_for_q2);
+    dt_free_align(C1_e_up_raw);
+    dt_free_align(C2_e_up_raw);
+    dt_free_align(C3_e_up_raw);
+  }
+
+  dt_free_align(C1_loess_q); dt_free_align(C2_loess_q); dt_free_align(C3_loess_q);
+  C1_loess_q = C2_loess_q = C3_loess_q = NULL;
+  dt_free_align(C1_loess_e); dt_free_align(C2_loess_e); dt_free_align(C3_loess_e);
+  C1_loess_e = C2_loess_e = C3_loess_e = NULL;
+  dt_free_align(C1_e_to_q); dt_free_align(C2_e_to_q); dt_free_align(C3_e_to_q);
+  C1_e_to_q = C2_e_to_q = C3_e_to_q = NULL;
+  dt_free_align(L_q); dt_free_align(L_e);
+  L_q = L_e = NULL;
+
+  /* Phase 8: smoothstep slider walk */
+  C1_h_den = dt_alloc_align_float(chsize);
+  C2_h_den = dt_alloc_align_float(chsize);
+  C3_h_den = dt_alloc_align_float(chsize);
+  if(!C1_h_den || !C2_h_den || !C3_h_den) goto cleanup_rawlc_o;
+
+  {
+    const float s = chroma_strength;
+    int segment;
+    float t_raw;
+    const float *A1, *A2, *A3, *B1, *B2, *B3;
+    if(s <= 0.0f)
+    {
+      segment = -1;
+      t_raw = 0.0f;
+      A1 = A2 = A3 = B1 = B2 = B3 = NULL;
+    }
+    else if(s <= 1.0f)
+    {
+      segment = 0;
+      t_raw = s;
+      A1 = C1_h;       A2 = C2_h;       A3 = C3_h;
+      B1 = C1_loess_h; B2 = C2_loess_h; B3 = C3_loess_h;
+    }
+    else if(s <= 2.0f)
+    {
+      segment = 1;
+      t_raw = s - 1.0f;
+      A1 = C1_loess_h; A2 = C2_loess_h; A3 = C3_loess_h;
+      B1 = C1_q_up;    B2 = C2_q_up;    B3 = C3_q_up;
+    }
+    else if(s <= 3.0f)
+    {
+      segment = 2;
+      t_raw = s - 2.0f;
+      A1 = C1_q_up;    A2 = C2_q_up;    A3 = C3_q_up;
+      B1 = C1_e_up;    B2 = C2_e_up;    B3 = C3_e_up;
+    }
+    else
+    {
+      segment = 3;
+      t_raw = 1.0f;
+      A1 = C1_e_up;    A2 = C2_e_up;    A3 = C3_e_up;
+      B1 = NULL;       B2 = NULL;       B3 = NULL;
+    }
+
+    if(segment < 0)
+    {
+      memcpy(C1_h_den, C1_h, sizeof(float) * chsize);
+      memcpy(C2_h_den, C2_h, sizeof(float) * chsize);
+      memcpy(C3_h_den, C3_h, sizeof(float) * chsize);
+    }
+    else if(segment >= 3 || B1 == NULL)
+    {
+      memcpy(C1_h_den, A1, sizeof(float) * chsize);
+      memcpy(C2_h_den, A2, sizeof(float) * chsize);
+      memcpy(C3_h_den, A3, sizeof(float) * chsize);
+    }
+    else
+    {
+      const float t = t_raw * t_raw * (3.0f - 2.0f * t_raw);
+      const float oneMt = 1.0f - t;
+      DT_OMP_FOR()
+      for(size_t i = 0; i < chsize; i++)
+      {
+        C1_h_den[i] = oneMt * A1[i] + t * B1[i];
+        C2_h_den[i] = oneMt * A2[i] + t * B2[i];
+        C3_h_den[i] = oneMt * A3[i] + t * B3[i];
+      }
+    }
+  }
+
+  dt_free_align(C1_h); dt_free_align(C2_h); dt_free_align(C3_h);
+  C1_h = C2_h = C3_h = NULL;
+  dt_free_align(C1_loess_h); dt_free_align(C2_loess_h); dt_free_align(C3_loess_h);
+  C1_loess_h = C2_loess_h = C3_loess_h = NULL;
+  dt_free_align(C1_q_up); dt_free_align(C2_q_up); dt_free_align(C3_q_up);
+  C1_q_up = C2_q_up = C3_q_up = NULL;
+  dt_free_align(C1_e_up); dt_free_align(C2_e_up); dt_free_align(C3_e_up);
+  C1_e_up = C2_e_up = C3_e_up = NULL;
+  dt_free_align(L_h_den); L_h_den = NULL;
+
+  /* Phase 9: final K16 joint bilateral upsample to full-res */
+  C1_aligned = dt_alloc_align_float(npixels);
+  C2_aligned = dt_alloc_align_float(npixels);
+  C3_aligned = dt_alloc_align_float(npixels);
+  if(!C1_aligned || !C2_aligned || !C3_aligned) goto cleanup_rawlc_o;
+
+  gat_k16_joint_bilateral_upsample(C1_h_den, C2_h_den, C3_h_den, L_pixel,
+                                    C1_aligned, C2_aligned, C3_aligned,
+                                    halfwidth, halfheight, /*BW=*/1.5f);
+  dt_free_align(C1_h_den); dt_free_align(C2_h_den); dt_free_align(C3_h_den);
+  C1_h_den = C2_h_den = C3_h_den = NULL;
+
+  /* Phase 10: per-pixel inverse 2x2 WHT + dark_ref + ×unified_sigma + inv GAT */
+  {
+    static const float SIGNS[4][3] = {
+      { +1.0f, +1.0f, +1.0f },  /* R  */
+      { -1.0f, +1.0f, -1.0f },  /* Gb */
+      { +1.0f, -1.0f, -1.0f },  /* Gr */
+      { -1.0f, -1.0f, +1.0f },  /* B  */
+    };
+
+    DT_OMP_FOR()
+    for(int fr = 0; fr < height; fr++)
+    {
+      const int r_off = (fr - co_row) & 1;
+      for(int fc = 0; fc < width; fc++)
+      {
+        const int c_off = (fc - co_col) & 1;
+        const int slot  = r_off | (c_off << 1);
+        const size_t pos = (size_t)fr * width + fc;
+        const float val = 0.5f * (L_pixel[pos]
+                                + SIGNS[slot][0] * C1_aligned[pos]
+                                + SIGNS[slot][1] * C2_aligned[pos]
+                                + SIGNS[slot][2] * C3_aligned[pos])
+                        + ch_dark_ref[slot];
+        out[pos] = gat_inverse_exact(val * unified_sigma);
+      }
+    }
+  }
+
+cleanup_rawlc_o:
+  dt_free_align(in_gat);
+  dt_free_align(L_cs);
+  dt_free_align(L_cs_den);
+  dt_free_align(L_pixel);
+  dt_free_align(L_h_den);
+  dt_free_align(L_q); dt_free_align(L_e);
+  dt_free_align(C1_h); dt_free_align(C2_h); dt_free_align(C3_h);
+  dt_free_align(C1_q); dt_free_align(C2_q); dt_free_align(C3_q);
+  dt_free_align(C1_e); dt_free_align(C2_e); dt_free_align(C3_e);
+  dt_free_align(C1_loess_h); dt_free_align(C2_loess_h); dt_free_align(C3_loess_h);
+  dt_free_align(C1_loess_q); dt_free_align(C2_loess_q); dt_free_align(C3_loess_q);
+  dt_free_align(C1_loess_e); dt_free_align(C2_loess_e); dt_free_align(C3_loess_e);
+  dt_free_align(C1_q_up); dt_free_align(C2_q_up); dt_free_align(C3_q_up);
+  dt_free_align(C1_e_to_q); dt_free_align(C2_e_to_q); dt_free_align(C3_e_to_q);
+  dt_free_align(C1_e_up); dt_free_align(C2_e_up); dt_free_align(C3_e_up);
+  dt_free_align(C1_h_den); dt_free_align(C2_h_den); dt_free_align(C3_h_den);
+  dt_free_align(C1_aligned); dt_free_align(C2_aligned); dt_free_align(C3_aligned);
 }
 
 

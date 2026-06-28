@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from scipy.io import loadmat
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 SIDD_VAL = GALOSH / "benchmark" / "SIDD_Validation"
 OUT = GALOSH / "benchmark" / "results" / "speed"
 OUT.mkdir(parents=True, exist_ok=True)

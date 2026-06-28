@@ -12,7 +12,7 @@ from skimage.io import imread
 MSYS_PATH = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 BASE = Path(__file__).parent.parent
 EXE = str(BASE / "standalone" / "rawdenoise.exe")
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def inv_srgb(x):

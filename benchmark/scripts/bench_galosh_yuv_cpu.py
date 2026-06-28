@@ -1,13 +1,17 @@
-"""GALOSH YUV CPU bench (legacy + v5 robust-MAD).
+"""GALOSH_YUV_O CPU bench.
 
-SIDD Medium 80-pair benchmark for galosh_yuv_cpu.exe in two configurations:
-  * legacy            --robust-shrink=0  (mean-based BayesShrink, baseline)
-  * v5 robust-MAD     --robust-shrink=1  (MAD-based BayesShrink, stage 1
-                                          mirror of RAW CPU v5)
+SIDD Medium 80-pair benchmark for galosh_yuv_cpu.exe.
 
-Output PNGs land alongside the existing GPU YUV method dirs:
-    benchmark/sidd_medium/galosh_yuv_cpu/<tag>_den.png
-    benchmark/sidd_medium/galosh_yuv_cpu_robust_mad/<tag>_den.png
+GALOSH_YUV_O is the production canonical pipeline (= former
+"v5 robust-MAD" / "GALOSH_YUV_G", now finalised under the _O naming
+mirror of GALOSH_RAW_O).  MAD-based BayesShrink and bilateral LOESS
+chroma are unconditionally on; no flag toggles them any more.
+
+Legacy mean-based BayesShrink (--robust-shrink=0) and the pre-G
+separable mean-only chroma filter remain in archived bench dirs only.
+
+Output PNGs land at:
+    benchmark/sidd_medium/galosh_yuv_cpu_o/<tag>_den.png
 
 Per-image pipeline:
     noisy_srgb.npy (float32 [0,1])
@@ -42,7 +46,7 @@ from PIL import Image
 
 GALOSH_ROOT = Path(__file__).parent.parent.parent
 EXE         = GALOSH_ROOT / "standalone" / "galosh_yuv_cpu.exe"
-BENCH_DIR   = Path(r"C:\Users\luxgrain\datasets\sidd\medium_bench")
+BENCH_DIR   = Path(os.path.expanduser(r"~\datasets\sidd\medium_bench"))
 OUT_ROOT    = GALOSH_ROOT / "benchmark" / "sidd_medium"
 TMP_DIR     = GALOSH_ROOT / "benchmark" / "sidd_medium" / "_tmp_yuvcpubench"
 TMP_DIR.mkdir(parents=True, exist_ok=True)

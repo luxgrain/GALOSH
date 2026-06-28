@@ -76,6 +76,11 @@
 #define HALO       (GALOSH_BS - GALOSH_STRIDE)     /* 6: ensures stride-aligned blocks */
 #define TILE_W     (TILE_SIZE + 2 * HALO)         /* 46 for TILE_SIZE=32 */
 #define TILE_PIXELS (TILE_W * TILE_W)             /* 2116 */
+/* Smaller tile for the FP32 LOSH (galosh_fused_pass12_f32): float LDS is 2x/pixel,
+ * so the TILE_SIZE(=48) tile would need ~56KB > 48KB.  32 -> ~30KB, fits. */
+#define TILE_SIZE_F32   24   /* 20.7KB float LDS */
+#define TILE_W_F32      (TILE_SIZE_F32 + 2 * HALO)
+#define TILE_PIXELS_F32 (TILE_W_F32 * TILE_W_F32)
 
 #define WIENER_FLOOR  0.125f   /* 1/BS */
 
@@ -220,6 +225,82 @@ inline float mad_sigma_y_sq_h(const half *restrict block)
     /* mad approximates 0.6745 * sqrt(N) * sigma_Y in unnormalized WHT
      * scale (because median(|N(0, N*sigma^2)|) = 0.6745 * sqrt(N) * sigma);
      * convert to per-pixel sigma_Y^2: (mad / 0.6745)^2 / N. */
+    const float sy = mad / 0.6745f;
+    return (sy * sy) / (float)GALOSH_BP;
+}
+
+
+/* ================================================================
+ * FP32 (float) versions of the WHT + MAD helpers.  SHARED by the o32
+ * RAW path (§6.4 galosh_pass12_o32) and the PC-default YUV FP32 LOSH
+ * kernel (galosh_fused_pass12_f32).  Defined here (early, next to the
+ * §1 _h half versions) so BOTH kernels reach them; the former §6.4
+ * local copies were removed to avoid a redefinition.
+ * EN: The _h helpers take half* (mobile/FP16 storage path).  An FP32
+ *     kernel must NOT pass float* to a half* parameter (pointer type
+ *     mismatch → "N warnings" + a broken build).  These _f copies are
+ *     bit-identical in structure but full FP32 (no half intermediate
+ *     rounding) so the GPU FP32 path matches the FP32 CPU reference
+ *     (galosh_yuv_cpu) to ~1e-4, not the ~5e-3 FP16 floor.
+ * JP: _h は half* 引数（mobile/FP16）。FP32 kernel が float* を half*
+ *     に渡すと型不一致でビルド破綻するため、構造同一・中間も完全 FP32
+ *     の float 版を用意。o32 と YUV f32 で共有。
+ * ================================================================ */
+inline void wht8_f(float *x)
+{
+  /* 3-stage 8-point Hadamard butterfly (mirror of §1 wht8_h).
+   * BUG FIX 2026-05-09: stage 1 (pair butterfly) was missing in the
+   * initial o32 port — caused Phase 5 pass12_o32 to give 80% mean
+   * attenuation (flagged by tools/verify_o32_phases.py as the first
+   * divergence vs CPU). */
+  float a0 = x[0]+x[1], a1 = x[0]-x[1];
+  float a2 = x[2]+x[3], a3 = x[2]-x[3];
+  float a4 = x[4]+x[5], a5 = x[4]-x[5];
+  float a6 = x[6]+x[7], a7 = x[6]-x[7];
+  float b0 = a0+a2, b1 = a1+a3;
+  float b2 = a0-a2, b3 = a1-a3;
+  float b4 = a4+a6, b5 = a5+a7;
+  float b6 = a4-a6, b7 = a5-a7;
+  x[0] = b0+b4; x[1] = b1+b5; x[2] = b2+b6; x[3] = b3+b7;
+  x[4] = b0-b4; x[5] = b1-b5; x[6] = b2-b6; x[7] = b3-b7;
+}
+
+inline void wht2d_8x8_f(float *block, const int normalize)
+{
+  for(int r = 0; r < 8; r++)
+    wht8_f(block + r * 8);
+  for(int c = 0; c < 8; c++)
+  {
+    float col[8];
+    for(int r = 0; r < 8; r++) col[r] = block[r * 8 + c];
+    wht8_f(col);
+    for(int r = 0; r < 8; r++) block[r * 8 + c] = col[r];
+  }
+  if(normalize)
+  {
+    const float inv = (1.0f / 64.0f);
+    for(int i = 0; i < 64; i++) block[i] *= inv;
+  }
+}
+
+inline float mad_sigma_y_sq_f(const float *restrict block)
+{
+    float abs_ac[GALOSH_BP - 1];
+    for(int i = 1; i < GALOSH_BP; i++)
+        abs_ac[i - 1] = fabs(block[i]);
+    const int target = (GALOSH_BP - 1) / 2;
+    for(int k = 0; k <= target; k++)
+    {
+        int min_idx = k;
+        float min_val = abs_ac[k];
+        for(int j = k + 1; j < GALOSH_BP - 1; j++)
+        {
+            if(abs_ac[j] < min_val) { min_val = abs_ac[j]; min_idx = j; }
+        }
+        abs_ac[min_idx] = abs_ac[k];
+        abs_ac[k] = min_val;
+    }
+    const float mad = abs_ac[target];
     const float sy = mad / 0.6745f;
     return (sy * sy) / (float)GALOSH_BP;
 }
@@ -619,6 +700,240 @@ kernel void galosh_fused_pass12(
       const float d = (float)denom[idx];
       output[(size_t)gy * width + gx] = (d > 1e-6f)
           ? (half)((float)numer[idx] / d) : tile_in[idx];
+    }
+  }
+}
+
+/* FP32 (PC/desktop) variant of galosh_fused_pass12 — identical math, float storage
+ * (the half version keeps numer/denom/tile in FP16 for the mobile/embedded path).
+ * Used by the YUV GPU FP32 default so CPU<->GPU match to ~FP32 (not the FP16 floor). */
+kernel void galosh_fused_pass12_f32(
+    global const float *restrict input,
+    global float *restrict output,
+    const int width,
+    const int height,
+    const float sigma_strength)
+{
+  const int tile_x = get_group_id(0) * TILE_SIZE_F32;
+  const int tile_y = get_group_id(1) * TILE_SIZE_F32;
+  const int lid = get_local_id(1) * get_local_size(0) + get_local_id(0);
+  const int wg_size = get_local_size(0) * get_local_size(1);
+
+  local float tile_in[TILE_PIXELS_F32];
+  local float numer[TILE_PIXELS_F32];
+  local float denom[TILE_PIXELS_F32];
+  local float pilot[TILE_PIXELS_F32];
+
+  /* ---- Step 1: Load input tile (with halo) ---- */
+  for(int i = lid; i < TILE_PIXELS_F32; i += wg_size)
+  {
+    const int lx = i % TILE_W_F32;
+    const int ly = i / TILE_W_F32;
+    const int gx = tile_x - HALO + lx;
+    const int gy = tile_y - HALO + ly;
+    tile_in[i] = (gx >= 0 && gx < width && gy >= 0 && gy < height)
+                 ? input[(size_t)gy * width + gx] : (float)0.0f;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  /* ---- Step 2: Zero accumulators ---- */
+  for(int i = lid; i < TILE_PIXELS_F32; i += wg_size)
+  {
+    numer[i] = (float)0.0f;
+    denom[i] = (float)0.0f;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  /* ---- Step 3: Pass1 BayesShrink (phased overlap-add, FP16 blocks + WHT, FP32 threshold math) ---- */
+  {
+    const int n_blocks_dim = (TILE_W_F32 - GALOSH_BS) / GALOSH_STRIDE + 1;
+    const float sigma_sq = sigma_strength * sigma_strength;
+    const float lambda_max_base = sigma_strength * sqrt(2.0f * log((float)GALOSH_BP));
+
+    for(int phase = 0; phase < N_PHASES; phase++)
+    {
+      const int px = phase % PHASE_MOD;
+      const int py = phase / PHASE_MOD;
+      const int bpd = (n_blocks_dim - px + PHASE_MOD - 1) / PHASE_MOD;
+      const int bpd_y = (n_blocks_dim - py + PHASE_MOD - 1) / PHASE_MOD;
+      const int n_blocks = bpd * bpd_y;
+
+      for(int bi = lid; bi < n_blocks; bi += wg_size)
+      {
+        const int pbx = bi % bpd;
+        const int pby = bi / bpd;
+        const int bx = pbx * PHASE_MOD + px;
+        const int by = pby * PHASE_MOD + py;
+        if(bx >= n_blocks_dim || by >= n_blocks_dim) continue;
+
+        const int ref_c = bx * GALOSH_STRIDE;
+        const int ref_r = by * GALOSH_STRIDE;
+
+        float block[GALOSH_BP];
+        for(int dy = 0; dy < GALOSH_BS; dy++)
+          for(int dx = 0; dx < GALOSH_BS; dx++)
+            block[dy * GALOSH_BS + dx] = tile_in[(ref_r + dy) * TILE_W_F32 + (ref_c + dx)];
+
+        wht2d_8x8_f(block, 0);
+
+        /* BayesShrink threshold in FP32 for precision */
+        /* GALOSH_*_G: MAD-based sigma_Y (replaces L2 sum_sq).  See
+         * mad_sigma_y_sq_h() above for derivation and rationale. */
+        const float sigma_y_sq = mad_sigma_y_sq_f(block);
+        const float sigma_x_sq = fmax(sigma_y_sq - sigma_sq, 0.0f);
+
+        float lambda;
+        if(sigma_x_sq < 1e-10f)
+          lambda = 1e30f;
+        else
+        {
+          lambda = (sigma_sq / sqrt(sigma_x_sq)) * sqrt((float)GALOSH_BP);
+          const float lambda_max_unorm = lambda_max_base * sqrt((float)GALOSH_BP);
+          if(lambda > lambda_max_unorm) lambda = lambda_max_unorm;
+        }
+
+        /* Pass1 shrinkage — soft instead of hard.
+         * EN: Hard thresholding ( |c|<λ → 0 else c ) creates a discontinuity
+         *     at |c|=λ.  In yuv_gpu this leaks into the chroma path as a
+         *     blocky overlap-add artifact and inflates LPIPS.  Soft
+         *     thresholding ( c → sign(c)·max(|c|-λ, 0) ) is continuous and
+         *     preserves edge gradient direction.  Pass2 Wiener still applies
+         *     so noise floor is maintained.
+         * JP: Pass1 を soft 化。hard 不連続 → over-smooth + ブロック化、
+         *     perceptual を悪化させていた。soft で連続化、Pass2 Wiener が
+         *     後段で noise level 確保。 */
+        int n_nonzero = 1;
+        for(int i = 1; i < GALOSH_BP; i++)
+        {
+          const float v = (float)block[i];
+          const float a = fabs(v);
+          if(a < lambda)
+            block[i] = (float)0.0f;
+          else
+          {
+            block[i] = (float)copysign(a - lambda, v);
+            n_nonzero++;
+          }
+        }
+
+        wht2d_8x8_f(block, 1);
+
+        const float weight = 1.0f / (float)n_nonzero;
+        for(int dy = 0; dy < GALOSH_BS; dy++)
+          for(int dx = 0; dx < GALOSH_BS; dx++)
+          {
+            const float kw = kaiser_1d[dy] * kaiser_1d[dx];
+            const float wkw = weight * kw;
+            const int pos = (ref_r + dy) * TILE_W_F32 + (ref_c + dx);
+            numer[pos] += (float)(wkw * (float)block[dy * GALOSH_BS + dx]);
+            denom[pos] += (float)wkw;
+          }
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+  }
+
+  /* ---- Step 4: Finalize Pass1 → pilot ---- */
+  for(int i = lid; i < TILE_PIXELS_F32; i += wg_size)
+  {
+    const float d = (float)denom[i];
+    pilot[i] = (d > 1e-6f) ? (float)((float)numer[i] / d) : tile_in[i];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  /* ---- Step 5: Zero accumulators for Pass2 ---- */
+  for(int i = lid; i < TILE_PIXELS_F32; i += wg_size)
+  {
+    numer[i] = (float)0.0f;
+    denom[i] = (float)0.0f;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  /* ---- Step 6: Pass2 Wiener shrinkage (phased overlap-add, FP16 blocks + WHT, FP32 gain math) ---- */
+  {
+    const int n_blocks_dim = (TILE_W_F32 - GALOSH_BS) / GALOSH_STRIDE + 1;
+    const float sigma_sq_unorm = sigma_strength * sigma_strength * (float)GALOSH_BP;
+
+    for(int phase = 0; phase < N_PHASES; phase++)
+    {
+      const int px = phase % PHASE_MOD;
+      const int py = phase / PHASE_MOD;
+      const int bpd = (n_blocks_dim - px + PHASE_MOD - 1) / PHASE_MOD;
+      const int bpd_y = (n_blocks_dim - py + PHASE_MOD - 1) / PHASE_MOD;
+      const int n_blocks = bpd * bpd_y;
+
+      for(int bi = lid; bi < n_blocks; bi += wg_size)
+      {
+        const int pbx = bi % bpd;
+        const int pby = bi / bpd;
+        const int bx = pbx * PHASE_MOD + px;
+        const int by = pby * PHASE_MOD + py;
+        if(bx >= n_blocks_dim || by >= n_blocks_dim) continue;
+
+        const int ref_c = bx * GALOSH_STRIDE;
+        const int ref_r = by * GALOSH_STRIDE;
+
+        float blk_noisy[GALOSH_BP];
+        float blk_pilot[GALOSH_BP];
+        for(int dy = 0; dy < GALOSH_BS; dy++)
+          for(int dx = 0; dx < GALOSH_BS; dx++)
+          {
+            const int pos = (ref_r + dy) * TILE_W_F32 + (ref_c + dx);
+            blk_noisy[dy * GALOSH_BS + dx] = tile_in[pos];
+            blk_pilot[dy * GALOSH_BS + dx] = pilot[pos];
+          }
+
+        wht2d_8x8_f(blk_noisy, 0);
+        wht2d_8x8_f(blk_pilot, 0);
+
+        /* Wiener gain in FP32, apply to float */
+        float wiener_energy = 0.0f;
+        for(int i = 0; i < GALOSH_BP; i++)
+        {
+          float w;
+          if(i == 0)
+            w = 1.0f;
+          else
+          {
+            const float p = (float)blk_pilot[i];
+            const float s2 = p * p;
+            w = s2 / (s2 + sigma_sq_unorm);
+            if(w < WIENER_FLOOR) w = WIENER_FLOOR;
+          }
+          blk_noisy[i] = (float)((float)blk_noisy[i] * w);
+          wiener_energy += w * w;
+        }
+
+        wht2d_8x8_f(blk_noisy, 1);
+
+        const float weight = 1.0f / fmax(wiener_energy, 1e-6f);
+        for(int dy = 0; dy < GALOSH_BS; dy++)
+          for(int dx = 0; dx < GALOSH_BS; dx++)
+          {
+            const float kw = kaiser_1d[dy] * kaiser_1d[dx];
+            const float wkw = weight * kw;
+            const int pos = (ref_r + dy) * TILE_W_F32 + (ref_c + dx);
+            numer[pos] += (float)(wkw * (float)blk_noisy[dy * GALOSH_BS + dx]);
+            denom[pos] += (float)wkw;
+          }
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+  }
+
+  /* ---- Step 7: Finalize Pass2 → global output (interior only) ---- */
+  for(int i = lid; i < TILE_SIZE_F32 * TILE_SIZE_F32; i += wg_size)
+  {
+    const int lx = i % TILE_SIZE_F32 + HALO;
+    const int ly = i / TILE_SIZE_F32 + HALO;
+    const int idx = ly * TILE_W_F32 + lx;
+    const int gx = tile_x + (i % TILE_SIZE_F32);
+    const int gy = tile_y + (i / TILE_SIZE_F32);
+    if(gx < width && gy < height)
+    {
+      const float d = (float)denom[idx];
+      output[(size_t)gy * width + gx] = (d > 1e-6f)
+          ? (float)((float)numer[idx] / d) : tile_in[idx];
     }
   }
 }
@@ -3171,27 +3486,37 @@ kernel void galosh_yuv_makitalo_inverse_Y(
   const int i = get_global_id(0);
   if(i >= npix) return;
   const float d = d_stab[i];
-  const float d_min = lut_params[0];
-  const float d_max = lut_params[1];
+  const float d_min     = lut_params[0];
+  const float d_max     = lut_params[1];
+  const float y_break   = lut_params[2];
+  const float t_break   = lut_params[3];
+  const float sigma_raw = lut_params[4];
 
-  /* Binary search within lut_d[] for the interval containing d. */
+  /* EXACT match to CPU gat_inverse_exact (galosh_cpu.h):
+   *  - d <= d_min : analytical linear-branch inverse y_break+σ(d-t_break)
+   *                 (NOT a clamp to lut_x[0] — preserves the dark-tail
+   *                  distribution shape; the clamp + the lut_x[0] floor were
+   *                  the ~3e-4 luma CPU<->GPU residual after the LOSH/chroma
+   *                  were reconciled, concentrated in the dark pixels);
+   *  - d >= d_max : 1.0 (NOT lut_x[4095]);
+   *  - interior   : same binary search + lerp form as the CPU, no fmax(·,0). */
   float result;
   if(d <= d_min) {
-    result = lut_x[0];
+    result = y_break + sigma_raw * (d - t_break);
   } else if(d >= d_max) {
-    result = lut_x[4095];
+    result = 1.0f;
   } else {
-    int lo = 0, hi = 4095;
+    int lo = 0, hi = GAT_LUT_SIZE - 1;
     while(hi - lo > 1)
     {
       const int mid = (lo + hi) >> 1;
       if(lut_d[mid] <= d) lo = mid; else hi = mid;
     }
     const float d0 = lut_d[lo], d1 = lut_d[hi];
-    const float t  = (d - d0) / fmax(d1 - d0, 1e-20f);
-    result = lut_x[lo] * (1.0f - t) + lut_x[hi] * t;
+    const float t  = (d - d0) / fmax(d1 - d0, 1e-10f);
+    result = lut_x[lo] + t * (lut_x[hi] - lut_x[lo]);
   }
-  x_out[i] = fmax(result, 0.0f);
+  x_out[i] = result;
 }
 
 /* ================================================================
@@ -4351,62 +4676,85 @@ kernel void galosh_o_smoothstep_blend_3p(
 #define NE_LAPMAD_BINS     4096
 #define NE_LAPMAD_MAX_INV  16.0f   /* bin_idx = clamp(|Lap| * MAX_INV * BINS, 0, BINS-1) */
 
+/* Iterative in-place quickselect (Hoare partition) of the k-th smallest
+ * (0-indexed) value of a global array.  The k-th smallest is UNIQUE, so this
+ * returns EXACTLY what the CPU quick_select_kth returns on the same samples —
+ * no histogram quantization.  Serial (1 WI) but one scalar per image →
+ * negligible; median-of-mid pivot, O(n) average on noise data. */
+inline float qselect_kth_g(global float *a, const int n, const int k)
+{
+  int lo = 0, hi = n - 1;
+  while(lo < hi)
+  {
+    const float pivot = a[(lo + hi) >> 1];
+    int i = lo, j = hi;
+    while(i <= j)
+    {
+      while(a[i] < pivot) i++;
+      while(a[j] > pivot) j--;
+      if(i <= j) { const float t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+    }
+    if(k <= j)      hi = j;
+    else if(k >= i) lo = i;
+    else            break;
+  }
+  return a[k];
+}
+
 kernel void galosh_yuv_q_lap_mad(
     global const float *restrict plane,
     const int width,
     const int height,
     const int x_stride,             /* 3 — matches CPU sampling */
-    const float lap_max,            /* clip range for histogram (= max |Lap|) */
+    const float lap_max,            /* UNUSED (kept for host-ABI compatibility) */
     const int result_idx,           /* index into params buffer */
-    global float *restrict params)
+    global float *restrict params,
+    global float *restrict scratch) /* |Lap| sample scratch, >= n_samples floats */
 {
   const int lid = get_local_id(0);
-  const int wg  = get_local_size(0);  /* NE_LAPMAD_WG */
+  const int wg  = get_local_size(0);  /* NE_LAPMAD_WG, single work-group */
 
-  local int hist[NE_LAPMAD_BINS];
-  local int total_count;
+  /* Match the CPU estimate_sigma_plane sample SUBSET EXACTLY: row-major,
+   * x in [0, width-4) step x_stride (strict <), stopping at
+   * n_samples = min(W*H/6, 200000) — the CPU cap samples only the TOP rows. */
+  const int n_per_row   = (width - 4 + x_stride - 1) / x_stride;  /* ceil; x < width-4 */
+  const int n_samples   = min((width * height) / 6, 200000);
+  const int n_full_rows = (n_per_row > 0) ? (n_samples / n_per_row) : 0;
+  const int n_partial   = (n_per_row > 0) ? (n_samples % n_per_row) : 0;
 
-  /* Zero histogram. */
-  for(int i = lid; i < NE_LAPMAD_BINS; i += wg) hist[i] = 0;
-  if(lid == 0) total_count = 0;
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  /* Each WI scans a row stripe.  x-stride=3 gives ~width/3 samples per row. */
-  const float bin_scale = (float)NE_LAPMAD_BINS / lap_max;
-  int my_count = 0;
-  for(int y = lid; y < height; y += wg)
+  /* Each WI computes |Laplacian| for its rows and writes to scratch at the
+   * DETERMINISTIC row-major index (y*n_per_row + s) = the CPU's abs_laps[] order
+   * (no atomics needed — the subset and order are fixed). */
+  for(int y = lid; y <= n_full_rows && y < height; y += wg)
   {
-    const int x_end = width - 4;
-    for(int x = 0; x <= x_end; x += x_stride)
+    const int row_samples = (y < n_full_rows) ? n_per_row : n_partial;
+    const int base = y * n_per_row;
+    for(int s = 0; s < row_samples; s++)
     {
+      const int x = s * x_stride;
       const float a = plane[(size_t)y * width + x];
       const float b = plane[(size_t)y * width + x + 2];
       const float c = plane[(size_t)y * width + x + 4];
-      const float lap = fabs(a - 2.0f * b + c);
-      int bin = (int)(lap * bin_scale);
-      if(bin >= NE_LAPMAD_BINS) bin = NE_LAPMAD_BINS - 1;
-      atomic_inc(&hist[bin]);
-      my_count++;
+      scratch[base + s] = fabs(a - 2.0f * b + c);
     }
   }
-  atomic_add(&total_count, my_count);
-  barrier(CLK_LOCAL_MEM_FENCE);
+  barrier(CLK_GLOBAL_MEM_FENCE);
 
-  /* WI 0: cumsum-scan to find median bin, derive σ. */
+  /* WI 0: EXACT median = the (n_samples/2)-th smallest, matching CPU
+   * quick_select_median = quick_select_kth(.,n,n/2).  Replaces the histogram
+   * median, which quantized σ_gat (~±0.08%) AND diverged badly on clean scenes
+   * (e.g. 0001: 0.7465 vs 0.579) — a genuine CPU<->GPU PROCESSING difference.
+   * Now bit-faithful to the CPU estimator; the only remaining luma residual is
+   * FP32 rounding-order (GPU tiled vs CPU loop), same nature as RAW o↔o32. */
   if(lid == 0)
   {
-    const int median_target = total_count / 2;
-    int cum = 0, median_bin = 0;
-    for(int i = 0; i < NE_LAPMAD_BINS; i++)
-    {
-      cum += hist[i];
-      if(cum >= median_target) { median_bin = i; break; }
-    }
-    const float mad = ((float)median_bin + 0.5f) / bin_scale;
+    const float mad = (n_samples >= 1)
+        ? qselect_kth_g(scratch, n_samples, n_samples / 2) : 0.0f;
     /* MAD → σ: Var(lap)=6σ² → σ = MAD/(0.6745·sqrt(6)) = MAD/1.6521. */
     const float sigma = fmax(mad / 1.6521f, 0.01f);
     params[result_idx] = sigma;
   }
+  (void)lap_max;
 }
 
 /* [LATEST: GALOSH_YUV_Q] galosh_yuv_q_unified_sigma_norm — in-place
@@ -4682,70 +5030,14 @@ kernel void galosh_o32_chroma_extract_halfres(
 
 
 /* ================================================================
- * §6.4 helpers: FP32 versions of wht8 / wht2d_8x8 / mad_sigma_y_sq.
- *
- * The §1 helpers (wht8_h / wht2d_8x8_h / mad_sigma_y_sq_h) accept half
- * blocks and intermix half storage with FP32 arithmetic.  The o32 path
- * uses float blocks throughout, so we duplicate the helpers as `_f`
- * variants here (= local to §6, no impact on existing G).
- *
- * (日) §6.4 用 helper。 §1 の half 版は GALOSH_RAW_G で使用継続。 o32 は
- *   FP32 throughout なので float 版を用意。
+ * §6.4 helpers: the FP32 _f WHT/MAD helpers (wht8_f / wht2d_8x8_f /
+ * mad_sigma_y_sq_f) were MOVED UP to §1 (next to the half _h versions)
+ * so the YUV FP32 LOSH kernel (galosh_fused_pass12_f32, defined before
+ * this point) can also reach them.  Single shared definition now lives
+ * in §1; they were duplicated here originally and removed to fix a
+ * redefinition build error.  The wht8_f stage-1 butterfly bug-fix
+ * history (2026-05-09) moved with them.
  * ================================================================ */
-inline void wht8_f(float *x)
-{
-  /* 3-stage 8-point Hadamard butterfly (mirror of §1 wht8 / wht8_h).
-   * BUG FIX 2026-05-09: stage 1 (pair butterfly) was missing in initial
-   * o32 port — caused Phase 5 pass12_o32 to give 80% mean attenuation
-   * (= verified via tools/verify_o32_phases.py which flagged Phase 5 as
-   * first divergence vs CPU). */
-  float a0 = x[0]+x[1], a1 = x[0]-x[1];
-  float a2 = x[2]+x[3], a3 = x[2]-x[3];
-  float a4 = x[4]+x[5], a5 = x[4]-x[5];
-  float a6 = x[6]+x[7], a7 = x[6]-x[7];
-  float b0 = a0+a2, b1 = a1+a3;
-  float b2 = a0-a2, b3 = a1-a3;
-  float b4 = a4+a6, b5 = a5+a7;
-  float b6 = a4-a6, b7 = a5-a7;
-  x[0] = b0+b4; x[1] = b1+b5; x[2] = b2+b6; x[3] = b3+b7;
-  x[4] = b0-b4; x[5] = b1-b5; x[6] = b2-b6; x[7] = b3-b7;
-}
-
-inline void wht2d_8x8_f(float *block, const int normalize)
-{
-  for(int r = 0; r < 8; r++) wht8_f(block + r * 8);
-  for(int c = 0; c < 8; c++)
-  {
-    float col[8];
-    for(int r = 0; r < 8; r++) col[r] = block[r * 8 + c];
-    wht8_f(col);
-    for(int r = 0; r < 8; r++) block[r * 8 + c] = col[r];
-  }
-  if(normalize)
-  {
-    const float inv = 1.0f / 64.0f;
-    for(int i = 0; i < 64; i++) block[i] *= inv;
-  }
-}
-
-inline float mad_sigma_y_sq_f(const float *restrict block)
-{
-  float abs_ac[GALOSH_BP - 1];   /* 63 */
-  for(int i = 1; i < GALOSH_BP; i++) abs_ac[i - 1] = fabs(block[i]);
-  const int target = (GALOSH_BP - 1) / 2;   /* 31 */
-  for(int k = 0; k <= target; k++)
-  {
-    int min_idx = k;
-    float min_val = abs_ac[k];
-    for(int j = k + 1; j < GALOSH_BP - 1; j++)
-      if(abs_ac[j] < min_val) { min_val = abs_ac[j]; min_idx = j; }
-    abs_ac[min_idx] = abs_ac[k];
-    abs_ac[k] = min_val;
-  }
-  const float mad = abs_ac[target];
-  const float sy = mad / 0.6745f;
-  return (sy * sy) / (float)GALOSH_BP;
-}
 
 
 /* ================================================================

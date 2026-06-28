@@ -22,7 +22,7 @@ os.environ["OMP_NUM_THREADS"] = "1"  # Single-threaded OpenMP for C exe
 
 BASE = Path(__file__).parent.parent
 EXE = str(BASE / "standalone" / "rawdenoise_v4.exe")
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 
 DATASETS = {
     "CBSD68 (481x321)":  (BASE / "datasets" / "cbsd68", "101085.png"),

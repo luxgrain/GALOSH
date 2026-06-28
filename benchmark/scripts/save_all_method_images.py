@@ -20,7 +20,7 @@ os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 
 BASE = Path(__file__).parent.parent
 EXE = str(BASE / "standalone" / "rawdenoise_v4.exe")
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 
 DATASETS = {
     "kodak":   {"path": BASE / "datasets" / "kodak",   "glob": "kodim*.png", "max": 24},

@@ -24,7 +24,7 @@ KODAK = BASE / "datasets" / "kodak"
 RESULTS = BASE / "results"
 RESULTS.mkdir(exist_ok=True)
 
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 

@@ -24,6 +24,7 @@ Usage:
     iso_preset: 800 | 3200 | 12800  (default: 3200)
 """
 
+import os
 import sys, os, subprocess, time, math
 import numpy as np
 import bm3d
@@ -35,10 +36,10 @@ from PIL import Image
 from skimage.metrics import structural_similarity
 
 # ── Config ────────────────────────────────────────────────────────────
-KODAK_DIR = r"C:\Users\luxgrain\denoise_eval\datasets\kodak"
-EXE       = r"C:\Users\luxgrain\denoise_eval\standalone\yuv_galosh.exe"
+KODAK_DIR = os.path.expanduser(r"~\denoise_eval\datasets\kodak")
+EXE       = os.path.expanduser(r"~\denoise_eval\standalone\yuv_galosh.exe")
 BASH      = r"C:\msys64\usr\bin\bash.exe"
-WORK_DIR  = r"C:\Users\luxgrain\denoise_eval\standalone\yuv_bench"
+WORK_DIR  = os.path.expanduser(r"~\denoise_eval\standalone\yuv_bench")
 STRIDE_Y  = 2
 STRIDE_C  = 2
 GAMMA_EXE = 2.2       # tell galosh the input is sRGB-gamma-encoded

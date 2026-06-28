@@ -756,11 +756,33 @@ static void galosh_pass1(const float *restrict input,
 
         galosh_wht2d_8x8(block, 0);
 
-        float sum_sq = 0.0f;
+        /* GALOSH_RAW_G: MAD-based sigma_Y (Donoho-Johnstone 1995).
+         * Replaces the L2 sum_sq estimator with median absolute deviation
+         * of the AC coefficients.  Robust to ~25% outlier coefs; kills
+         * the spatial noise clusters that L2 sum_sq over-includes as
+         * "false signal" (the BM3D-CFA-clearable residual).  Partial
+         * selection sort to locate the median of 63 elements --
+         * benchmarked fastest among partial-selection / bitonic /
+         * quickselect on both CPU OMP and GPU SIMT contexts. */
+        float abs_ac[GALOSH_BLOCK_PIXELS - 1];  /* 63 elements */
         for(int i = 1; i < GALOSH_BLOCK_PIXELS; i++)
-          sum_sq += block[i] * block[i];
-        const float sigma_y_sq = sum_sq
-          / ((float)(GALOSH_BLOCK_PIXELS - 1) * (float)GALOSH_BLOCK_PIXELS);
+          abs_ac[i - 1] = fabsf(block[i]);
+        const int target = (GALOSH_BLOCK_PIXELS - 1) / 2;  /* rank 31 = median of 63 */
+        for(int k = 0; k <= target; k++)
+        {
+          int min_idx = k;
+          float min_val = abs_ac[k];
+          for(int j = k + 1; j < GALOSH_BLOCK_PIXELS - 1; j++)
+          {
+            if(abs_ac[j] < min_val) { min_val = abs_ac[j]; min_idx = j; }
+          }
+          abs_ac[min_idx] = abs_ac[k];
+          abs_ac[k] = min_val;
+        }
+        /* mad estimates 0.6745 * sqrt(N) * sigma_Y in unnormalized WHT scale. */
+        const float mad = abs_ac[target];
+        const float sy_unnorm = mad / 0.6745f;
+        const float sigma_y_sq = (sy_unnorm * sy_unnorm) / (float)GALOSH_BLOCK_PIXELS;
         const float sigma_x_sq = fmaxf(sigma_y_sq - sigma_sq, 0.0f);
 
         float lambda;
@@ -942,6 +964,247 @@ static void galosh_pass2(const float *restrict noisy,
 {
   galosh_pass2_ex(noisy, pilot, output, width, height,
                   sigma_strength, GALOSH_WIENER_FLOOR, stride);
+}
+
+
+/* ====================================================================
+ * Section 10b: Y-guided LOESS chroma denoise (GALOSH_RAW_G)
+ *
+ * For each half-res pixel (x,y), fit a local linear model
+ *     C_i = a · Y_i + b + eps_i,  i in (2R+1)^2 window
+ * weighted by w_i = exp(-(Y_i - Y_c)^2 / (2 sigma^2)) so that
+ * neighbours whose luma differs from the centre's by > sigma are
+ * downweighted (excludes specular highlights from silver/white windows).
+ * Bayes MAP with Gaussian prior a~N(0, tau^2) gives
+ *     a = cov(Y, C) / (var(Y) + 1/tau^2),   b = mean_C - a · mean_Y
+ *     C_out = a · Y_c + b
+ * Drop-in replacement for the 3-plane WHT-LOSH chroma path.  Identical
+ * formula to the standalone galosh_cpu.h / GPU galosh_yuv_guided_loess
+ * kernels.
+ * ==================================================================== */
+
+#ifndef GALOSH_LOESS_RADIUS
+#define GALOSH_LOESS_RADIUS 7          /* 15x15 window matches GPU default */
+#endif
+#ifndef GALOSH_LOESS_BW
+#define GALOSH_LOESS_BW 3.0f           /* sigma in GAT units (per-pixel noise ~1) */
+#endif
+#ifndef GALOSH_LOESS_TAU_SQ_INV
+#define GALOSH_LOESS_TAU_SQ_INV 1.0f   /* eps = 1/tau^2  (tau^2=1 -> |a|<=2 prior) */
+#endif
+
+static inline int galosh_reflect_idx(int i, int n)
+{
+  if(i < 0) return -i;
+  if(i >= n) return 2 * n - i - 2;
+  return i;
+}
+
+static void galosh_loess_chroma(const float *restrict y_guide,
+                                 const float *restrict cb_in,
+                                 const float *restrict cr_in,
+                                 float *restrict cb_out,
+                                 float *restrict cr_out,
+                                 const int width, const int height,
+                                 const float strength_c)
+{
+  const float eps_gat = strength_c * strength_c * GALOSH_LOESS_TAU_SQ_INV;
+  const float inv_2sigma_sq = 1.0f / (2.0f * GALOSH_LOESS_BW * GALOSH_LOESS_BW);
+  const int R = GALOSH_LOESS_RADIUS;
+
+  const int x0_int = (R < width)  ? R          : width;
+  const int x1_int = (width  > R) ? width - R  : 0;
+  const int y0_int = (R < height) ? R          : height;
+  const int y1_int = (height > R) ? height - R : 0;
+
+#ifdef DT_OMP_FOR
+  DT_OMP_FOR()
+#endif
+  for(int y = 0; y < height; y++)
+  {
+    const int y_interior = (y >= y0_int && y < y1_int);
+    for(int x = 0; x < width; x++)
+    {
+      const size_t cx = (size_t)y * width + x;
+      const float Y_c = y_guide[cx];
+
+      float sumW = 0.f, sumY = 0.f, sumYY = 0.f;
+      float sumCb = 0.f, sumCr = 0.f;
+      float sumYCb = 0.f, sumYCr = 0.f;
+
+      if(y_interior && x >= x0_int && x < x1_int)
+      {
+        for(int dy = -R; dy <= R; dy++)
+        {
+          const size_t row_off = (size_t)(y + dy) * width;
+          const float *rowY  = y_guide + row_off;
+          const float *rowCb = cb_in   + row_off;
+          const float *rowCr = cr_in   + row_off;
+          for(int dx = -R; dx <= R; dx++)
+          {
+            const int xi = x + dx;
+            const float Yi  = rowY [xi];
+            const float Cbi = rowCb[xi];
+            const float Cri = rowCr[xi];
+            const float dY  = Yi - Y_c;
+            const float w   = expf(-dY * dY * inv_2sigma_sq);
+            sumW   += w;
+            sumY   += w * Yi;
+            sumYY  += w * Yi * Yi;
+            sumCb  += w * Cbi;
+            sumCr  += w * Cri;
+            sumYCb += w * Yi * Cbi;
+            sumYCr += w * Yi * Cri;
+          }
+        }
+      }
+      else
+      {
+        for(int dy = -R; dy <= R; dy++)
+        {
+          const int yi = galosh_reflect_idx(y + dy, height);
+          const float *rowY  = y_guide + (size_t)yi * width;
+          const float *rowCb = cb_in   + (size_t)yi * width;
+          const float *rowCr = cr_in   + (size_t)yi * width;
+          for(int dx = -R; dx <= R; dx++)
+          {
+            const int xi = galosh_reflect_idx(x + dx, width);
+            const float Yi  = rowY [xi];
+            const float Cbi = rowCb[xi];
+            const float Cri = rowCr[xi];
+            const float dY  = Yi - Y_c;
+            const float w   = expf(-dY * dY * inv_2sigma_sq);
+            sumW   += w;
+            sumY   += w * Yi;
+            sumYY  += w * Yi * Yi;
+            sumCb  += w * Cbi;
+            sumCr  += w * Cri;
+            sumYCb += w * Yi * Cbi;
+            sumYCr += w * Yi * Cri;
+          }
+        }
+      }
+
+      const float invW     = 1.0f / fmaxf(sumW, 1e-10f);
+      const float mean_Y   = sumY   * invW;
+      const float mean_YY  = sumYY  * invW;
+      const float mean_Cb  = sumCb  * invW;
+      const float mean_Cr  = sumCr  * invW;
+      const float mean_YCb = sumYCb * invW;
+      const float mean_YCr = sumYCr * invW;
+
+      const float var_Y   = fmaxf(mean_YY - mean_Y * mean_Y, 0.0f);
+      const float cov_YCb = mean_YCb - mean_Y * mean_Cb;
+      const float cov_YCr = mean_YCr - mean_Y * mean_Cr;
+      const float denom   = fmaxf(var_Y + eps_gat, 1e-6f);
+      const float a_cb    = cov_YCb / denom;
+      const float a_cr    = cov_YCr / denom;
+      const float b_cb    = mean_Cb - a_cb * mean_Y;
+      const float b_cr    = mean_Cr - a_cr * mean_Y;
+
+      cb_out[cx] = a_cb * Y_c + b_cb;
+      cr_out[cx] = a_cr * Y_c + b_cr;
+    }
+  }
+}
+
+
+/* ====================================================================
+ * Section 10c: EWA Jinc-Lanczos-3 generic 2x upsample (for K16 chromaup)
+ *
+ * jinc(x) = 2 * J1(pi*x) / (pi*x), jinc(0) = 1
+ * EWA kernel = jinc(r) * jinc(r/3) for r < 3, isotropic 2D Lanczos
+ * (mpv's ewa_lanczossharp family).  Used to upsample half-res chroma
+ * to full-res before per-pixel inverse 2x2 WHT in K16.
+ * ==================================================================== */
+
+extern double j1(double x);
+
+static inline float galosh_jinc(float x)
+{
+  if(fabsf(x) < 1e-5f) return 1.0f;
+  const double pix = M_PI * (double)x;
+  return (float)(2.0 * j1(pix) / pix);
+}
+
+static void galosh_upsample_2x_ewajl3(const float *restrict src,
+                                       float *restrict dst,
+                                       const int halfwidth, const int halfheight)
+{
+  const int fw = 2 * halfwidth;
+  const int fh = 2 * halfheight;
+
+  /* Sub-pixel offsets in half-res units: TL(0,0), TR(0,+0.5),
+   * BL(+0.5,0), BR(+0.5,+0.5). */
+  const float subpix[4][2] = {
+    {  0.0f,  0.0f },  /* TL */
+    {  0.0f, +0.5f },  /* TR */
+    { +0.5f,  0.0f },  /* BL */
+    { +0.5f, +0.5f },  /* BR */
+  };
+
+  const int W = 2;          /* half-window radius */
+  const int kw = 2 * W + 1; /* 5 */
+  float weights[4][5][5];
+
+  for(int si = 0; si < 4; si++)
+  {
+    const float oy = subpix[si][0];
+    const float ox = subpix[si][1];
+    float wsum = 0.0f;
+    for(int dy = -W; dy <= W; dy++)
+      for(int dx = -W; dx <= W; dx++)
+      {
+        const float ry = (float)dy - oy;
+        const float rx = (float)dx - ox;
+        const float r_half = sqrtf(rx * rx + ry * ry);
+        const float r_full = r_half * 2.0f;
+        float w_val = 0.0f;
+        if(r_full < 3.0f)
+          w_val = galosh_jinc(r_full) * galosh_jinc(r_full / 3.0f);
+        weights[si][dy + W][dx + W] = w_val;
+        wsum += w_val;
+      }
+    const float inv_wsum = 1.0f / fmaxf(wsum, 1e-20f);
+    for(int dy = 0; dy < kw; dy++)
+      for(int dx = 0; dx < kw; dx++)
+        weights[si][dy][dx] *= inv_wsum;
+  }
+
+#ifdef DT_OMP_FOR
+  DT_OMP_FOR()
+#endif
+  for(int hy = 0; hy < halfheight; hy++)
+  {
+    for(int hx = 0; hx < halfwidth; hx++)
+    {
+      for(int si = 0; si < 4; si++)
+      {
+        const int sub_dy = si / 2;
+        const int sub_dx = si % 2;
+        const int fr = 2 * hy + sub_dy;
+        const int fc = 2 * hx + sub_dx;
+        if(fr >= fh || fc >= fw) continue;
+
+        float sum = 0.0f;
+        for(int dy = -W; dy <= W; dy++)
+        {
+          int hyi = hy + dy;
+          if(hyi < 0)            hyi = 0;
+          if(hyi >= halfheight)  hyi = halfheight - 1;
+          for(int dx = -W; dx <= W; dx++)
+          {
+            int hxi = hx + dx;
+            if(hxi < 0)           hxi = 0;
+            if(hxi >= halfwidth)  hxi = halfwidth - 1;
+            sum += src[(size_t)hyi * halfwidth + hxi]
+                 * weights[si][dy + W][dx + W];
+          }
+        }
+        dst[(size_t)fr * fw + fc] = sum;
+      }
+    }
+  }
 }
 
 
@@ -1207,13 +1470,16 @@ static void galosh_denoise(const float *const restrict in,
 
     const int chroma_stride = 2;  /* GALOSH_F: 75% overlap */
 
-    galosh_pass1(chroma1, c1_pilot, halfwidth, halfheight, chroma_strength, chroma_stride);
-    galosh_pass1(chroma2, c2_pilot, halfwidth, halfheight, chroma_strength, chroma_stride);
-    galosh_pass1(chroma3, c3_pilot, halfwidth, halfheight, chroma_strength, chroma_stride);
-
-    galosh_pass2(chroma1, c1_pilot, c1_out, halfwidth, halfheight, chroma_strength, chroma_stride);
-    galosh_pass2(chroma2, c2_pilot, c2_out, halfwidth, halfheight, chroma_strength, chroma_stride);
-    galosh_pass2(chroma3, c3_pilot, c3_out, halfwidth, halfheight, chroma_strength, chroma_stride);
+    /* GALOSH_RAW_G: chroma denoise via Y-guided LOESS instead of
+     * independent WHT-LOSH on each plane.  Two galosh_loess_chroma
+     * calls handle the 3 chroma planes (each kernel call does a
+     * Cb/Cr pair).  c{1,2,3}_pilot remain allocated but unused. */
+    (void)chroma_stride;
+    (void)c1_pilot; (void)c2_pilot;
+    galosh_loess_chroma(luma, chroma1, chroma2, c1_out, c2_out,
+                         halfwidth, halfheight, chroma_strength);
+    galosh_loess_chroma(luma, chroma3, chroma3, c3_out, c3_pilot /*dummy*/,
+                         halfwidth, halfheight, chroma_strength);
   }
 
   dt_free_align(c1_pilot); c1_pilot = NULL;

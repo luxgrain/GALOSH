@@ -35,7 +35,7 @@ RESULTS.mkdir(exist_ok=True)
 IMG_OUT = BASE / "viewer_images"
 IMG_OUT.mkdir(exist_ok=True)
 
-KAIR_DIR = Path(r"C:\Users\luxgrain\KAIR")
+KAIR_DIR = Path(os.path.expanduser(r"~\KAIR"))
 
 ISOS = [400, 800, 1600, 3200, 6400, 12800]
 CONDITIONS = ["known", "blind"]

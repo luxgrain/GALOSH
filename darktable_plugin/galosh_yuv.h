@@ -1,17 +1,33 @@
-/* galosh_yuv.h - sRGB / YCbCr GALOSH denoise as header-only module.
+/* galosh_yuv.h - GALOSH YUV denoiser, linear RGB entry (header-only).
  *
- * Extracted from GALOSH/standalone/galosh_yuv_cpu.c (minus main()).
- * Include from darktable src/iop/galosh_yuv.c after:
- *   #define GALOSH_DT_ENV
- *   #include "galosh_core.h"
+ * This header is a darktable-specific re-rolling of standalone
+ * galosh_yuv_cpu.c.  Differences from the CLI reference:
+ *
+ *   1. Input/output are LINEAR scene-referred RGB (the convention of
+ *      darktable's IOP_CS_RGB at this pipeline stage), NOT gamma-encoded
+ *      sRGB.  The sRGB <-> linear conversions of the CLI reference are
+ *      removed -- applying inverse gamma to already-linear data was the
+ *      cause of magenta highlights and global colour-cast.
+ *
+ *   2. alpha / sigma_sq are no longer accepted -- the entry is fully
+ *      blind (Foi-Alenius MAD on Y, quasi-linear GAT).  The IOP UI
+ *      exposes only luma_strength and chroma_strength as designed.
+ *
+ *   3. Debug fprintf() spam removed -- darktable rebuilds the pipeline
+ *      tile on every redraw, the CLI logging would flood stderr.
+ *
+ * The algorithm itself (BT.709 Y/Cb/Cr split, GAT-stabilised Y with
+ * 2-pass WHT-LOSH, Y-guided LOESS chroma) is unchanged from the CLI
+ * reference.
  *
  * Public entry point:
- *   galosh_yuv_denoise_srgb(in, out, W, H, strength_y, strength_c,
- *                            alpha, sigma_sq)
- * Input / output are float32 sRGB, 3 channels interleaved (HxWx3).
+ *   galosh_yuv_denoise_linear(in_rgb, out_rgb, W, H,
+ *                              strength_y, strength_c)
  *
- * All helpers are static.  Diagnostic pragma suppresses the spurious
- * -Wunused-function from darktable introspection parser.
+ *  Refs: Foi et al. (Sig.Proc. 2008) - Poisson-Gaussian noise model
+ *        Makitalo & Foi (TIP 2013)   - exact unbiased inverse GAT
+ *        Chang, Yu & Vetterli (TIP 2000) - BayesShrink
+ *        Cleveland (JASA 1979)       - LOESS local regression
  */
 #ifndef GALOSH_YUV_H
 #define GALOSH_YUV_H
@@ -20,35 +36,21 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 
 /* ================================================================
- * sRGB ↔ linear + BT.709 YCbCr helpers
+ * BT.709 full-range YCbCr (linear domain)
+ *
+ * Same coefficients as the GPU galosh_yuv kernel and the standalone
+ * CLI reference -- only the input/output here are linear, not sRGB.
  * ================================================================ */
-
-static inline float srgb_to_linear_f(float x)
-{
-  /* IEC 61966-2-1 piecewise inverse gamma. */
-  return (x <= 0.04045f) ? x / 12.92f
-                         : powf((x + 0.055f) / 1.055f, 2.4f);
-}
-
-static inline float linear_to_srgb_f(float x)
-{
-  if(x <= 0.0f) return 0.0f;
-  if(x >= 1.0f) return 1.0f;
-  return (x <= 0.0031308f) ? 12.92f * x
-                           : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
-}
-
-/* BT.709 full-range YCbCr (same convention as galosh_yuv_gpu.cl). */
-static inline void rgb_to_ycbcr(float R, float G, float B,
-                                float *Y, float *Cb, float *Cr)
+static inline void galosh_yuv_rgb_to_ycbcr(float R, float G, float B,
+                                           float *Y, float *Cb, float *Cr)
 {
   *Y  =  0.2126f * R + 0.7152f * G + 0.0722f * B;
   *Cb = -0.1146f * R - 0.3854f * G + 0.5000f * B;
   *Cr =  0.5000f * R - 0.4542f * G - 0.0458f * B;
 }
 
-static inline void ycbcr_to_rgb(float Y, float Cb, float Cr,
-                                float *R, float *G, float *B)
+static inline void galosh_yuv_ycbcr_to_rgb(float Y, float Cb, float Cr,
+                                           float *R, float *G, float *B)
 {
   *R = Y                 + 1.5748f * Cr;
   *G = Y - 0.1873f * Cb  - 0.4681f * Cr;
@@ -56,12 +58,14 @@ static inline void ycbcr_to_rgb(float Y, float Cb, float Cr,
 }
 
 /* ================================================================
- * Blind σ estimation for a single plane (Y) via Laplacian MAD.
- * Identical math to estimate_gat_sigma_mosaic but on a single
- * plane (no Bayer stride).  Used when user passes alpha=0.
+ * Blind sigma estimation on a single plane (Y) via Laplacian MAD.
+ *
+ * Mirrors estimate_gat_sigma_mosaic but on a contiguous plane (no
+ * Bayer stride).  Median-of-absolute-Laplacians scaled by
+ * 1/(0.6745 * sqrt(6)) = 1/1.6521.
  * ================================================================ */
-static float estimate_sigma_plane(const float *plane,
-                                  const int width, const int height)
+static float galosh_yuv_estimate_sigma(const float *plane,
+                                       const int width, const int height)
 {
   const int n_samples = MIN(width * height / 6, 200000);
   float *abs_laps = dt_alloc_align_float(n_samples + 1);
@@ -80,23 +84,31 @@ static float estimate_sigma_plane(const float *plane,
   if(count < 100) { dt_free_align(abs_laps); return 1.0f; }
   const float mad = quick_select_median(abs_laps, count);
   dt_free_align(abs_laps);
-  /* MAD → std: Var(lap) = 6·sigma² → sigma = MAD/(0.6745·sqrt(6)) */
   return mad / 1.6521f;
 }
 
 /* ================================================================
- * galosh_yuv_denoise_srgb — main pipeline.
+ * galosh_yuv_denoise_linear -- main pipeline (linear RGB in/out).
+ *
+ * The pipeline matches the CLI reference exactly except for the two
+ * skipped gamma conversions and the always-blind noise estimation:
+ *
+ *   in_rgb (linear)
+ *     -> BT.709 Y, Cb, Cr (linear)
+ *     -> blind MAD sigma on Y -> alpha = 0.1*sigma, sigma_sq = sigma^2
+ *     -> GAT forward on Y, normalise to unit variance in GAT space
+ *     -> LOSH 2-pass (BayesShrink pilot + Wiener) on Y_stab
+ *     -> LOESS Y-guided regression on Cb, Cr
+ *     -> inverse GAT on Y -> ycbcr_to_rgb -> out_rgb (linear)
  * ================================================================ */
-static void galosh_yuv_denoise_srgb(const float *restrict in_srgb,
-                                    float *restrict out_srgb,
-                                    const int width, const int height,
-                                    const float strength_y,
-                                    const float strength_c,
-                                    float alpha, float sigma_sq)
+static void galosh_yuv_denoise_linear(const float *restrict in_rgb,
+                                      float *restrict out_rgb,
+                                      const int width, const int height,
+                                      const float strength_y,
+                                      const float strength_c)
 {
   const size_t npx = (size_t)width * (size_t)height;
 
-  /* Step 1: Allocate planar Y, Cb, Cr in GAT / linear domain. */
   float *Y_stab  = dt_alloc_align_float(npx);
   float *Cb_lin  = dt_alloc_align_float(npx);
   float *Cr_lin  = dt_alloc_align_float(npx);
@@ -106,82 +118,67 @@ static void galosh_yuv_denoise_srgb(const float *restrict in_srgb,
   float *Cr_den  = dt_alloc_align_float(npx);
   if(!Y_stab || !Cb_lin || !Cr_lin || !Y_pilot || !Y_den || !Cb_den || !Cr_den)
   {
-    fprintf(stderr, "[yuv_cpu] alloc failed\n");
+    /* On alloc failure pass-through and bail. */
+    if(in_rgb != out_rgb)
+      memcpy(out_rgb, in_rgb, npx * 3 * sizeof(float));
     goto cleanup;
   }
 
-  /* Step 2: sRGB → linear RGB → BT.709 YCbCr (linear domain). */
+  /* Step 1: linear RGB -> BT.709 YCbCr (linear). */
   DT_OMP_FOR()
   for(int y = 0; y < height; y++)
   {
     for(int x = 0; x < width; x++)
     {
       const size_t i = (size_t)y * width + x;
-      const float R = srgb_to_linear_f(in_srgb[3 * i + 0]);
-      const float G = srgb_to_linear_f(in_srgb[3 * i + 1]);
-      const float B = srgb_to_linear_f(in_srgb[3 * i + 2]);
+      const float R = in_rgb[3 * i + 0];
+      const float G = in_rgb[3 * i + 1];
+      const float B = in_rgb[3 * i + 2];
       float Y, Cb, Cr;
-      rgb_to_ycbcr(R, G, B, &Y, &Cb, &Cr);
-      Y_stab[i] = Y;    /* temp: holds linear Y, will be overwritten by GAT */
+      galosh_yuv_rgb_to_ycbcr(R, G, B, &Y, &Cb, &Cr);
+      Y_stab[i] = Y;
       Cb_lin[i] = Cb;
       Cr_lin[i] = Cr;
     }
   }
 
-  /* Step 3: Blind noise estimate on Y (if user didn't supply α, σ²).
-   *
-   * We need α > 0 for the GAT to be well-defined (t_break = 2σ/α).  When
-   * the user passes α≤0 we treat σ² as signal-INdependent variance and
-   * synthesise a tiny α via the sqrt(σ²) heuristic: α = σ_lin · 0.1 is
-   * enough to make GAT behave as approximately-linear normalisation
-   * (matches "quasi-Gaussian" regime for low-ISO captures). */
-  if(alpha <= 0.0f || sigma_sq <= 0.0f)
-  {
-    const float sigma_lin = estimate_sigma_plane(Y_stab, width, height);
-    sigma_sq = fmaxf(sigma_lin * sigma_lin, 1e-8f);
-    alpha    = fmaxf(sigma_lin * 0.1f, 1e-5f);  /* tiny α — quasi-linear GAT */
-    fprintf(stderr, "[yuv_cpu] Blind σ (MAD) = %.5f, using α=%.6g σ²=%.6e\n",
-            sigma_lin, alpha, sigma_sq);
-  }
+  /* Step 2: blind noise estimation on Y. */
+  const float sigma_lin = galosh_yuv_estimate_sigma(Y_stab, width, height);
+  const float sigma_sq  = fmaxf(sigma_lin * sigma_lin, 1e-8f);
+  const float alpha     = fmaxf(sigma_lin * 0.1f, 1e-5f);
 
-  /* Step 4: GAT forward on Y.  α=0 degenerates to (Y - 0) / σ — pure
-   * linear normalisation.  With α>0, the full variance-stabilising
-   * transform is applied. */
+  /* Step 3: GAT forward on Y. */
   gat_build_inverse_table(alpha, sigma_sq);
   DT_OMP_FOR()
   for(size_t i = 0; i < npx; i++)
     Y_stab[i] = gat_forward(Y_stab[i], alpha, sigma_sq);
 
-  /* Step 5: Normalise Y_stab to unit variance in GAT space.  Measure
-   * σ_gat on the post-GAT plane and divide.  This matches the RAW path
-   * convention so downstream strength values are scale-consistent. */
-  const float sigma_gat = estimate_sigma_plane(Y_stab, width, height);
+  /* Step 4: normalise Y_stab to unit variance in GAT space. */
+  const float sigma_gat = galosh_yuv_estimate_sigma(Y_stab, width, height);
   const float unified_sigma = fmaxf(sigma_gat, 1e-6f);
   const float inv_sg = 1.0f / unified_sigma;
   DT_OMP_FOR()
   for(size_t i = 0; i < npx; i++) Y_stab[i] *= inv_sg;
 
-  fprintf(stderr, "[yuv_cpu] alpha=%.6g sigma_sq=%.6g  sigma_gat=%.4f  "
-                  "size=%dx%d  strength_y=%.3f strength_c=%.3f\n",
-          alpha, sigma_sq, sigma_gat,
-          width, height, strength_y, strength_c);
-
-  /* Step 6: LOSH on Y (pass1 pilot + pass2 Wiener, 75% overlap stride=2). */
+  /* Step 5: 2-pass LOSH on Y (Pass1 BayesShrink + Pass2 Wiener, stride=2).
+   * GALOSH_YUV_G: MAD-based sigma_Y in Pass1 (use_robust_shrink=1) -- the
+   * partial-selection-sort robust noise estimator that kills spatial noise
+   * clusters fooling the L2 sum_sq estimator (Donoho-Johnstone 1995).
+   * SIDD Medium 80-pair: +0.84 dB PSNR / -19% LPIPS / -7.9% DISTS vs the
+   * legacy mean-based pass1.  Single-orientation collapses to plain
+   * pass1+pass2 inside the wrapper. */
   const int losh_stride = 2;
-  galosh_pass1(Y_stab, Y_pilot, width, height, strength_y, losh_stride);
-  galosh_pass2(Y_stab, Y_pilot, Y_den, width, height, strength_y, losh_stride);
-  fprintf(stderr, "[yuv_cpu] Y LOSH pass1+pass2 done\n");
+  galosh_pass12_multiorient_blocked(Y_stab, Y_den, width, height,
+                                     strength_y, GALOSH_BLOCK_SIZE,
+                                     losh_stride, /*n_orient=*/1,
+                                     /*use_robust_shrink=*/1);
+  (void)Y_pilot;  /* internal pilot now lives inside the wrapper */
 
-  /* Step 7: LOESS on Cb, Cr with noisy Y as guide (matches GPU raw path;
-   * using the denoised Y gives slightly smoother chroma but also
-   * double-filters — the noisy Y already contains enough high-SNR edge
-   * information for bilateral weighting). */
+  /* Step 6: LOESS Y-guided chroma. */
   galosh_loess_chroma(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
                       width, height, strength_c);
-  fprintf(stderr, "[yuv_cpu] Cb/Cr LOESS done (R=%d BW=%.1f)\n",
-          GALOSH_LOESS_RADIUS, GALOSH_LOESS_BW);
 
-  /* Step 8: Inverse GAT on Y and rebuild sRGB. */
+  /* Step 7: inverse GAT on Y, rebuild linear RGB. */
   DT_OMP_FOR()
   for(int y = 0; y < height; y++)
   {
@@ -190,10 +187,10 @@ static void galosh_yuv_denoise_srgb(const float *restrict in_srgb,
       const size_t i = (size_t)y * width + x;
       const float Y_inv = gat_inverse_exact(Y_den[i] * unified_sigma);
       float R, G, B;
-      ycbcr_to_rgb(Y_inv, Cb_den[i], Cr_den[i], &R, &G, &B);
-      out_srgb[3 * i + 0] = linear_to_srgb_f(R);
-      out_srgb[3 * i + 1] = linear_to_srgb_f(G);
-      out_srgb[3 * i + 2] = linear_to_srgb_f(B);
+      galosh_yuv_ycbcr_to_rgb(Y_inv, Cb_den[i], Cr_den[i], &R, &G, &B);
+      out_rgb[3 * i + 0] = R;
+      out_rgb[3 * i + 1] = G;
+      out_rgb[3 * i + 2] = B;
     }
   }
 
@@ -202,10 +199,6 @@ cleanup:
   dt_free_align(Cb_lin);  dt_free_align(Cr_lin);
   dt_free_align(Cb_den);  dt_free_align(Cr_den);
 }
-
-/* ================================================================
- * main: CLI driver (same binary I/O style as galosh_raw_cpu).
- * ================================================================ */
 
 #pragma GCC diagnostic pop
 

@@ -9,6 +9,7 @@ Usage:
   python benchmark/scripts/int_p0_gpu_compare.py            # 20 patches
   python benchmark/scripts/int_p0_gpu_compare.py --n 60
 """
+import os
 import argparse, os, re, subprocess, sys, random
 from pathlib import Path
 import numpy as np
@@ -19,7 +20,7 @@ os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
-GALOSH   = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH   = Path(os.path.expanduser(r"~\GALOSH"))
 CPU_EXE  = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 GPU_EXE  = GALOSH / "standalone" / "galosh_int_p0_test.exe"
 SIDD_VAL = GALOSH / "benchmark" / "SIDD_Validation"

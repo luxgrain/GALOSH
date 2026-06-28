@@ -7,7 +7,7 @@ set SDK_UM_INC=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um
 set SDK_SH_INC=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared
 set SDK_UCRT_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64
 set SDK_UM_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64
-set WORK=C:\Users\luxgrain\denoise_eval\standalone
+set WORK=%USERPROFILE%\denoise_eval\standalone
 cd /d %WORK%
 
 "%CL_PATH%" /nologo /c /O2 /openmp /TC /I"%MSVC_INC%" /I"%SDK_UCRT_INC%" /I"%SDK_UM_INC%" /I"%SDK_SH_INC%" yuv_galosh_core.c /Fo:yuv_galosh_core_omp.obj

@@ -19,7 +19,7 @@ os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 VAL = GALOSH / "benchmark" / "SIDD_Validation"
 OUTROOT = GALOSH / "benchmark" / "sidd_validation"
 TMP = GALOSH / "benchmark" / "results" / "speed" / "_o32sweep_tmp"

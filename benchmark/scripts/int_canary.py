@@ -24,14 +24,14 @@ try:
 except Exception:
     pass
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 EXE = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 BENCH = Path(r"E:\rawnind_bench")
 TAG = "D60-3__ISO400"
 EXPECTED_PSNR = 42.73  # 2026-06-07: was 42.30 (v12); +chroma-recip +guided-filter 2-pass fixes
 THRESHOLD = 40.0  # below = regression
 
-TMP = Path(r"C:\Users\luxgrain\GALOSH\benchmark\results\int_canary_tmp")
+TMP = Path(os.path.expanduser(r"~\GALOSH\benchmark\results\int_canary_tmp"))
 TMP.mkdir(parents=True, exist_ok=True)
 
 

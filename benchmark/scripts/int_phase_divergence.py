@@ -34,7 +34,7 @@ try:
 except Exception:
     pass
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 EXE_FP = GALOSH / "standalone" / "galosh_raw_cpu.exe"
 EXE_INT = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 RAWNIND = Path(r"E:\rawnind_bench")

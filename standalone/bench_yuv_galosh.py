@@ -10,15 +10,16 @@ Usage:
   sigma_c  : galosh chroma strength (default 1.0)
 """
 
+import os
 import sys, os, struct, subprocess, math, time
 import numpy as np
 from PIL import Image
 
 # ── config ──────────────────────────────────────────────────────────
-KODAK_DIR = r"C:\Users\luxgrain\denoise_eval\datasets\kodak"
-EXE       = r"C:\Users\luxgrain\denoise_eval\standalone\yuv_galosh.exe"
+KODAK_DIR = os.path.expanduser(r"~\denoise_eval\datasets\kodak")
+EXE       = os.path.expanduser(r"~\denoise_eval\standalone\yuv_galosh.exe")
 BASH      = r"C:\msys64\usr\bin\bash.exe"
-WORK_DIR  = r"C:\Users\luxgrain\denoise_eval\standalone\yuv_bench"
+WORK_DIR  = os.path.expanduser(r"~\denoise_eval\standalone\yuv_bench")
 N_IMAGES  = 24          # all 24 Kodak images
 STRIDE_Y  = 2
 STRIDE_C  = 2

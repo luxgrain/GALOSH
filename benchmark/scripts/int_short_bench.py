@@ -25,7 +25,7 @@ try:
 except Exception:
     pass
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 EXE = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 SIDD_VAL = GALOSH / "benchmark" / "SIDD_Validation"
 RAWNIND = Path(r"E:\rawnind_bench")

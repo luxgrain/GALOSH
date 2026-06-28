@@ -107,10 +107,10 @@ int main(int argc, char **argv) {
   const char *paths[] = { "galosh_int.clh", "galosh_int_tbl.clh",
                           "galosh_int_p0.clh", "galosh_int_p0.cl" };
   const char *fb[] = {
-    "C:/Users/luxgrain/GALOSH/standalone/galosh_int.clh",
-    "C:/Users/luxgrain/GALOSH/standalone/galosh_int_tbl.clh",
-    "C:/Users/luxgrain/GALOSH/standalone/galosh_int_p0.clh",
-    "C:/Users/luxgrain/GALOSH/standalone/galosh_int_p0.cl" };
+    "standalone/galosh_int.clh",
+    "standalone/galosh_int_tbl.clh",
+    "standalone/galosh_int_p0.clh",
+    "standalone/galosh_int_p0.cl" };
   size_t cap = 1, lens[4]; char *parts[4];
   for(int i = 0; i < 4; i++) {
     parts[i] = load_file(paths[i], &lens[i]);

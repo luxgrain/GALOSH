@@ -20,7 +20,7 @@ from skimage.io import imsave
 from colour_demosaicing import demosaicing_CFA_Bayer_Menon2007 as demo
 
 os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 VAL = GALOSH / "benchmark" / "SIDD_Validation"
 OUTD = GALOSH / "benchmark" / "sidd_validation" / "_nphase_visual" / "natural"
 OUTD.mkdir(parents=True, exist_ok=True)

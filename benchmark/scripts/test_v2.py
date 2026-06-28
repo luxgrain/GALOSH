@@ -7,9 +7,9 @@ import time
 from skimage.io import imread
 
 MSYS_PATH = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
-EXE_V1 = r"C:\Users\luxgrain\denoise_eval\standalone\rawdenoise.exe"
-EXE_V2 = r"C:\Users\luxgrain\denoise_eval\standalone\rawdenoise_v2.exe"
-SDIR = r"C:\Users\luxgrain\denoise_eval\standalone"
+EXE_V1 = os.path.expanduser(r"~\denoise_eval\standalone\rawdenoise.exe")
+EXE_V2 = os.path.expanduser(r"~\denoise_eval\standalone\rawdenoise_v2.exe")
+SDIR = os.path.expanduser(r"~\denoise_eval\standalone")
 
 img = imread("datasets/kodak/kodim01.png").astype(np.float32) / 255.0
 h, w = img.shape[:2]; h -= h % 2; w -= w % 2; img = img[:h, :w]

@@ -29,7 +29,7 @@ KODAK = BASE / "datasets" / "kodak"
 RESULTS = BASE / "results"
 RESULTS.mkdir(exist_ok=True)
 
-NAFNET_DIR = Path(r"C:\Users\luxgrain\NAFNet")
+NAFNET_DIR = Path(os.path.expanduser(r"~\NAFNet"))
 
 
 def inv_srgb(x):

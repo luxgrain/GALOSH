@@ -318,11 +318,11 @@ int main(int argc, char **argv) {
   /* --- concat galosh_int.clh + galosh_int_tbl.clh + galosh_int_test.cl --- */
   size_t l1 = 0, lt = 0, l2 = 0;
   char *prim = load_file("galosh_int.clh", &l1);
-  if(!prim) prim = load_file("C:/Users/luxgrain/GALOSH/standalone/galosh_int.clh", &l1);
+  if(!prim) prim = load_file("standalone/galosh_int.clh", &l1);
   char *tbl = load_file("galosh_int_tbl.clh", &lt);
-  if(!tbl) tbl = load_file("C:/Users/luxgrain/GALOSH/standalone/galosh_int_tbl.clh", &lt);
+  if(!tbl) tbl = load_file("standalone/galosh_int_tbl.clh", &lt);
   char *test = load_file("galosh_int_test.cl", &l2);
-  if(!test) test = load_file("C:/Users/luxgrain/GALOSH/standalone/galosh_int_test.cl", &l2);
+  if(!test) test = load_file("standalone/galosh_int_test.cl", &l2);
   if(!prim || !tbl || !test) { fprintf(stderr, "cannot load .clh/.cl source\n"); return 1; }
   size_t total = l1 + lt + l2 + 4;
   char *src = (char *)malloc(total);

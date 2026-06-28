@@ -7,7 +7,7 @@ import os, sys, subprocess, zipfile, shutil
 from pathlib import Path
 import urllib.request
 
-EVAL_ROOT = Path(r"C:\Users\luxgrain\denoise_eval")
+EVAL_ROOT = Path(os.path.expanduser(r"~\denoise_eval"))
 DATASET_DIR = EVAL_ROOT / "datasets"
 
 def download_file(url, dest, desc=""):

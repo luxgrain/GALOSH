@@ -91,7 +91,7 @@ static int run_single_plane_gpu(const char *input_file, const char *output_file,
     /* Load & build kernel source */
     {
         const char *cl_paths[] = {"galosh.cl",
-            "C:/Users/luxgrain/GALOSH/standalone/galosh.cl", NULL};
+            "standalone/galosh.cl", NULL};
         char *source = NULL; size_t src_len = 0;
         for(int i = 0; cl_paths[i]; i++) {
             source = load_kernel_source(cl_paths[i], &src_len);

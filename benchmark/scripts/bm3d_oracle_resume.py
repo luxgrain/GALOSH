@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Resume bm3d_cfa_oracle for the remaining 16 UIDs and merge with the
 existing 64 from the earlier partial log."""
+import os
 import sys, os, re, json, time
 import numpy as np
 from pathlib import Path
@@ -14,7 +15,7 @@ sys.path.insert(0, str(SCRIPTS / "methods"))
 from bench_sidd_medium import BENCH_DIR
 from bm3d_cfa import run_bm3d_cfa
 
-LOG_PATH = r"C:\Users\luxgrain\AppData\Local\Temp\claude\c--Users-luxgrain-GALOSH\7cb74090-d4e6-415a-8cac-1d59ba9abaaf\tasks\bqo6yvno7.output"
+LOG_PATH = os.path.expanduser(r"~\AppData\Local\Temp\claude\c--Users-luxgrain-GALOSH\7cb74090-d4e6-415a-8cac-1d59ba9abaaf\tasks\bqo6yvno7.output")
 
 def psnr(a, b):
     mse = float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))

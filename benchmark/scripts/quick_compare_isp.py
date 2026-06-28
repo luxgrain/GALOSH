@@ -2,10 +2,11 @@
 Quick comparison: noisy ISP sRGB vs GALOSH YUV (gamma=1.0 and 2.2)
 Measures PSNR against ISP GT to show actual improvement.
 """
+import os
 import numpy as np, scipy.io as sio, subprocess, os
 from pathlib import Path
 
-BASE  = Path(r'C:\Users\luxgrain\denoise_eval')
+BASE  = Path(os.path.expanduser(r'~\denoise_eval'))
 SIDD  = BASE / 'datasets' / 'sidd'
 BASH  = Path(r'C:\msys64\usr\bin\bash.exe')
 EXE   = BASE / 'standalone' / 'yuv_galosh.exe'

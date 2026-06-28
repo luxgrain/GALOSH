@@ -7,7 +7,7 @@ set SDK_UM_INC=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um
 set SDK_SH_INC=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared
 set SDK_UCRT_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64
 set SDK_UM_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64
-set WORK=C:\Users\luxgrain\denoise_eval\standalone
+set WORK=%USERPROFILE%\denoise_eval\standalone
 cd /d %WORK%
 
 rem /openmp:llvm ? OpenMP 4.0+ ??

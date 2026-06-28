@@ -25,7 +25,7 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 VAL    = GALOSH / "benchmark" / "SIDD_Validation"
 OUT    = GALOSH / "benchmark" / "sidd_validation" / "galosh_raw_gpu_g"
 OUT.mkdir(parents=True, exist_ok=True)

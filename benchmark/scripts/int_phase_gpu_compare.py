@@ -8,6 +8,7 @@ buffer raw, and prints the same line.  A correct port is BIT-EXACT.
 Usage:
   python benchmark/scripts/int_phase_gpu_compare.py --phase 2 --n 20
 """
+import os
 import argparse, os, re, subprocess, sys, random
 from pathlib import Path
 import numpy as np
@@ -23,7 +24,7 @@ PHASE_FILE = {1: "p1_ingat.bin", 2: "p2_ingat.bin", 3: "p3_lcs.bin", 4: "p4_chro
               5: "p5_den.bin", 6: "p6.bin", 7: "p7_full.bin",
               8: "p8.bin", 9: "p9.bin", 10: "p10.bin"}
 
-GALOSH   = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH   = Path(os.path.expanduser(r"~\GALOSH"))
 CPU_EXE  = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 GPU_EXE  = GALOSH / "standalone" / "galosh_int_pipe_test.exe"
 SIDD_VAL = GALOSH / "benchmark" / "SIDD_Validation"

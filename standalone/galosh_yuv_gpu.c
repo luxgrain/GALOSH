@@ -29,6 +29,10 @@
  * sets it before calling run_yuv_gat_gpu.
  * ================================================================ */
 static int g_galosh_yuv_q_gpu = 0;
+/* LOSH luma precision: 0 = FP32 (PC/desktop default — matches the CPU FP32 reference to
+ * ~8e-5 via galosh_fused_pass12_f32); 1 = FP16 (galosh_fused_pass12 — the mobile GPU/NPU
+ * path, where scalar half is 2× and power-cheaper; on desktop it only adds an FP16 floor). */
+static int g_yuv_fp16 = 0;
 
 
 /* ================================================================
@@ -86,7 +90,8 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     cl_kernel k_gat_fwd = NULL;
     cl_kernel k_f2h = NULL, k_h2f = NULL;
     cl_kernel k_build_lut = NULL, k_lut_fin = NULL;
-    cl_kernel k_makitalo = NULL, k_fused = NULL;
+    cl_kernel k_makitalo = NULL, k_fused = NULL, k_fused_f32 = NULL;
+    cl_kernel k_pass12_o32 = NULL;  /* PROVEN FP32 LOSH (RAW o32 kernel, 8e-5 vs CPU) */
     /* Step 7 (Phase 2a) — Y-guided filter, 4-kernel separable pipeline:
      *   1) moments_x        : 1D x-pass over (Y, Y², Cb, Cr, Y·Cb, Y·Cr)
      *   2) moments_y_and_ab : 1D y-pass + local linear regression → (a, b)
@@ -113,6 +118,7 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     cl_mem y_stab_buf = NULL, cb_stab_buf = NULL, cr_stab_buf = NULL;
     cl_mem scale_cb_buf = NULL, scale_cr_buf = NULL;
     cl_mem half_in_buf = NULL, half_out_buf = NULL;
+    cl_mem y_den_f32_buf = NULL;   /* FP32 LOSH output (PC default path) */
     cl_mem cb_biv_buf = NULL, cr_biv_buf = NULL;
     /* Phase 2a separable guided filter: 6 moments_x + 4 apply_x scratch.
      * Float32, npix each — ≈640 MB total at 5326×2998 (desktop-only). */
@@ -130,6 +136,7 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
      * Allocated lazily when g_galosh_yuv_q_gpu is set; remain NULL
      * for the [LATEST: GALOSH_YUV_O] path. */
     cl_mem q_y_snap_f = NULL;       /* FP32 snapshot of pre-LOSH Y_stab */
+    cl_mem ne_scratch = NULL;       /* |Lap| sample scratch for EXACT-median σ est (matches CPU) */
     cl_mem q_y_h16 = NULL;          /* full-res Y_stab guide, FP16 */
     cl_mem q_cb_h16 = NULL, q_cr_h16 = NULL;       /* full-res input Cb/Cr, FP16 */
     cl_mem q_cb_full_d = NULL, q_cr_full_d = NULL; /* Anchor 0 output, FP16 */
@@ -185,7 +192,7 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     /* --- Load & build single-source CL program (galosh.cl) --- */
     {
         const char *cl_paths[] = {"galosh.cl",
-            "C:/Users/luxgrain/GALOSH/standalone/galosh.cl", NULL};
+            "standalone/galosh.cl", NULL};
 
         char *source = NULL;
         size_t src_len = 0;
@@ -204,7 +211,7 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
 
         char opts[512];
         snprintf(opts, sizeof(opts),
-            "-DCL_TARGET_OPENCL_VERSION=120 "
+            "-DCL_TARGET_OPENCL_VERSION=120 -cl-nv-verbose "
             "-DGALOSH_STRIDE=%d -DTILE_SIZE=%d -DHIST_BINS=%d -DREDUCE_WG_SIZE=%d",
             GALOSH_STRIDE, TILE_SIZE, HIST_BINS, REDUCE_WG_SIZE);
         err = clBuildProgram(prog, 1, &device, opts, NULL, NULL);
@@ -236,7 +243,9 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     YG_KERNEL(k_build_lut,    "galosh_build_inv_lut");        /* from fused.cl */
     YG_KERNEL(k_lut_fin,      "galosh_lut_finalize");         /* from fused.cl */
     YG_KERNEL(k_makitalo,     "galosh_yuv_makitalo_inverse_Y");
-    YG_KERNEL(k_fused,        "galosh_fused_pass12");         /* from fused.cl */
+    YG_KERNEL(k_fused,        "galosh_fused_pass12");         /* FP16 LOSH (mobile) */
+    YG_KERNEL(k_fused_f32,    "galosh_fused_pass12_f32");     /* [DEPRECATED] FP32 LOSH (no validity filter) */
+    YG_KERNEL(k_pass12_o32,   "galosh_pass12_o32");           /* FP32 LOSH (PC default) = proven RAW o32 kernel */
     YG_KERNEL(k_guided_loess,       "galosh_yuv_guided_loess");
     /* Separable guided-filter kernels: still present in galosh.cl for
      * archived bench reproduction but no longer used by the production
@@ -259,10 +268,13 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
      * regression floors/underestimates on single-plane Y — see noise-est block). */
     YG_KERNEL(k_q_lap_mad,      "galosh_yuv_q_lap_mad");
     YG_KERNEL(k_q_synth_alpha,  "galosh_yuv_q_synth_alpha_sigma_sq");
+    /* σ_gat normalize/denormalize created UNCONDITIONALLY: the default (O)
+     * mode now also does the post-GAT unit-variance normalize (4a'/4g'),
+     * mirroring the unconditional CPU YUV_O path (was Q-only → ~0.005 gap). */
+    YG_KERNEL(k_q_norm,         "galosh_yuv_q_unified_sigma_norm");
+    YG_KERNEL(k_q_denorm,       "galosh_yuv_q_unified_sigma_denorm");
     if(g_galosh_yuv_q_gpu)
     {
-        YG_KERNEL(k_q_norm,         "galosh_yuv_q_unified_sigma_norm");
-        YG_KERNEL(k_q_denorm,       "galosh_yuv_q_unified_sigma_denorm");
         YG_KERNEL(k_o_box_3p,       "galosh_o_box_downsample_2x_3p");
         YG_KERNEL(k_o_loess_3p,     "galosh_o_loess_chroma_3p_fp16_tiled");
         YG_KERNEL(k_o_k16_3p,       "galosh_o_k16_joint_bilateral_upsample_3p");
@@ -288,6 +300,9 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
         scale_cr_buf  = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
         half_in_buf   = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
         half_out_buf  = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
+        y_den_f32_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        q_y_snap_f    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);  /* normalized post-GAT NOISY Y snapshot = chroma LOESS guide (BOTH modes; = CPU Y_stab guide) */
+        ne_scratch    = clCreateBuffer(context, CL_MEM_READ_WRITE, (200000 + 64) * sizeof(float), NULL, &err);  /* exact-median σ est: holds n_samples=min(W*H/6,200000) |Lap| values */
         cb_biv_buf    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
         cr_biv_buf    = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
         /* Separable guided-filter scratch (6 moments_x + 4 apply_x). */
@@ -340,7 +355,8 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
         const size_t hh_kfh  = (size_t)kfw_half * kfh_half * sizeof(cl_half);
         const size_t hh_kfq  = (size_t)kfw_q    * kfh_q    * sizeof(cl_half);
 
-        q_y_snap_f = clCreateBuffer(context, CL_MEM_READ_WRITE, fb, NULL, &err);
+        /* q_y_snap_f now allocated unconditionally (chroma LOESS guide for BOTH
+         * O and Q modes — see the y_den_f32_buf block above). */
         q_y_h16    = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
         q_cb_h16   = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
         q_cr_h16   = clCreateBuffer(context, CL_MEM_READ_WRITE, hb, NULL, &err);
@@ -449,6 +465,7 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
         clSetKernelArg(k_q_lap_mad, 4, sizeof(float), &lap_max);
         clSetKernelArg(k_q_lap_mad, 5, sizeof(int), &sigma_idx);
         clSetKernelArg(k_q_lap_mad, 6, sizeof(cl_mem), &params_buf);
+        clSetKernelArg(k_q_lap_mad, 7, sizeof(cl_mem), &ne_scratch);
         dispatch_1d_named(queue, k_q_lap_mad, 64, 64, "YGQ2a lap_mad_lin");
 
         /* Q Stage 1 derive α/σ² from σ_lin (= synthetic, matches CPU). */
@@ -557,12 +574,15 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     clSetKernelArg(k_gat_fwd, 3, sizeof(int), &npix_i);
     dispatch_1d_named(queue, k_gat_fwd, align_up(npix, 256), 256, "YG4a gat_fwd");
 
-    /* 4a': [LATEST: GALOSH_YUV_Q] Stage 2 unified_sigma normalize.
-     * Mirrors CPU galosh_yuv_cpu Stage 2: Laplacian-MAD on Y_stab →
-     * σ_gat → divide Y_stab by σ_gat for unit-variance in GAT space.
-     * Skipped for GALOSH_YUV_O (= the Foi-Alenius path doesn't have
-     * an analogous post-GAT scalar normalize). */
-    if(g_galosh_yuv_q_gpu)
+    /* 4a': post-GAT σ_gat unit-variance normalize — RUN IN BOTH MODES.
+     * Mirrors CPU galosh_yuv_cpu Step 5 (UNCONDITIONAL for both YUV_O and
+     * YUV_Q): Laplacian-MAD σ_gat on the post-GAT Y_stab → divide Y_stab by
+     * σ_gat for unit variance in GAT space, so the LOSH sees the canonical
+     * scale.  BUG FIX 2026-06-28: this was Q-ONLY; the default (O) path
+     * skipped it, so the GPU LOSH ran at the wrong noise scale and shrank
+     * differently from the CPU → a ~0.005 mean|diff| CPU<->GPU divergence
+     * that FP32-LOSH alone could not close (noise-est α already matched to
+     * ~0.1%).  The matching de-normalize is "4g'" below. */
     {
         const int x_stride = 3;
         const float lap_max = 8.0f;       /* clip range for GAT-domain σ ≈ 1 */
@@ -574,27 +594,34 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
         clSetKernelArg(k_q_lap_mad, 4, sizeof(float), &lap_max);
         clSetKernelArg(k_q_lap_mad, 5, sizeof(int), &sigma_gat_idx);
         clSetKernelArg(k_q_lap_mad, 6, sizeof(cl_mem), &params_buf);
-        dispatch_1d_named(queue, k_q_lap_mad, 64, 64, "YGQ4a' lap_mad_gat");
+        clSetKernelArg(k_q_lap_mad, 7, sizeof(cl_mem), &ne_scratch);
+        dispatch_1d_named(queue, k_q_lap_mad, 64, 64, "YG4a' lap_mad_gat");
 
         clSetKernelArg(k_q_norm, 0, sizeof(cl_mem), &y_stab_buf);
         clSetKernelArg(k_q_norm, 1, sizeof(cl_mem), &params_buf);
         clSetKernelArg(k_q_norm, 2, sizeof(int), &sigma_gat_idx);
         clSetKernelArg(k_q_norm, 3, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_q_norm, align_up(npix, 256), 256, "YGQ4a'' unified_sigma_norm");
-
-        /* Snapshot post-unified_sigma, pre-LOSH Y_stab for chroma path
-         * (= mirrors CPU Q which uses Y_stab as guide; Phase 4f LOSH
-         * overwrites y_stab_buf via h2f, so we need this snapshot
-         * before Phase 4b f2h consumes it). */
-        clEnqueueCopyBuffer(queue, y_stab_buf, q_y_snap_f, 0, 0,
-                            npix * sizeof(float), 0, NULL, NULL);
+        dispatch_1d_named(queue, k_q_norm, align_up(npix, 256), 256, "YG4a'' unified_sigma_norm");
     }
+    /* Snapshot post-σ_gat, pre-LOSH NOISY Y_stab — the chroma LOESS bilateral
+     * GUIDE for BOTH modes (mirrors CPU galosh_yuv_cpu, which passes the
+     * normalized post-GAT NOISY Y_stab as y_guide; the LOSH below overwrites
+     * y_stab_buf, so snapshot first).  BUG FIX 2026-06-28: O-mode chroma
+     * previously used the DENOISED LINEAR y_buf as guide — wrong domain (linear
+     * vs GAT) and wrong signal (denoised vs noisy), so the bilateral weights
+     * went ~uniform and the chroma diverged from the CPU by ~0.0057 (the
+     * dominant CPU<->GPU gap, not the luma LOSH/precision). */
+    clEnqueueCopyBuffer(queue, y_stab_buf, q_y_snap_f, 0, 0,
+                        npix * sizeof(float), 0, NULL, NULL);
 
-    /* 4b: float → half */
-    clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &y_stab_buf);
-    clSetKernelArg(k_f2h, 1, sizeof(cl_mem), &half_in_buf);
-    clSetKernelArg(k_f2h, 2, sizeof(int), &npix_i);
-    dispatch_1d_named(queue, k_f2h, align_up(npix, 256), 256, "YG4b f2h_Y");
+    /* 4b: float → half (FP16 LOSH path only; FP32 reads y_stab directly) */
+    if(g_yuv_fp16)
+    {
+        clSetKernelArg(k_f2h, 0, sizeof(cl_mem), &y_stab_buf);
+        clSetKernelArg(k_f2h, 1, sizeof(cl_mem), &half_in_buf);
+        clSetKernelArg(k_f2h, 2, sizeof(int), &npix_i);
+        dispatch_1d_named(queue, k_f2h, align_up(npix, 256), 256, "YG4b f2h_Y");
+    }
 
     /* 4c: build inverse GAT LUT */
     clSetKernelArg(k_build_lut, 0, sizeof(cl_mem), &lut_d_buf);
@@ -610,40 +637,71 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     clSetKernelArg(k_lut_fin, 3, sizeof(float), &sigma_sq_y);
     dispatch_1d_named(queue, k_lut_fin, 1, 0, "YG4d lut_fin");
 
-    /* 4e: zero half_out accumulator */
+    /* 4e-4g: LOSH (Pass1 BayesShrink + Pass2 Wiener) on Y_stab.
+     * FP32 (default, PC): galosh_fused_pass12_f32 on float y_stab → y_den_f32 scratch,
+     *   then copy back to y_stab (no f2h/h2f) → matches the CPU FP32 reference (~8e-5).
+     * FP16 (--fp16, mobile GPU/NPU): the half galosh_fused_pass12 bracketed by f2h/h2f. */
+    if(g_yuv_fp16)
     {
         cl_half hzero = 0;
         clEnqueueFillBuffer(queue, half_out_buf, &hzero, sizeof(cl_half), 0,
                             npix * sizeof(cl_half), 0, NULL, NULL);
+        clSetKernelArg(k_fused, 0, sizeof(cl_mem), &half_in_buf);
+        clSetKernelArg(k_fused, 1, sizeof(cl_mem), &half_out_buf);
+        clSetKernelArg(k_fused, 2, sizeof(int), &width);
+        clSetKernelArg(k_fused, 3, sizeof(int), &height);
+        clSetKernelArg(k_fused, 4, sizeof(float), &strength_y);
+        dispatch_tile_named(queue, k_fused, width, height, "YG4f fused_Y(FP16)");
+        clSetKernelArg(k_h2f, 0, sizeof(cl_mem), &half_out_buf);
+        clSetKernelArg(k_h2f, 1, sizeof(cl_mem), &y_stab_buf);
+        clSetKernelArg(k_h2f, 2, sizeof(int), &npix_i);
+        dispatch_1d_named(queue, k_h2f, align_up(npix, 256), 256, "YG4g h2f_Y");
     }
-
-    /* 4f: fused pass12 (LOSH shrinkage on Y) */
-    clSetKernelArg(k_fused, 0, sizeof(cl_mem), &half_in_buf);
-    clSetKernelArg(k_fused, 1, sizeof(cl_mem), &half_out_buf);
-    clSetKernelArg(k_fused, 2, sizeof(int), &width);
-    clSetKernelArg(k_fused, 3, sizeof(int), &height);
-    clSetKernelArg(k_fused, 4, sizeof(float), &strength_y);
-    dispatch_tile_named(queue, k_fused, width, height, "YG4f fused_Y");
-
-    /* 4g: half → float */
-    clSetKernelArg(k_h2f, 0, sizeof(cl_mem), &half_out_buf);
-    clSetKernelArg(k_h2f, 1, sizeof(cl_mem), &y_stab_buf);
-    clSetKernelArg(k_h2f, 2, sizeof(int), &npix_i);
-    dispatch_1d_named(queue, k_h2f, align_up(npix, 256), 256, "YG4g h2f_Y");
+    else
+    {
+        /* FP32 (PC default) LOSH = the PROVEN galosh_pass12_o32 — the RAW o32
+         * kernel that is bit-exact (~8e-5) vs the CPU galosh_pass12_multiorient_
+         * blocked.  The YUV CPU LOSH IS that same function (n_orient=1, robust=1,
+         * stride=GALOSH_STRIDE=2, block=GALOSH_BS=8), so o32 mirrors it directly,
+         * INCLUDING o32's image-space block validity filter (ref ∈ [0, dim-BS])
+         * that the hand-ported galosh_fused_pass12_f32 lacked → that omission was
+         * the ~half-of-diff border divergence. */
+        float fzero = 0.0f;
+        clEnqueueFillBuffer(queue, y_den_f32_buf, &fzero, sizeof(float), 0,
+                            npix * sizeof(float), 0, NULL, NULL);
+        const int o32_phase_stride = 1;   /* 1 = 16 phases = full quality */
+        clSetKernelArg(k_pass12_o32, 0, sizeof(cl_mem), &y_stab_buf);
+        clSetKernelArg(k_pass12_o32, 1, sizeof(cl_mem), &y_den_f32_buf);
+        clSetKernelArg(k_pass12_o32, 2, sizeof(int), &width);
+        clSetKernelArg(k_pass12_o32, 3, sizeof(int), &height);
+        clSetKernelArg(k_pass12_o32, 4, sizeof(float), &strength_y);
+        clSetKernelArg(k_pass12_o32, 5, sizeof(int), &o32_phase_stride);
+        {   /* O32_TILE_SIZE=28 (galosh.cl), LDS 25.6KB; wg = g_tile_wg_dim². */
+            const int o32_tile = 28;
+            const size_t gl[2] = { (size_t)((width  + o32_tile - 1) / o32_tile) * g_tile_wg_dim,
+                                   (size_t)((height + o32_tile - 1) / o32_tile) * g_tile_wg_dim };
+            const size_t lo[2] = { (size_t)g_tile_wg_dim, (size_t)g_tile_wg_dim };
+            clEnqueueNDRangeKernel(queue, k_pass12_o32, 2, NULL, gl, lo, 0, NULL, NULL);
+        }
+        clEnqueueCopyBuffer(queue, y_den_f32_buf, y_stab_buf, 0, 0,
+                            npix * sizeof(float), 0, NULL, NULL);
+    }
 
     /* 4g': [LATEST: GALOSH_YUV_Q] denormalize Y_stab by unified_sigma
      * before Makitalo (= mirrors CPU `gat_inverse_exact(Y_den * unified_sigma)`).
      * Stage 2 normalize divided Y_stab by σ_gat to give unit variance for LOSH;
      * the inverse GAT operates on the original GAT-domain scale, so we
      * multiply by σ_gat here to undo the normalization. */
-    if(g_galosh_yuv_q_gpu)
+    /* 4g': de-normalize Y_stab by σ_gat — RUN IN BOTH MODES (undo the 4a'
+     * Step-5 normalize; mirrors CPU gat_inverse_exact(Y_den * unified_sigma)
+     * which is also unconditional).  Was Q-only — see the 4a' bug-fix note. */
     {
         const int sigma_gat_idx = P_YG_SIGMA_CB;
         clSetKernelArg(k_q_denorm, 0, sizeof(cl_mem), &y_stab_buf);
         clSetKernelArg(k_q_denorm, 1, sizeof(cl_mem), &params_buf);
         clSetKernelArg(k_q_denorm, 2, sizeof(int), &sigma_gat_idx);
         clSetKernelArg(k_q_denorm, 3, sizeof(int), &npix_i);
-        dispatch_1d_named(queue, k_q_denorm, align_up(npix, 256), 256, "YGQ4g' denorm");
+        dispatch_1d_named(queue, k_q_denorm, align_up(npix, 256), 256, "YG4g' denorm");
     }
 
     /* 4h: Makitalo-Foi inverse GAT */
@@ -967,8 +1025,10 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     }
     else
     {
-        /* GALOSH_YUV_O chroma: single-pass non-separable bilateral LOESS. */
-        clSetKernelArg(k_guided_loess, 0, sizeof(cl_mem), &y_buf);
+        /* GALOSH_YUV_O chroma: single-pass non-separable bilateral LOESS.
+         * GUIDE = q_y_snap_f (normalized post-GAT NOISY Y, = CPU Y_stab guide),
+         * NOT the denoised linear y_buf — see the 4a' snapshot bug-fix note. */
+        clSetKernelArg(k_guided_loess, 0, sizeof(cl_mem), &q_y_snap_f);
         clSetKernelArg(k_guided_loess, 1, sizeof(cl_mem), &cb_buf);
         clSetKernelArg(k_guided_loess, 2, sizeof(cl_mem), &cr_buf);
         clSetKernelArg(k_guided_loess, 3, sizeof(cl_mem), &params_buf);
@@ -1098,6 +1158,7 @@ yg_cleanup:
     if(k_o_crop)          clReleaseKernel(k_o_crop);
     if(k_o_smoothstep_3p) clReleaseKernel(k_o_smoothstep_3p);
     if(q_y_snap_f)        clReleaseMemObject(q_y_snap_f);
+    if(ne_scratch)        clReleaseMemObject(ne_scratch);
     if(q_y_h16)           clReleaseMemObject(q_y_h16);
     if(q_cb_h16)          clReleaseMemObject(q_cb_h16);
     if(q_cr_h16)          clReleaseMemObject(q_cr_h16);
@@ -1170,6 +1231,10 @@ int main(int argc, char **argv)
         {
             const char ch = (a[10] == 'Q') ? 'q' : (a[10] == 'O') ? 'o' : a[10];
             g_galosh_yuv_q_gpu = (ch == 'q') ? 1 : 0;
+        }
+        else if(strcmp(a, "--fp16") == 0)
+        {
+            g_yuv_fp16 = 1;   /* mobile GPU/NPU FP16 LOSH; default is FP32 (matches CPU) */
         }
         else
         {

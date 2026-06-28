@@ -1,7 +1,8 @@
 """Reconstruct yuv_galosh_core.c with correct galosh_yuv_denoise + standalone harness."""
+import os
 import sys
 
-SRC = r'C:\Users\luxgrain\denoise_eval\standalone\yuv_galosh_core.c'
+SRC = os.path.expanduser(r'~\denoise_eval\standalone\yuv_galosh_core.c')
 
 with open(SRC, 'rb') as f:
     raw = f.read()

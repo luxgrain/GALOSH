@@ -42,19 +42,19 @@ from skimage.metrics import structural_similarity as ssim
 os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 
 BASE       = Path(__file__).parent.parent
-BENCH_DIR  = Path(r"C:\Users\luxgrain\datasets\sidd\medium_bench")
+BENCH_DIR  = Path(os.path.expanduser(r"~\datasets\sidd\medium_bench"))
 OUTDIR     = BASE / "sidd_medium"
 RESULTS    = BASE / "results"
 RESULTS.mkdir(exist_ok=True)
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-GPU_RAW_EXE    = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_raw_gpu.exe")
-GPU_YUV_EXE    = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_yuv_gpu.exe")
-GPU_SINGLE_EXE = Path(r"C:\Users\luxgrain\GALOSH\standalone\galosh_single_gpu.exe")
+GPU_RAW_EXE    = Path(os.path.expanduser(r"~\GALOSH\standalone\galosh_raw_gpu.exe"))
+GPU_YUV_EXE    = Path(os.path.expanduser(r"~\GALOSH\standalone\galosh_yuv_gpu.exe"))
+GPU_SINGLE_EXE = Path(os.path.expanduser(r"~\GALOSH\standalone\galosh_single_gpu.exe"))
 # Backward-compat alias (some legacy bench helpers reference GPU_EXE).
 GPU_EXE        = GPU_RAW_EXE
-KAIR_DIR   = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\KAIR")
-NAFNET_DIR = Path(r"C:\Users\luxgrain\GALOSH\benchmark\external\NAFNet")
+KAIR_DIR   = Path(os.path.expanduser(r"~\GALOSH\benchmark\external\KAIR"))
+NAFNET_DIR = Path(os.path.expanduser(r"~\GALOSH\benchmark\external\NAFNet"))
 BASH_EXE   = Path(r"C:\msys64\usr\bin\bash.exe")
 
 # EN: Make per-method wrappers under scripts/methods/ importable.
@@ -196,6 +196,7 @@ def compute_niqe(srgb):
 def run_galosh_gpu(noisy, w, h, uid, strength=1.0, ls=1.0, cs=1.0,
                    alpha=0.0, sigma_sq=0.0, cl_device=0):
     """GALOSH GPU (OpenCL) on full RAW. Fully blind."""
+    uid = f"{uid}_{os.getpid()}"   # PID-unique temp: parallel processes must NOT share _tmp files
     in_path  = OUTDIR / f"_tmp_{uid}_in.raw"
     out_path = OUTDIR / f"_tmp_{uid}_out.raw"
     noisy.astype(np.float32).tofile(str(in_path))
