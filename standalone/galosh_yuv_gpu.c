@@ -211,7 +211,7 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
 
         char opts[512];
         snprintf(opts, sizeof(opts),
-            "-DCL_TARGET_OPENCL_VERSION=120 -cl-nv-verbose "
+            "-DCL_TARGET_OPENCL_VERSION=120 "
             "-DGALOSH_STRIDE=%d -DTILE_SIZE=%d -DHIST_BINS=%d -DREDUCE_WG_SIZE=%d",
             GALOSH_STRIDE, TILE_SIZE, HIST_BINS, REDUCE_WG_SIZE);
         err = clBuildProgram(prog, 1, &device, opts, NULL, NULL);
