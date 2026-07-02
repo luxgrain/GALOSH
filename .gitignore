@@ -98,3 +98,10 @@ tools/_tmp_archive_*/
 !standalone/*.txt
 !scripts/*.txt
 standalone/*.clbin
+
+# --- Organize 2026-07-02: archived-for-user-deletion area (NEVER commit) ---
+_ARCHIVE/
+
+# --- USPTO provisional materials (private, never public) ---
+docs/patent/
+tools/patent_figures/
