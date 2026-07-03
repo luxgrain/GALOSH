@@ -187,9 +187,29 @@ silicon, or a fully verified hardware datapath — those are future work.
   its GPU throughput reflects paired-int32 emulation on FP-oriented hardware,
   not ISP-native speed.
 
+## Citing GALOSH / Who uses it?
+
+If GALOSH is useful in your research, please cite it (`CITATION.cff` has
+machine-readable metadata; the arXiv identifier will be added on release):
+
+```bibtex
+@article{galosh2026,
+  author = {Sato, Yoshiro},
+  title  = {{GALOSH}: Blind, Training-Free Denoising of Raw Bayer and sRGB
+            Images by Parallel-Friendly Local Shrinkage},
+  year   = {2026},
+  note   = {arXiv preprint, identifier to be added on release}
+}
+```
+
+If you use GALOSH in a product or pipeline — **or even just drew on it as a
+reference for your own design** — we would love to hear about it: open an
+issue, or add yourself to [`ADOPTERS.md`](ADOPTERS.md). Entirely voluntary
+(Apache-2.0 imposes no reporting obligation), always appreciated.
+
 ## License and publication
 
-- **Code:** Apache-2.0 (see `LICENSE`).
+- **Code:** Apache-2.0 (see `LICENSE` and `NOTICE`).
 - **Paper / figures:** CC BY 4.0. Planned submission path: **arXiv → IEEE SPL →
   IPOL** (reproducible-implementation article).
 - A U.S. provisional patent application covering the methods has been filed

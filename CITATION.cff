@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: >-
+  If you use GALOSH in your research, please cite it using the metadata below.
+  A preprint is in preparation (arXiv ID will be added here on release).
+title: "GALOSH: Blind, Training-Free Denoising of Raw Bayer and sRGB Images by Parallel-Friendly Local Shrinkage"
+type: software
+authors:
+  - family-names: Sato
+    given-names: Yoshiro
+repository-code: "https://github.com/luxgrain/GALOSH"
+license: Apache-2.0
+keywords:
+  - image denoising
+  - blind denoising
+  - training-free
+  - raw Bayer
+  - variance stabilization
+  - Walsh-Hadamard transform
+preferred-citation:
+  type: article
+  title: "GALOSH: Blind, Training-Free Denoising of Raw Bayer and sRGB Images by Parallel-Friendly Local Shrinkage"
+  authors:
+    - family-names: Sato
+      given-names: Yoshiro
+  year: 2026
+  notes: "arXiv preprint in preparation; identifier to be added on release."
