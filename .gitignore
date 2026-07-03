@@ -105,3 +105,6 @@ _ARCHIVE/
 # --- USPTO provisional materials (private, never public) ---
 docs/patent/
 tools/patent_figures/
+
+# --- Harness scratch ---
+standalone/tests/_smoke_tmp/
