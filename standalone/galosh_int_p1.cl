@@ -49,9 +49,10 @@ void k_p1_sigma_ch(__global const lbuf_t *gat_q20, int width, int height,
   /* horizontal Laplacian: y in [0,halfheight), x in [0,halfwidth-2) */
   const int nxh = halfwidth - 2;
   if(nxh > 0) {
-    long tot = (long)halfheight * nxh;
-    for(long t = tid; t < tot; t += P1_WG) {
-      int y = (int)(t / nxh), x = (int)(t - (long)y * nxh);
+    /* no-INT64: hh*nxh <= W*H/4 < 2^31 for any real frame */
+    int tot = halfheight * nxh;
+    for(int t = tid; t < tot; t += P1_WG) {
+      int y = t / nxh, x = t - y * nxh;
       int r = 2*y + dy0, c0 = 2*x + dx0, c1 = 2*(x+1) + dx0, c2 = 2*(x+2) + dx0;
       if(r >= height || c2 >= width) continue;
       int v0 = LDB(gat_q20, (size_t)r * width + c0);
@@ -67,9 +68,10 @@ void k_p1_sigma_ch(__global const lbuf_t *gat_q20, int width, int height,
   /* vertical Laplacian: y in [0,halfheight-2), x in [0,halfwidth) */
   const int nyv = halfheight - 2;
   if(nyv > 0) {
-    long tot = (long)nyv * halfwidth;
-    for(long t = tid; t < tot; t += P1_WG) {
-      int y = (int)(t / halfwidth), x = (int)(t - (long)y * halfwidth);
+    /* no-INT64: nyv*hw <= W*H/4 < 2^31 for any real frame */
+    int tot = nyv * halfwidth;
+    for(int t = tid; t < tot; t += P1_WG) {
+      int y = t / halfwidth, x = t - y * halfwidth;
       int c = 2*x + dx0, r0 = 2*y + dy0, r1 = 2*(y+1) + dy0, r2 = 2*(y+2) + dy0;
       if(r2 >= height || c >= width) continue;
       int v0 = LDB(gat_q20, (size_t)r0 * width + c);

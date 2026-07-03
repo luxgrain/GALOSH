@@ -1157,7 +1157,11 @@ static void fxp_estimate_noise(const fxp32 *in_q20,
     int viol = 0, cut_from = -1, nv_cut = n_valid;
     for(int b = 0; b < NE_NBINS; b++) {
       if(!bv_cut[b]) continue;
-      fxp32 thr = (fxp32)(((int64_t)run_max * 3) / 5);   /* 3/5·running_max */
+      /* 3/5·running_max via int32 split-multiply (no-INT64 shipping rule).
+       * run_max >= 0 always, so q*3 + (r*3)/5 == floor(run_max*3/5) EXACTLY
+       * (run_max = 5q+r) — bit-exact replacement of the former int64 form.
+       * 分割演算で int64 を排除（run_max>=0 なので厳密に等価・bit一致）。 */
+      fxp32 thr = (run_max / 5) * 3 + ((run_max % 5) * 3) / 5;
       if(bin_var_arr[b] < thr) {
         if(viol == 0) cut_from = b;                       /* first of a run */
         if(++viol >= 2) break;                            /* sustained drop */
@@ -2348,7 +2352,7 @@ static void phase4_chroma_halfres(const fxp32 *in_gat_q20,
  * GAT_int matches GAT_fp32 within precision.
  * ========================================================================== */
 #ifdef GALOSH_OPCOUNT
-long long g_n_mac = 0, g_n_sf = 0;   /* op-count instrumentation (see galosh_cpu_int.h) */
+long long g_n_mac = 0, g_n_sf = 0;   /* no64-exempt: op-count instrumentation (see galosh_cpu_int.h) */
 #endif
 int main(int argc, char **argv) {
   g_verbose = (getenv("GALOSH_VERBOSE") != NULL);
@@ -3023,7 +3027,7 @@ int main(int argc, char **argv) {
           output_file);
 
 #ifdef GALOSH_OPCOUNT
-  { long long px = (long long)width * height;
+  { long long px = (long long)width * height;   /* no64-exempt: profiling I/O, off the datapath */
     fprintf(stderr, "[OPCOUNT] pixels=%lld  MAC=%lld (%.1f/px)  SF=%lld (%.2f/px)\n",
             px, g_n_mac, (double)g_n_mac / (double)px,
             g_n_sf, (double)g_n_sf / (double)px); }

@@ -47,6 +47,13 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
                               float alpha, float sigma_sq, int cl_device_idx,
                               int variant)
 {
+    /* Externally supplied noise model (CLI): positive (α, σ²) must be HONORED
+     * (CPU-exe parity; e.g. the paper's VST-front-end ablation).  Saved here
+     * because the Phase-0 readback below overwrites alpha/sigma_sq.
+     * 外部供給 (α, σ²)>0 は尊重する（CPU exe と同じ意味論）。Phase-0 の
+     * readback が alpha/sigma_sq を上書きするため、ここで退避する。 */
+    const float alpha_ext = alpha, sigma_sq_ext = sigma_sq;
+    const int   ext_model = (alpha > 0.0f && sigma_sq > 0.0f);
 
     const int hw = width / 2, hh = height / 2;
     const size_t npix = (size_t)width * height;
@@ -858,10 +865,32 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         float est_o32[PARAMS_SIZE];
         clEnqueueReadBuffer(queue, params_buf, CL_TRUE, 0,
                             PARAMS_SIZE * sizeof(float), est_o32, 0, NULL, NULL);
-        alpha    = est_o32[P_ALPHA];
-        sigma_sq = est_o32[P_SIGMA_SQ];
-        fprintf(stderr, "[GPU][o32] Phase 0 noise est: alpha=%.6f sigma_sq=%.8f\n",
-                alpha, sigma_sq);
+        if(ext_model)
+        {
+            /* Honor the externally supplied model: o32 device kernels (GAT
+             * forward, inverse-LUT build) read params[P_ALPHA/P_SIGMA_SQ] and
+             * K0e derived P_S_SCALE from the estimate, so overwrite those
+             * slots with the supplied model (content-derived slots such as
+             * dark_thresh keep their estimated values). */
+            alpha = alpha_ext;  sigma_sq = sigma_sq_ext;
+            float sup_s_scale = sigma_sq / fmaxf(alpha, 1e-12f);
+            clEnqueueWriteBuffer(queue, params_buf, CL_TRUE, P_ALPHA * sizeof(float),
+                                 sizeof(float), &alpha, 0, NULL, NULL);
+            clEnqueueWriteBuffer(queue, params_buf, CL_TRUE, P_SIGMA_SQ * sizeof(float),
+                                 sizeof(float), &sigma_sq, 0, NULL, NULL);
+            clEnqueueWriteBuffer(queue, params_buf, CL_TRUE, P_S_SCALE * sizeof(float),
+                                 sizeof(float), &sup_s_scale, 0, NULL, NULL);
+            fprintf(stderr, "[GPU][o32] Phase 0 EXTERNAL model: alpha=%.6f sigma_sq=%.8f"
+                    " (blind est was %.6f / %.8f)\n",
+                    alpha, sigma_sq, est_o32[P_ALPHA], est_o32[P_SIGMA_SQ]);
+        }
+        else
+        {
+            alpha    = est_o32[P_ALPHA];
+            sigma_sq = est_o32[P_SIGMA_SQ];
+            fprintf(stderr, "[GPU][o32] Phase 0 noise est: alpha=%.6f sigma_sq=%.8f\n",
+                    alpha, sigma_sq);
+        }
     }
     else
     {
@@ -941,10 +970,30 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         float est_params[PARAMS_SIZE];
         clEnqueueReadBuffer(queue, params_buf, CL_TRUE, 0,
                             PARAMS_SIZE * sizeof(float), est_params, 0, NULL, NULL);
+        if(ext_model)
+        {
+            /* Honor the externally supplied model (legacy path: downstream
+             * kernels take α/σ² as host kernel args, but keep params_buf
+             * consistent for any params-reading consumer). */
+            alpha = alpha_ext;  sigma_sq = sigma_sq_ext;
+            float sup_s_scale = sigma_sq / fmaxf(alpha, 1e-12f);
+            clEnqueueWriteBuffer(queue, params_buf, CL_TRUE, P_ALPHA * sizeof(float),
+                                 sizeof(float), &alpha, 0, NULL, NULL);
+            clEnqueueWriteBuffer(queue, params_buf, CL_TRUE, P_SIGMA_SQ * sizeof(float),
+                                 sizeof(float), &sigma_sq, 0, NULL, NULL);
+            clEnqueueWriteBuffer(queue, params_buf, CL_TRUE, P_S_SCALE * sizeof(float),
+                                 sizeof(float), &sup_s_scale, 0, NULL, NULL);
+            fprintf(stderr, "[GPU] Phase 0 EXTERNAL model: alpha=%.6f sigma_sq=%.8f"
+                    " (blind est was %.6f / %.8f)\n",
+                    alpha, sigma_sq, est_params[13], est_params[14]);
+        }
+        else
+        {
         alpha    = est_params[13];
         sigma_sq = est_params[14];
         fprintf(stderr, "[GPU] Blind noise est: alpha=%.6f sigma_sq=%.8f s_scale=%.6f\n",
                 alpha, sigma_sq, est_params[10]);
+        }
 
     }
     }   /* end else (variant != 32) */

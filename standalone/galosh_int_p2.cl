@@ -52,7 +52,7 @@ void k_p2_dark_ref(__global const int *in_q20, __global const lbuf_t *in_gat,
   barrier(CLK_LOCAL_MEM_FENCE);
 
   const int n_cc = width / 2, n_cr = height / 2;   /* cell grid (br,bc step 2) */
-  const long ncells = (long)n_cr * n_cc;
+  const int ncells = n_cr * n_cc;   /* no-INT64: W/2 * H/2 < 2^31 for any real frame */
   const int n_iter = 2;
 
   for(int iter = 0; iter <= n_iter; iter++) {
@@ -63,8 +63,8 @@ void k_p2_dark_ref(__global const int *in_q20, __global const lbuf_t *in_gat,
     fxp_acc my_sw = fxp_acc_zero();
     fxp_acc my_sw0 = fxp_acc_zero(), my_sw1 = fxp_acc_zero();
     fxp_acc my_sw2 = fxp_acc_zero(), my_sw3 = fxp_acc_zero();
-    for(long ci = tid; ci < ncells; ci += P2_WG) {
-      int cr = (int)(ci / n_cc), cc = (int)(ci - (long)cr * n_cc);
+    for(int ci = tid; ci < ncells; ci += P2_WG) {
+      int cr = ci / n_cc, cc = ci - cr * n_cc;
       int br = 2 * cr, bc = 2 * cc;
       int g0 = LDB(in_gat, (size_t)br     * width + bc    );
       int g1 = LDB(in_gat, (size_t)(br+1) * width + bc    );
@@ -109,8 +109,8 @@ void k_p2_dark_ref(__global const int *in_q20, __global const lbuf_t *in_gat,
     /* ---- variance pass: residual-weighted MSE -> s_scale update ---- */
     int ch0 = l_ch[0], ch1 = l_ch[1], ch2 = l_ch[2], ch3 = l_ch[3];
     fxp_acc my_swW = fxp_acc_zero(), my_swR2 = fxp_acc_zero();
-    for(long ci = tid; ci < ncells; ci += P2_WG) {
-      int cr = (int)(ci / n_cc), cc = (int)(ci - (long)cr * n_cc);
+    for(int ci = tid; ci < ncells; ci += P2_WG) {
+      int cr = ci / n_cc, cc = ci - cr * n_cc;
       int br = 2 * cr, bc = 2 * cc;
       int g0 = LDB(in_gat, (size_t)br     * width + bc    );
       int g1 = LDB(in_gat, (size_t)(br+1) * width + bc    );

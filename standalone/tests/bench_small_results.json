@@ -1,0 +1,33 @@
+[
+ {
+  "method": "noisy_raw",
+  "psnr": 23.1,
+  "time_s": 0.0
+ },
+ {
+  "method": "noisy_yuv",
+  "psnr": 23.1,
+  "time_s": 0.0
+ },
+ {
+  "method": "galosh_raw_fp32",
+  "psnr": 38.97,
+  "time_s": 0.09,
+  "gain_db": 15.87,
+  "improves": true
+ },
+ {
+  "method": "galosh_raw_int32",
+  "psnr": 38.46,
+  "time_s": 0.618,
+  "gain_db": 15.36,
+  "improves": true
+ },
+ {
+  "method": "galosh_yuv_fp32",
+  "psnr": 30.72,
+  "time_s": 0.116,
+  "gain_db": 7.62,
+  "improves": true
+ }
+]

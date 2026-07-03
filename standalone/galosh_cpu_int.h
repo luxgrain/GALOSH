@@ -144,7 +144,7 @@ static inline void fxp_acc_sub_i32(fxp_acc *a, int32_t v) {
  * = special-function calls (exp/sqrt/recip/gat LUT).  Used to model ISP-native
  * throughput (MAC/pixel / MAC-array-rate), decoupled from FP-hardware emulation. */
 #ifdef GALOSH_OPCOUNT
-extern long long g_n_mac, g_n_sf;
+extern long long g_n_mac, g_n_sf;   /* no64-exempt: op-count instrumentation, off the datapath */
 #define OPCNT_MAC() (g_n_mac++)
 #define OPCNT_SF()  (g_n_sf++)
 #else

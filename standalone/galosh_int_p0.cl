@@ -218,7 +218,8 @@ void k_p0_estimate(__global const int *in_q20, int width, int height,
       int run_max = 0, viol = 0, cut_from = -1, nv_cut = n_valid;
       for(int b = 0; b < NE_NBINS; b++) {
         if(!bin_valid[b]) continue;
-        int thr = (int)(((long)run_max * 3) / 5);
+        /* no-INT64: split-multiply, EXACT for run_max>=0 (mirrors galosh_raw_cpu_int.c) */
+      int thr = (run_max / 5) * 3 + ((run_max % 5) * 3) / 5;
         if(bin_var_arr[b] < thr) { if(viol == 0) cut_from = b; if(++viol >= 2) break; }
         else { viol = 0; cut_from = -1; if(bin_var_arr[b] > run_max) run_max = bin_var_arr[b]; }
       }
@@ -285,11 +286,13 @@ p0_serial_done: ;
   barrier(CLK_LOCAL_MEM_FENCE);
   const int nxh = halfwidth - 2;     /* horizontal: x in [0,halfwidth-2) */
   if(nxh > 0) {
-    long tot_h = (long)4 * halfheight * nxh;
-    for(long t = tid; t < tot_h; t += P0_WG) {
-      int ch = (int)(t / ((long)halfheight * nxh));
-      long rem = t - (long)ch * halfheight * nxh;
-      int y = (int)(rem / nxh), x = (int)(rem - (long)y * nxh);
+    /* no-INT64: flattened index fits int32 (4*hh*nxh <= W*H < 2^31 for any real frame) */
+    const int hn_h = halfheight * nxh;
+    int tot_h = 4 * hn_h;
+    for(int t = tid; t < tot_h; t += P0_WG) {
+      int ch = t / hn_h;
+      int rem = t - ch * hn_h;
+      int y = rem / nxh, x = rem - y * nxh;
       int dy0 = (ch >> 1) & 1, dx0 = ch & 1;
       int r = 2 * y + dy0, c0 = 2 * x + dx0, c1 = 2 * (x+1) + dx0, c2 = 2 * (x+2) + dx0;
       if(r >= height || c2 >= width) continue;
@@ -306,11 +309,13 @@ p0_serial_done: ;
   }
   const int nyv = halfheight - 2;    /* vertical: y in [0,halfheight-2) */
   if(nyv > 0) {
-    long tot_v = (long)4 * nyv * halfwidth;
-    for(long t = tid; t < tot_v; t += P0_WG) {
-      int ch = (int)(t / ((long)nyv * halfwidth));
-      long rem = t - (long)ch * nyv * halfwidth;
-      int y = (int)(rem / halfwidth), x = (int)(rem - (long)y * halfwidth);
+    /* no-INT64: flattened index fits int32 (see horizontal pass note) */
+    const int hn_v = nyv * halfwidth;
+    int tot_v = 4 * hn_v;
+    for(int t = tid; t < tot_v; t += P0_WG) {
+      int ch = t / hn_v;
+      int rem = t - ch * hn_v;
+      int y = rem / halfwidth, x = rem - y * halfwidth;
       int dy0 = (ch >> 1) & 1, dx0 = ch & 1;
       int c = 2 * x + dx0, r0 = 2 * y + dy0, r1 = 2 * (y+1) + dy0, r2 = 2 * (y+2) + dy0;
       if(r2 >= height || c >= width) continue;
@@ -529,7 +534,8 @@ __kernel void k_p0_estimate_serial(__global const int *in_q20, int width, int he
     int run_max = 0, viol = 0, cut_from = -1, nv_cut = n_valid;
     for(int b = 0; b < NE_NBINS; b++) {
       if(!bin_valid[b]) continue;
-      int thr = (int)(((long)run_max * 3) / 5);
+      /* no-INT64: split-multiply, EXACT for run_max>=0 (mirrors galosh_raw_cpu_int.c) */
+      int thr = (run_max / 5) * 3 + ((run_max % 5) * 3) / 5;
       if(bin_var_arr[b] < thr) { if(viol == 0) cut_from = b; if(++viol >= 2) break; }
       else { viol = 0; cut_from = -1; if(bin_var_arr[b] > run_max) run_max = bin_var_arr[b]; }
     }

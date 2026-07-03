@@ -173,9 +173,49 @@ static inline void free_aligned(void *p) {
     } \
 } while(0)
 
+/* Directory of the running executable (kernels ship next to the exe).
+ * 実行ファイルのあるディレクトリ（カーネル .cl は exe と同じ場所に置かれる）。 */
+static const char *galosh_exe_dir(void) {
+    static char dir[1024];
+    static int done = 0;
+    if(!done) {
+        dir[0] = 0;
+#ifdef _WIN32
+        DWORD n = GetModuleFileNameA(NULL, dir, (DWORD)sizeof(dir) - 1);
+        if(n > 0) {
+            dir[n] = 0;
+            for(char *p = dir + n; p > dir; p--)
+                if(*p == '\\' || *p == '/') { *p = 0; break; }
+        }
+#else
+        ssize_t n = readlink("/proc/self/exe", dir, sizeof(dir) - 1);
+        if(n > 0) {
+            dir[n] = 0;
+            for(char *p = dir + n; p > dir; p--)
+                if(*p == '/') { *p = 0; break; }
+        }
+#endif
+        done = 1;
+    }
+    return dir;
+}
+
+/* Load a kernel/source file. Resolution order:
+ *   1. the path as given (relative to the CWD, e.g. run from the repo root);
+ *   2. <exe dir>/<basename> — so the CLI works from ANY working directory
+ *      as long as the .cl/.clh files sit next to the executable (they do).
+ * CWD 依存を排除：与えられたパス → exe と同じディレクトリの basename の順で解決。 */
 static char *load_kernel_source(const char *filename, size_t *out_len) {
     FILE *f = fopen(filename, "rb");
-    if(!f) { fprintf(stderr, "Cannot open %s\n", filename); return NULL; }
+    if(!f) {
+        const char *base = filename;
+        for(const char *p = filename; *p; p++)
+            if(*p == '/' || *p == '\\') base = p + 1;
+        char alt[1200];
+        snprintf(alt, sizeof(alt), "%s/%s", galosh_exe_dir(), base);
+        f = fopen(alt, "rb");
+        if(!f) { fprintf(stderr, "Cannot open %s (also tried %s)\n", filename, alt); return NULL; }
+    }
     fseek(f, 0, SEEK_END);
     size_t len = ftell(f);
     fseek(f, 0, SEEK_SET);
