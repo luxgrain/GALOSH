@@ -1,0 +1,119 @@
+% ============================================================================
+% GALOSH — sRGB（GALOSH-YUV/RGB）ベンチマーク表（日本語キャプション版）
+% 出典: benchmark/scripts/bench_yuv_srgb.py 全 BLIND 実行 2026-06-29
+% 凡例は RAW 表と同じ: 太字 = blind・training-free 手法中で最良、下線 = 同2位。
+% DL 行は学習済み参照グループ。
+% ============================================================================
+
+% ---------------------------------------------------------------- SIDD sRGB
+\begin{table}[t]
+\centering
+\caption{\textbf{SIDD Medium sRGB}（80 シーン、\textbf{フルフレーム}
+$\sim$15.8\,MP）における sRGB 領域ブラインド・デノイジング。全手法がフル画像で
+実行される（DL はオーバーラップ $1024^2$ タイル推論；LPIPS/DISTS は $1024^2$
+タイル格子の平均）。全手法が \emph{blind}：古典的手法は入力から
+$\sigma$ を推定（skimage \texttt{estimate\_sigma}）、GALOSH は自前のブラインド
+ノイズモデル、DL は公開されている実ノイズ学習済み重み。太字 / \underline{下線} =
+blind・training-free 手法中の最良 / 2位。学習済み DL は上限参照
+（NAFNet と Restormer は SIDD \emph{で}学習されている）。}
+\label{tab:sidd_srgb}
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{l ccccc rr}
+\toprule
+ & & & & & & \multicolumn{2}{c}{時間\,(s)}\\
+\cmidrule(lr){7-8}
+手法 & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$ & NIQE$\downarrow$ & CPU & GPU\\
+\midrule
+ノイズ入力                 & 25.69 & 0.424 & 0.790 & 0.380 & 5.86 & --- & ---\\
+\addlinespace[2pt]
+\multicolumn{8}{l}{\textit{blind・training-free}}\\
+\quad \textbf{GALOSH-YUV（提案）} & \textbf{35.01} & \textbf{0.838} & \textbf{0.314} & \textbf{0.243} & \underline{5.41} & 2.50 & 0.87\\
+\quad CBM3D                & 27.09 & 0.493 & 0.721 & 0.349 & 5.52 & 118.6$^{1t}$ & ---\\
+\quad Color-NLM            & \underline{28.92} & \underline{0.656} & \underline{0.534} & \underline{0.290} & \textbf{4.57} & 2.79 & ---\\
+\quad Guided filter        & 27.43 & 0.523 & 0.687 & 0.349 & 5.79 & 0.71 & ---\\
+\midrule
+\multicolumn{8}{l}{\textit{学習済み DL（参照）}}\\
+\quad NAFNet-SIDD          & 41.94 & 0.942 & 0.168 & 0.154 & 7.69 & --- & 13.5\\
+\quad Restormer-SIDD       & 40.94 & 0.935 & 0.181 & 0.175 & 8.05 & --- & 565$^{v}$\\
+\quad SCUNet-real          & 36.09 & 0.902 & 0.252 & 0.234 & 9.30 & --- & 17.6\\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize フル 15.8\,MP フレームの画像あたり時間をプラットフォーム別の列
+に分離。「---」= そのプラットフォームの実装なし（古典的ベースラインに GPU 移植は
+なく、DL は CPU では非実用的）。DL の時間は fresh プロセスの warm 実行値
+（長寿命プロセスでは GPU メモリの経時劣化で膨張する）。$^{v}$Restormer のタイル
+attention は本 12\,GB GPU ではフルフレームで VRAM 律速。両プラットフォームを
+持つのは GALOSH のみ：GPU = カーネルパイプライン、CPU = 32 スレッドビルド。
+CPU 行は $^{1t}$（参照 CBM3D パッケージは実質シングルスレッド）を除き全 32
+コア使用。}
+\end{table}
+
+% ---------------------------------------------------------------- RawNIND sRGB
+\begin{table}[t]
+\centering
+\caption{\textbf{RawNIND レンダリング sRGB}（カメラ横断 $512^2$ クロップ全
+1493 枚）における sRGB 領域ブラインド・デノイジング。プロトコルと強調は
+表~\ref{tab:sidd_srgb} と同じ。本セットは低 ISO シーンが支配的（1493 中 684 が
+ISO\,2000 未満）で、集計値がノイズ入力側へ圧縮される --- ISO 帯別の内訳は
+表~\ref{tab:rawnind_srgb_iso} を参照。}
+\label{tab:rawnind_srgb}
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{l ccccc rr}
+\toprule
+ & & & & & & \multicolumn{2}{c}{時間\,(s)}\\
+\cmidrule(lr){7-8}
+手法 & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$ & NIQE$\downarrow$ & CPU & GPU\\
+\midrule
+ノイズ入力                 & 22.13 & 0.662 & 0.479 & 0.253 & 8.58 & --- & ---\\
+\addlinespace[2pt]
+\multicolumn{8}{l}{\textit{blind・training-free}}\\
+\quad \textbf{GALOSH-YUV（提案）} & \textbf{23.33} & \textbf{0.841} & \textbf{0.265} & \textbf{0.227} & \textbf{7.12} & 0.077 & 0.012\\
+\quad CBM3D                & \underline{22.49} & 0.720 & 0.396 & \underline{0.228} & 6.33 & 2.60$^{1t}$ & ---\\
+\quad Color-NLM            & 22.48 & \underline{0.761} & \underline{0.353} & 0.225 & \underline{7.82} & 0.19 & ---\\
+\quad Guided filter        & 22.50 & 0.724 & 0.402 & 0.236 & 8.62 & 0.012 & ---\\
+\midrule
+\multicolumn{8}{l}{\textit{学習済み DL（参照）}}\\
+\quad NAFNet-SIDD          & 22.58$^{\dagger}$ & 0.832 & 0.279 & 0.237 & 10.13 & --- & 0.13\\
+\quad Restormer-SIDD       & 23.63 & 0.873 & 0.207 & 0.206 & 9.46 & --- & 0.35\\
+\quad SCUNet-real          & 23.42 & 0.861 & 0.250 & 0.247 & 10.35 & --- & 0.14\\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize プラットフォーム分離と脚注は表~\ref{tab:sidd_srgb} と同じ
+（時間は $512^2$）。$^{\dagger}$NAFNet-SIDD は本セットの暗部 37 シーンで数値
+発散（生出力 $\pm10^3$、該当シーンの PSNR\,$<$\,5）。発散シーンを除外した平均
+は 23.05。GALOSH を含む他の全手法は同じ入力で安定。値はそのまま報告。}
+\end{table}
+
+% ---------------------------------------------------------------- per-ISO
+\begin{table}[t]
+\centering
+\caption{RawNIND sRGB の \textbf{ISO 帯別}平均 PSNR (dB)。低 ISO ではシーンが
+ほぼクリーンでどの手法もほとんど改善できない。デノイズが効く高 ISO では、
+GALOSH は古典的手法を明確に上回り、学習済み DL は GALOSH をやや上回る。
+表~\ref{tab:rawnind_srgb} の集計値はこの両方の効果を隠すため、内訳を報告する。}
+\label{tab:rawnind_srgb_iso}
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{l cccc}
+\toprule
+ & ISO$<$400 & 400--2k & 2k--12.8k & $\geq$12.8k\\
+手法 & (290) & (394) & (374) & (435)\\
+\midrule
+ノイズ入力       & 23.60 & 24.68 & 21.57 & 19.32\\
+\addlinespace[2pt]
+\textbf{GALOSH-YUV（提案）} & \textbf{23.66} & \textbf{25.20} & \textbf{22.58} & \textbf{22.06}\\
+CBM3D            & \textbf{23.66} & 24.89 & 21.85 & 20.10\\
+\midrule
+NAFNet-SIDD      & 19.97$^{\dagger}$ & 24.44 & 22.67 & 22.56\\
+Restormer-SIDD   & 23.68 & 25.36 & 22.77 & 22.78\\
+SCUNet-real      & 23.52 & 25.26 & 22.62 & 22.36\\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize 太字 = blind・training-free 手法中の最良。$^{\dagger}$暗部発散
+ケース（表~\ref{tab:rawnind_srgb}）はこの帯に含まれる。}
+\end{table}

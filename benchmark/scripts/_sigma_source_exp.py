@@ -10,7 +10,7 @@ from skimage.restoration import estimate_sigma
 sys.path.insert(0, "benchmark/scripts")
 import bench_yuv_srgb as B
 
-ND = Path("E:/rawnind_bench/__noisy_raw_render__"); GD = Path("E:/rawnind_bench/__gt_raw_render__")
+ND = Path("E:/img_dataset/rawnind_bench/__noisy_raw_render__"); GD = Path("E:/img_dataset/rawnind_bench/__gt_raw_render__")
 R = Path("benchmark/rawnind_srgb_results"); r = json.load(open(R / "_metrics.json"))
 gal = {x['tag']: x for x in r if x['method'] == 'galosh_yuv_gpu_fp32' and x.get('ok')}
 

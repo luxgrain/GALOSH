@@ -21,9 +21,9 @@ from PIL import Image
 
 GALOSH     = Path(__file__).resolve().parents[2]
 EXE_GPU    = GALOSH / "standalone" / "galosh_yuv_gpu.exe"
-BENCH_SIDD = Path(os.path.expanduser(r"~\datasets\sidd\medium_bench"))
-RAWNIND_N  = Path("E:/rawnind_bench/__noisy_raw_render__")
-RAWNIND_G  = Path("E:/rawnind_bench/__gt_raw_render__")
+BENCH_SIDD = Path(r"E:\img_dataset\sidd\medium_bench")
+RAWNIND_N  = Path("E:/img_dataset/rawnind_bench/__noisy_raw_render__")
+RAWNIND_G  = Path("E:/img_dataset/rawnind_bench/__gt_raw_render__")
 OUT_NAME   = {"sidd": "yuv_srgb_results", "rawnind": "rawnind_srgb_results"}
 TMP        = GALOSH / "benchmark" / "_yuv_bench_tmp"
 UCRT_BIN   = r"C:\msys64\ucrt64\bin"
@@ -79,12 +79,31 @@ def est_sigma(img):
     s = estimate_sigma(img, channel_axis=-1, average_sigmas=True)
     return float(max(s, 1e-3))
 
+# Full-frame images (SIDD sRGB = 15.8MP) blow up GPU VRAM for whole-image
+# perceptual metrics -> above this pixel count, LPIPS/DISTS are the mean over a
+# non-overlapping 1024^2 tile grid (standard full-frame protocol).
+_METRIC_TILE_PX = 3_000_000
+def _tile_grid(H, W, ts=1024):
+    ys = list(range(0, max(H - ts, 0) + 1, ts)) or [0]
+    xs = list(range(0, max(W - ts, 0) + 1, ts)) or [0]
+    if ys[-1] + ts < H: ys.append(H - ts)
+    if xs[-1] + ts < W: xs.append(W - ts)
+    return [(y, x, min(ts, H), min(ts, W)) for y in ys for x in xs]
+
+def _tiled_pair_metric(fn, a, b, ts=1024):
+    H, W = a.shape[:2]
+    vals = [fn(np.ascontiguousarray(a[y:y+h, x:x+w]), np.ascontiguousarray(b[y:y+h, x:x+w]))
+            for (y, x, h, w) in _tile_grid(H, W, ts)]
+    return float(np.mean(vals))
+
 _lpips_fn = None
 def lpips_m(a, b):
     global _lpips_fn
     import torch, lpips
     if _lpips_fn is None:
         _lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(DEVICE)
+    if a.shape[0] * a.shape[1] > _METRIC_TILE_PX:
+        return _tiled_pair_metric(lpips_m, a, b)
     def t(x):  # HWC [0,1] -> NCHW [-1,1]
         return (torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE) * 2 - 1)
     with torch.no_grad():
@@ -97,6 +116,8 @@ def dists_m(a, b):
     from DISTS_pytorch import DISTS
     if _dists_fn is None:
         _dists_fn = DISTS().to(DEVICE)
+    if a.shape[0] * a.shape[1] > _METRIC_TILE_PX:
+        return _tiled_pair_metric(dists_m, a, b)
     def t(x):
         return torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
     with torch.no_grad():
@@ -110,8 +131,15 @@ def niqe_m(a):
         _niqe_fn = pyiqa.create_metric('niqe', device=DEVICE)
     def t(x):
         return torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
-    with torch.no_grad():
-        return float(_niqe_fn(t(a).clamp(0, 1)).item())
+    try:
+        with torch.no_grad():
+            return float(_niqe_fn(t(a).clamp(0, 1)).item())
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        H, W = a.shape[:2]
+        vals = [float(_niqe_fn(t(np.ascontiguousarray(a[y:y+h, x:x+w])).clamp(0, 1)).item())
+                for (y, x, h, w) in _tile_grid(H, W, 2048)]
+        return float(np.mean(vals))
 
 # ----------------------------------------------------------------- methods
 _galosh_dev = None
@@ -134,7 +162,7 @@ def m_galosh(noisy, uid, dev=None):
             if d is None: continue
             t0 = time.perf_counter()
             p = subprocess.run([str(EXE_GPU), str(ip), str(op), str(W), str(H), "1.0", "1.0", str(d)],
-                               env=env, capture_output=True, timeout=120)
+                               env=env, capture_output=True, timeout=600)  # full-frame 15.8MP: 190MB I/O each way
             dt = time.perf_counter() - t0
             if p.returncode == 0 and op.exists():
                 _galosh_dev = d
@@ -182,6 +210,8 @@ _nafnet = _scunet = _restormer = None
 def _dl_run(model, noisy, mult=1):
     import torch, torch.nn.functional as F
     H, W = noisy.shape[:2]
+    if H * W > _DL_TILE_PX:                 # full-frame (15.8MP) -> tiled inference (VRAM)
+        return _dl_run_tiled(model, noisy, mult)
     x = torch.from_numpy(noisy).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
     if mult > 1:
         ph = (mult - H % mult) % mult; pw = (mult - W % mult) % mult
@@ -190,6 +220,29 @@ def _dl_run(model, noisy, mult=1):
         y = model(x)
     y = y[:, :, :H, :W]
     return y.squeeze(0).permute(1, 2, 0).clamp(0, 1).cpu().numpy().astype(np.float32)
+
+# Whole-image DL inference OOMs on 15.8MP; standard overlapped-tile protocol with
+# feathered blending (each tile is still >= the nets' 256^2 train patch).
+_DL_TILE_PX = 2_500_000
+def _dl_run_tiled(model, noisy, mult=1, ts=1024, ov=96):
+    H, W = noisy.shape[:2]
+    out = np.zeros((H, W, 3), np.float64); wsum = np.zeros((H, W, 1), np.float64)
+    step = ts - ov
+    ys = list(range(0, max(H - ts, 0) + 1, step)); xs = list(range(0, max(W - ts, 0) + 1, step))
+    if not ys or ys[-1] + ts < H: ys.append(max(H - ts, 0))
+    if not xs or xs[-1] + ts < W: xs.append(max(W - ts, 0))
+    ramp = np.minimum(np.arange(1, ts + 1), np.arange(ts, 0, -1)).astype(np.float64)
+    ramp = np.minimum(ramp / max(ov, 1), 1.0)
+    win2d = np.outer(ramp, ramp)[:, :, None]
+    for y in sorted(set(ys)):
+        for x in sorted(set(xs)):
+            h, w = min(ts, H - y), min(ts, W - x)
+            tile = np.ascontiguousarray(noisy[y:y+h, x:x+w])
+            d = _dl_run(model, tile, mult)          # tile <= _DL_TILE_PX -> direct path
+            wv = win2d[:h, :w]
+            out[y:y+h, x:x+w] += d.astype(np.float64) * wv
+            wsum[y:y+h, x:x+w] += wv
+    return (out / np.maximum(wsum, 1e-12)).astype(np.float32)
 
 def m_nafnet(noisy):
     global _nafnet
@@ -259,7 +312,7 @@ def main():
         y0 = max(0, (H - n) // 2); x0 = max(0, (W - n) // 2)
         return np.ascontiguousarray(im[y0:y0 + min(n, H), x0:x0 + min(n, W)])
 
-    OUT = GALOSH / "benchmark" / OUT_NAME[args.dataset]
+    OUT = GALOSH / "benchmark" / (OUT_NAME[args.dataset] + ("_full" if not args.crop else ""))
     TMP.mkdir(parents=True, exist_ok=True)
     methods = build_methods(set(args.methods))
     total = scene_count(args.dataset, args.scenes)
@@ -313,7 +366,9 @@ def main():
         agg.setdefault(r["method"], []).append(r)
     keys = ["psnr", "ssim", "lpips", "dists", "niqe"]
     hdr = f"{'method':<22}{'N':>4}{'PSNR':>8}{'SSIM':>8}{'LPIPS':>8}{'DISTS':>8}{'NIQE':>7}{'ms':>9}"
-    dsdesc = {"sidd": f"SIDD-Medium sRGB, central {args.crop}x{args.crop} crop (full=15.8MP)",
+    dsdesc = {"sidd": (f"SIDD-Medium sRGB, central {args.crop}x{args.crop} crop (full=15.8MP)"
+                       if args.crop else
+                       "SIDD-Medium sRGB, FULL FRAME (~15.8MP; DL tiled 1024/ov96; LPIPS/DISTS = 1024-tile mean)"),
               "rawnind": "RawNIND-rendered sRGB, 512x512 full"}[args.dataset]
     note = (f"{dsdesc} | N={total} | ALL methods BLIND, sRGB colour | CBM3D/Color-NLM/Guided "
             f"sigma=estimate_sigma; GALOSH/NAFNet-SIDD/SCUNet-real/Restormer-SIDD self-contained")

@@ -1,0 +1,96 @@
+{
+ "hardware": "RTX 4070 Ti / 1 CPU core",
+ "date": "2026-06-27",
+ "scope": "GPU=per-frame GPU time (o32=kernel pipeline, i16=H2D+compute+D2H); one-time ctx+build(~90ms)+file I/O excluded. CPU=wall-clock.",
+ "o32_fp32_gpu_ms": {
+  "1080p": 18.2,
+  "4k": 46.2,
+  "5k": 71.9
+ },
+ "i16_int16_gpu_ms": {
+  "1080p": 73.8,
+  "4k": 296.0,
+  "5k": 535.2
+ },
+ "o_fp32_cpu_s": {
+  "1080p": 1.38
+ },
+ "r32_int32_cpu_s": {
+  "1080p": 15.38
+ },
+ "fps_o32": {
+  "1080p": 55.0,
+  "4k": 21.6,
+  "5k": 13.9
+ },
+ "fps_i16": {
+  "1080p": 13.6,
+  "4k": 3.4,
+  "5k": 1.9
+ },
+ "throughput_MPps": {
+  "o32": 113.7,
+  "dncnn_b": 3.7,
+  "b2u": 2.9
+ },
+ "note": "INT16 slower on GPU (paired-int32 emulation, no native INT64, 2 serial estimator phases) = silicon-honest fixed-point, not GPU-speed. o32 ~30-40x faster than sRGB DL baselines (approx: GPU kernel vs end-to-end).",
+ "cpu_gpu_1080p_s": {
+  "GALOSH_FP32": {
+   "cpu": 1.38,
+   "gpu": 0.0182
+  },
+  "BM3D_CFA": {
+   "cpu": 6.33,
+   "gpu": null
+  },
+  "NLM_CFA": {
+   "cpu": 3.21,
+   "gpu": 0.42
+  },
+  "Blind2Unblind": {
+   "cpu": null,
+   "gpu": 0.74,
+   "note": "impl requires CUDA, no CPU"
+  }
+ },
+ "cpu_gpu_note": "@1080p wall-clock warm. GALOSH GPU=kernel pipeline; others end-to-end. CPU=1 core. GALOSH only method on both platforms; B2U requires GPU.",
+ "r32_cpu_1080p_phase_breakdown_s": {
+  "p7_loess": 9.58,
+  "p5_bayes": 2.61,
+  "p9_k16": 2.44,
+  "other": 0.73,
+  "total": 15.36,
+  "note": "r32 CPU is the bit-exact reference (correctness-first, not speed-optimized); heavy per-pixel phases in paired-int32 emulation = ~10-20x FP32. Fast INT path = GPU i16 (73.8ms). INT16 NOT in the speed table."
+ },
+ "isp_op_count": {
+  "mac_per_pixel": 3380,
+  "sf_lut_per_pixel": 137,
+  "measured": "-DGALOSH_OPCOUNT, 1080p 3390.9/138.4, 4K 3370.3/136.8 (data-independent)"
+ },
+ "isp_throughput_fps": {
+  "0.5TMACs": {
+   "1080p": 73,
+   "4k": 18
+  },
+  "1.0TMACs": {
+   "1080p": 146,
+   "4k": 36
+  }
+ },
+ "isp_line_buffer_KB": {
+  "1080p": 204,
+  "4k": 408,
+  "note": "streaming, ~20-40x less than full-frame"
+ },
+ "isp_note": "GPU/CPU INT speed = FP-host emulation artifact, NOT ISP speed. op-count model (MAC/px / ISP MAC-rate) is the host-independent ISP-native metric. 0.5 TMAC/s ISP -> 1080p 73fps; 1 TMAC/s -> 4K 36fps. ~197x lighter than DnCNN. See isp_throughput_model.md",
+ "mac_per_pixel_comparison": {
+  "GALOSH": 3380,
+  "NLM_CFA": 13225,
+  "BM3D_CFA": 21632,
+  "note": "GALOSH measured (-DGALOSH_OPCOUNT); NLM exact S^2*P^2 (S=23,P=5); BM3D est block-match (N1=8,Ns=39,step3,2-stage); B2U measured via Conv2d hooks (UNet wf48 d5): one forward ~72k, actual 17-forward re-visible inference ~1.22M MAC/full-px. GALOSH lightest (21-360x < B2U) AND best LPIPS among blind. DnCNN-B excluded (sRGB, not raw).",
+  "B2U_one_forward": 71554,
+  "B2U_inference_17x": 1216423,
+  "NAFNet_raw_w32": 61351,
+  "NAFNet_raw_w64": 241516
+ }
+}

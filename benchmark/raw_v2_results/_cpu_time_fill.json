@@ -1,0 +1,27 @@
+{
+ "sidd_medium": {
+  "galosh_fp32_cpu": {
+   "n": 12,
+   "mean_s": 12.641755024592081,
+   "median_s": 12.323458075523376
+  },
+  "nlm_cfa_cpu": {
+   "n": 12,
+   "mean_s": 27.117198328177135,
+   "median_s": 26.49493968486786
+  }
+ },
+ "rawnind": {
+  "galosh_fp32_cpu": {
+   "n": 100,
+   "mean_s": 1.2517236328125,
+   "median_s": 0.5402462482452393
+  },
+  "nlm_cfa_cpu": {
+   "n": 100,
+   "mean_s": 0.5707525634765624,
+   "median_s": 0.5790292024612427
+  }
+ },
+ "note": "single-threaded; galosh = galosh_raw_cpu.exe blind incl file I/O; nlm = skimage per-plane fast_mode patch5/search23 (matches CUDA params)"
+}

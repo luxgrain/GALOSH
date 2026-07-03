@@ -42,7 +42,7 @@ from skimage.metrics import structural_similarity as ssim
 os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 
 BASE       = Path(__file__).parent.parent
-BENCH_DIR  = Path(os.path.expanduser(r"~\datasets\sidd\medium_bench"))
+BENCH_DIR  = Path(r"E:\img_dataset\sidd\medium_bench")
 OUTDIR     = BASE / "sidd_medium"
 RESULTS    = BASE / "results"
 RESULTS.mkdir(exist_ok=True)
@@ -193,32 +193,46 @@ def compute_niqe(srgb):
 # Denoisers — Pre-demosaic (RAW domain, GPU)
 # ---------------------------------------------------------------------------
 
+_galosh_cl_dev = None   # probed working (NVIDIA) OpenCL device; enumeration shuffles under CUDA load
 def run_galosh_gpu(noisy, w, h, uid, strength=1.0, ls=1.0, cs=1.0,
-                   alpha=0.0, sigma_sq=0.0, cl_device=0):
-    """GALOSH GPU (OpenCL) on full RAW. Fully blind."""
+                   alpha=0.0, sigma_sq=0.0, cl_device=None):
+    """GALOSH GPU (OpenCL) on full RAW. Fully blind (or external alpha/sigma when > 0).
+    cl_device=None -> PROBE devices 0..3 for the working (NVIDIA) one and cache it:
+    this box has AMD/Intel iGPUs that cannot run galosh.cl, and under CUDA load the
+    OpenCL enumeration order shuffles, so a fixed dev index is unreliable."""
+    global _galosh_cl_dev
     uid = f"{uid}_{os.getpid()}"   # PID-unique temp: parallel processes must NOT share _tmp files
     in_path  = OUTDIR / f"_tmp_{uid}_in.raw"
     out_path = OUTDIR / f"_tmp_{uid}_out.raw"
     noisy.astype(np.float32).tofile(str(in_path))
-    cmd = [str(BASH_EXE), "-c",
-           f'"{GPU_RAW_EXE}" "{in_path}" "{out_path}" {w} {h} '
-           f'{strength} {ls} {cs} {alpha} {sigma_sq} {cl_device}']
-    t0 = time.time()
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        in_path.unlink(missing_ok=True)
-        out_path.unlink(missing_ok=True)
-        print(f"    GALOSH GPU TIMEOUT")
-        return None, time.time() - t0
-    dt = time.time() - t0
+    if cl_device is not None:
+        cands = [cl_device]
+    else:
+        cands = [_galosh_cl_dev] if _galosh_cl_dev is not None else [0, 1, 2, 3]
+    for attempt in range(2):
+        for d in cands:
+            cmd = [str(BASH_EXE), "-c",
+                   f'"{GPU_RAW_EXE}" "{in_path}" "{out_path}" {w} {h} '
+                   f'{strength} {ls} {cs} {alpha} {sigma_sq} {d}']
+            t0 = time.time()
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                out_path.unlink(missing_ok=True)
+                print(f"    GALOSH GPU TIMEOUT (dev {d})")
+                continue
+            dt = time.time() - t0
+            if r.returncode == 0 and out_path.exists():
+                if cl_device is None: _galosh_cl_dev = d
+                den = np.fromfile(str(out_path), dtype=np.float32).reshape(h, w)
+                out_path.unlink(missing_ok=True); in_path.unlink(missing_ok=True)
+                return den, dt
+            out_path.unlink(missing_ok=True)
+        if cl_device is not None: break
+        cands = [0, 1, 2, 3]; _galosh_cl_dev = None   # cached device went stale -> full re-probe
     in_path.unlink(missing_ok=True)
-    if r.returncode != 0:
-        print(f"    GALOSH GPU FAILED: {r.stderr.decode()[:500]}")
-        return None, dt
-    den = np.fromfile(str(out_path), dtype=np.float32).reshape(h, w)
-    out_path.unlink(missing_ok=True)
-    return den, dt
+    print(f"    GALOSH GPU FAILED on all devices")
+    return None, 0.0
 
 def run_nlm_cfa_cuda(noisy, sigma, patch_radius=2, search_radius=11):
     """NLM-CFA on RGGB Bayer via PyTorch CUDA."""

@@ -1,0 +1,141 @@
+% ============================================================================
+% GALOSH — benchmark tables (arXiv-ready)
+% Requires: \usepackage{booktabs}  (siunitx optional; not needed here)
+% Convention: bold = best among the blind / training-free methods,
+%             underline = 2nd best among the same group.
+%             Blind2Unblind is a trained network shown only as an upper reference.
+% Primary axes: PSNR + LPIPS (SSIM auxiliary; DISTS/NIQE perceptual; Time per image).
+% ============================================================================
+
+% ---------------------------------------------------------------- SIDD Medium
+\begin{table}[t]
+\centering
+\caption{Raw-domain blind denoising on \textbf{SIDD Medium} (80 full-resolution
+real-noise Bayer images). All methods are \emph{blind} (no clean/noisy pairs, no
+per-image noise oracle) and \emph{training-free} except Blind2Unblind. Bold /
+\underline{underline} = best / 2nd-best among the blind, training-free methods.
+$\uparrow$: higher is better; $\downarrow$: lower is better.}
+\label{tab:sidd_medium}
+\setlength{\tabcolsep}{3.4pt}
+\begin{tabular}{l ccccc rr}
+\toprule
+ & & & & & & \multicolumn{2}{c}{Time\,(s)}\\
+\cmidrule(lr){7-8}
+Method & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$ & NIQE$\downarrow$ & CPU & GPU\\
+\midrule
+\multicolumn{8}{l}{\textit{GALOSH (ours) --- blind, training-free}}\\
+\quad GALOSH FP32          & \textbf{48.13} & \textbf{0.9883} & \textbf{0.2030} & \textbf{0.1690} & 8.62 & 12.6 & 0.76\\
+\quad GALOSH INT16\,$^{\dagger}$ & \underline{47.43} & \underline{0.9881} & \underline{0.2030} & \underline{0.1694} & \underline{8.62} & 103.6$^{\dagger}$ & 2.7\\
+% GALOSH numbers = canonical GPU pipeline w/ jinc ANTI-RINGING, full SIDD-Medium-80 set:
+% FP32 = o32 GPU, INT16 = i16 GPU (lf=5 cf=9, zero-loss vs the r32 CPU reference).
+% Source: bench_raw_v2_campaign.py (_metrics_antiring.json; galosh_fp32 + vst_galosh
+% re-verified 2026-07-02 on the GPU exe in _metrics_revst_gpu.json, 0 failures).
+% GPU times: fp32/vst = dedicated uncontended same-session runs
+% (_revst_gpu_time_sidd_medium.json); int16 GPU = i16 campaign mean.
+\addlinespace[2pt]
+\multicolumn{8}{l}{\textit{Ablation --- shared VST front-end (no native estimation)}}\\
+\quad VST\,+\,GALOSH core   & 44.35 & 0.9765 & 0.2132 & 0.1761 & \textbf{8.57} & 15.3 & 0.74\\
+\quad VST\,+\,BM3D-CFA      & 45.96 & 0.9851 & 0.2932 & 0.2778 & 11.36 & 40.5 & ---\\
+\quad VST\,+\,NLM-CFA       & 40.36 & 0.9679 & 0.4048 & 0.4194 & 12.98 & --- & 1.6\\
+\addlinespace[2pt]
+\multicolumn{8}{l}{\textit{Classical --- blind, native MAD}}\\
+\quad BM3D-CFA             & 46.74 & 0.9862 & 0.2725 & 0.2613 & 10.55 & 40.4 & ---\\
+\quad NLM-CFA              & 42.32 & 0.9729 & 0.3791 & 0.3901 & 12.05 & 27.1 & 1.2\\
+\midrule
+\multicolumn{8}{l}{\textit{Trained DL (upper reference, not blind)}}\\
+\quad Blind2Unblind        & 49.07 & 0.9924 & 0.1169 & 0.1281 & 9.43 & --- & 5.6\\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize Per-image full-frame times, split by platform so only like
+compares with like; every CPU entry is a single-threaded implementation; ``---'' = not
+measured on that platform (BM3D has no GPU port; Blind2Unblind requires
+CUDA). NLM-CFA: GPU = CUDA implementation, CPU = the skimage reference at the
+same patch/search parameters (means over 12 full frames; RawNIND CPU entries
+are medians over a 100-scene sample). GALOSH appears in
+both columns --- the cross-platform anchor. $^{\dagger}$INT16 quality is the
+bit-exact fixed-point pipeline; its CPU time is the correctness-first INT32
+reference (not speed-optimised) and its GPU time is the streaming i16
+implementation (see Sec.~\ref{sec:map}).}
+\end{table}
+
+% ---------------------------------------------------------------- RawNIND
+\begin{table}[t]
+\centering
+\caption{Raw-domain blind denoising on \textbf{RawNIND} (1493 cross-camera
+$512{\times}512$ real-noise crops). Same protocol and highlighting as
+Table~\ref{tab:sidd_medium}.}
+\label{tab:rawnind}
+\setlength{\tabcolsep}{3.4pt}
+\begin{tabular}{l ccccc rr}
+\toprule
+ & & & & & & \multicolumn{2}{c}{Time\,(s)}\\
+\cmidrule(lr){7-8}
+Method & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$ & NIQE$\downarrow$ & CPU & GPU\\
+\midrule
+\multicolumn{8}{l}{\textit{GALOSH (ours) --- blind, training-free}}\\
+\quad GALOSH FP32          & \underline{30.49} & \underline{0.7908} & \textbf{0.2395} & \textbf{0.2127} & \underline{8.64} & 0.54 & 0.45\\
+\quad GALOSH INT16\,$^{\dagger}$ & 30.17 & 0.7860 & \underline{0.2453} & \underline{0.2161} & \textbf{8.63} & 2.32$^{\dagger}$ & 0.35\\
+\addlinespace[2pt]
+\multicolumn{8}{l}{\textit{Ablation --- shared VST front-end (no native estimation)}}\\
+\quad VST\,+\,GALOSH core   & \textbf{30.63} & \textbf{0.8163} & 0.2481 & 0.2198 & 8.65 & 0.49 & 0.60\\
+% vst_galosh re-run 2026-07-02 on the GPU exe w/ external (alpha,sigma) honored:
+% current anti-ringing pipeline, 1493/1493, 0 err (E:\rawnind_bench_v2\_metrics_revst_gpu.json).
+% GPU times fp32/vst = dedicated uncontended run (_revst_gpu_time_rawnind.json, 150-scene sample).
+\quad VST\,+\,BM3D-CFA      & 30.07 & 0.7792 & 0.4320 & 0.3563 & 13.04 & 2.29 & ---\\
+\quad VST\,+\,NLM-CFA       & 29.03 & 0.7649 & 0.5452 & 0.4636 & 14.57 & --- & 0.68\\
+\addlinespace[2pt]
+\multicolumn{8}{l}{\textit{Classical --- blind, native MAD}}\\
+\quad BM3D-CFA             & 30.28 & 0.7848 & 0.4268 & 0.3461 & 12.15 & 2.30 & ---\\
+\quad NLM-CFA              & 29.54 & 0.7735 & 0.5190 & 0.4364 & 13.80 & 0.58 & 0.76\\
+\midrule
+\multicolumn{8}{l}{\textit{Trained DL (upper reference, not blind)}}\\
+\quad Blind2Unblind        & 30.68 & 0.7932 & 0.2215 & 0.2018 & 8.93 & --- & ---\\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize Platform split as in Table~\ref{tab:sidd_medium}; at $512^2$
+the GPU launch/sync overhead dominates GALOSH, so its CPU build is competitive
+here. $^{\dagger}$See Table~\ref{tab:sidd_medium}. Blind2Unblind timing
+omitted (results loaded from a precomputed cache).}
+\end{table}
+
+% ------------------------------------------- Speed (controlled reference)
+\begin{table}[t]
+\centering
+\caption{\textbf{Controlled-resolution speed reference} at 1080p
+(1920$\times$1080 Bayer) on CPU (one core) and GPU (NVIDIA RTX 4070\,Ti); the
+\emph{primary} speed comparison is the full-size per-image CPU/GPU columns of
+Tables~\ref{tab:sidd_medium}--\ref{tab:rawnind}. Wall-clock, warm; GALOSH GPU
+is the kernel pipeline (one-time context+build $\sim$90\,ms amortised), the
+others end-to-end.}
+\label{tab:speed}
+\setlength{\tabcolsep}{8pt}
+\begin{tabular}{l rr}
+\toprule
+Method & CPU (1 core) & GPU\\
+\midrule
+\multicolumn{3}{l}{\textit{GALOSH (ours) --- blind, training-free}}\\
+\quad GALOSH FP32 (o / o32)        & 1.38 s & \textbf{18.2 ms}\\
+\midrule
+\multicolumn{3}{l}{\textit{Classical (blind)}}\\
+\quad BM3D-CFA                     & 6.33 s & ---\\
+\quad NLM-CFA                      & 3.21 s & 0.42 s\\
+\midrule
+\multicolumn{3}{l}{\textit{Trained DL}}\\
+\quad Blind2Unblind                & ---$^{\dagger}$ & 0.74 s\\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize GALOSH FP32 on GPU scales to 46\,ms at 4K and 72\,ms at 5K ---
+$\approx$23$\times$ NLM-CFA and $\approx$40$\times$ Blind2Unblind on the same
+GPU --- and on CPU it is $2$--$5\times$ faster than the classical baselines
+(1.38\,s vs.\ 3.21/6.33\,s): fastest on both platforms.
+$^{\dagger}$The Blind2Unblind reference implementation requires CUDA and does
+not run on CPU. The bit-exact INT16 fixed-point variant (Sec.~\ref{sec:map})
+targets fixed-point streaming hardware rather than CPU/GPU throughput, so it
+is not a speed entry.}
+\end{table}

@@ -1,0 +1,15 @@
+{
+ "dataset": "rawnind",
+ "n": 150,
+ "fail": 0,
+ "ext": {
+  "time_mean_s": 0.5994623788197835,
+  "time_median_s": 0.5965681076049805,
+  "raw_psnr_mean": 34.67207955448202
+ },
+ "blind": {
+  "time_mean_s": 0.4545321257909139,
+  "time_median_s": 0.37196075916290283,
+  "raw_psnr_mean": 35.001023004078775
+ }
+}

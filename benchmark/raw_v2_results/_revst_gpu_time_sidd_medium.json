@@ -1,0 +1,15 @@
+{
+ "dataset": "sidd_medium",
+ "n": 80,
+ "fail": 0,
+ "ext": {
+  "time_mean_s": 0.7410353302955628,
+  "time_median_s": 0.7282053232192993,
+  "raw_psnr_mean": 44.34734423365997
+ },
+ "blind": {
+  "time_mean_s": 0.7586040079593659,
+  "time_median_s": 0.747867226600647,
+  "raw_psnr_mean": 48.126595170030384
+ }
+}
