@@ -30,7 +30,8 @@ Method & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$
 \quad GALOSH INT16\,$^{\dagger}$ & \underline{47.43} & \underline{0.9881} & \underline{0.2030} & \underline{0.1694} & \underline{8.62} & 103.6$^{\dagger}$ & 2.7\\
 % GALOSH numbers = canonical GPU pipeline w/ jinc ANTI-RINGING, full SIDD-Medium-80 set:
 % FP32 = o32 GPU, INT16 = i16 GPU (lf=5 cf=9; near-lossless vs the r32 CPU
-% reference, ~64 dB end-to-end -- one Phase-0 guard not yet mirrored on GPU).
+% reference, ~58-65 dB end-to-end on full frames = the INT16 storage quantization;
+% at INT32 storage the GPU pipeline is bit-exact vs r32, verified 2026-07-04).
 % Source: bench_raw_v2_campaign.py (_metrics_antiring.json; galosh_fp32 + vst_galosh
 % re-verified 2026-07-02 on the GPU exe in _metrics_revst_gpu.json, 0 failures).
 % GPU times: fp32/vst = dedicated uncontended same-session runs

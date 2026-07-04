@@ -1,7 +1,11 @@
-"""Per-phase GPU vs CPU comparison for the i16 GPU port (bit-exact at INT32
-storage where the phases are mirrored; NOTE: since the 2026-06-22 Phase-0 wshift
-fix on the CPU side, one guard is not yet mirrored on the GPU, so full-frame
-end-to-end agreement is near-lossless (~64 dB), not bit-identical).
+"""Per-phase GPU vs CPU comparison for the i16 GPU port. At INT32 storage the
+GPU pipeline is BIT-EXACT vs the r32 CPU reference end-to-end (the 2026-06-22
+CPU Phase-0 collapse fixes were mirrored to the GPU on 2026-06-25, commit
+30d5943; re-verified 2026-07-04: P10 16/16 SIDD-val patches + 3/3 full frames
+incl. SIDD 0052/0020 and a 5310x2986 RawNIND frame, ndiff=0).  The --i16 /
+--short modes narrow the line buffers to INT16 storage (lf/cf frac bits); that
+storage quantization makes end-to-end agreement near-lossless (~60-90 dB PSNR)
+rather than bit-identical, so those modes use a PSNR criterion instead.
 
 For phase N, the CPU r32 reference (run with GALOSH_INT_RAW_DUMP_DIR) dumps the
 working in_gat buffer as raw int32 (pN_ingat.bin) and prints "PN_RAW ...".  The
@@ -43,6 +47,7 @@ def ints_after(text, phase):
 
 def run_cpu(in_p, out_p, w, h, phase):
     env = dict(SUBENV); env["GALOSH_INT_RAW_DUMP_DIR"] = str(TMP)
+    env["GALOSH_VERBOSE"] = "1"   # P<N>_RAW summary lines are verbose-gated
     cmd = [str(CPU_EXE), str(in_p), str(out_p), str(w), str(h),
            "galosh", "1.0", "1.0", "1.0", "0", "0"]  # public r32 = single pipeline (no --variant CLI)
     r = subprocess.run(cmd, capture_output=True, timeout=240, env=env)

@@ -291,9 +291,11 @@ BM3D-CFA と NLM-CFA の $2$--$3\times$ 高速であり（表~\ref{tab:sidd_medi
 $18$--$360\times$ 下であり、全域で局所的・データ非依存のアクセスパターンを持つ。
 
 \paragraph{固定小数点実現。} シュリンケージコアは純 INT16 ストレージ / INT32
-アキュムレートの固定小数点形式を持つ。その GPU ストリーミング実装は INT32 CPU
-参照と end-to-end で near-lossless に一致し（フルフレームで $\approx$64\,dB
-PSNR。Phase-0 のガード 1 箇所が未ミラーのため bit 一致ではない）、品質は ---
+アキュムレートの固定小数点形式を持つ。INT32 ストレージでは GPU ストリーミング
+実装は INT32 CPU 参照と end-to-end で bit-exact に一致する（SIDD・RawNIND の
+フルフレームで検証済み）。ラインバッファを INT16 ストレージ形式（輝度 Q10.5、
+クロマ Q6.9）に狭めても両者は near-lossless（フルフレームで $\approx$58--65\,dB
+PSNR --- 残差はまさにこのストレージ量子化そのもの）であり、品質は ---
 GPU INT16 出力で直接測定して --- FP32 参照と 0.1--0.7\,dB 以内で一致する
 （表~\ref{tab:sidd_medium}、\ref{tab:rawnind}）。出荷パスのどこにも
 64 bit 演算は不要である（広い中間値はペア 32 bit パターンを使う）。

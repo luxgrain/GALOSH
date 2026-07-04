@@ -178,14 +178,15 @@ Results are written as JSON/CSV plus per-method PNG artifacts; the scripts in
 GALOSH's search-free structure is **designed to map naturally onto fixed-point
 and streaming implementations**: the computation graph is fixed, per-pixel cost
 is constant (~3.4k MAC/pixel, resolution-independent), and on-chip state is
-bounded by line buffers. Two measured facts back this up: a pure
-INT16-storage / INT32-accumulate realization exists whose GPU streaming
-implementation matches the INT32 CPU reference to near-lossless end-to-end
-accuracy (~64 dB PSNR on full frames; one Phase-0 guard is not yet mirrored,
-so the two are close but not bit-identical), and the shipping INT path
-contains **no native 64-bit arithmetic** (`make check-no-int64`; wide
-intermediates use paired-int32 / split-multiply patterns; profiling-only
-exemptions are marked `no64-exempt` in-source).
+bounded by line buffers. Three measured facts back this up: at INT32 storage
+the GPU streaming implementation is **bit-exact** against the INT32 CPU
+reference end-to-end (verified on SIDD and RawNIND full frames); narrowing
+the line buffers to the INT16 storage formats (luma Q10.5, chroma Q6.9)
+leaves the two near-lossless (~58-65 dB PSNR on full frames — the residual
+is exactly this storage quantization); and the shipping INT path contains
+**no native 64-bit arithmetic** (`make check-no-int64`; wide intermediates
+use paired-int32 / split-multiply patterns; profiling-only exemptions are
+marked `no64-exempt` in-source).
 
 We do **not** claim a completed ISP implementation, real-time operation on ISP
 silicon, or a fully verified hardware datapath — those are future work.

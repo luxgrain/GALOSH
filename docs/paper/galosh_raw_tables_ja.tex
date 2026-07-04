@@ -28,7 +28,8 @@ $\uparrow$: 高いほど良い、$\downarrow$: 低いほど良い。}
 \quad GALOSH INT16\,$^{\dagger}$ & \underline{47.43} & \underline{0.9881} & \underline{0.2030} & \underline{0.1694} & \underline{8.62} & 103.6$^{\dagger}$ & 2.7\\
 % GALOSH 数値 = canonical GPU パイプライン（jinc アンチリンギング）、SIDD-Medium 全80枚:
 % FP32 = o32 GPU、INT16 = i16 GPU（lf=5 cf=9。r32 CPU 参照に対し near-lossless
-% ~64 dB end-to-end — Phase-0 ガード 1 箇所が GPU 未ミラー）。
+% ~58-65 dB end-to-end（フルフレーム）= INT16 ストレージ量子化そのもの。
+% INT32 ストレージなら GPU は r32 と bit-exact、2026-07-04 検証済み）。
 % galosh_fp32 + vst_galosh は 2026-07-02 に GPU exe で再検証（_metrics_revst_gpu.json、失敗0）。
 % GPU 時間: fp32/vst = 同一セッションの専用非競合計測、int16 = i16 campaign 平均。
 \addlinespace[2pt]

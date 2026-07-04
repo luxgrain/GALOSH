@@ -330,14 +330,16 @@ operations per pixel, resolution-independent ($3391$ at 1080p vs.\ $3370$ at
 learned baselines, with local, data-independent access patterns throughout.
 
 \paragraph{Fixed-point realization.} The shrinkage core admits a pure INT16
-storage / INT32 accumulate fixed-point form. Its GPU streaming implementation
-matches the INT32 CPU reference to near-lossless end-to-end accuracy
-($\approx$64\,dB PSNR on full frames; one Phase-0 guard is not yet mirrored
-between the two, so they are close but not bit-identical), and its quality ---
-measured directly on the GPU INT16 output --- matches the FP32 reference to
-within 0.1--0.7\,dB (Tables~\ref{tab:sidd_medium},~\ref{tab:rawnind}). No
-64-bit arithmetic is required anywhere in the shipping path (wide
-intermediates use paired-32-bit patterns).
+storage / INT32 accumulate fixed-point form. At INT32 storage, the GPU
+streaming implementation is bit-exact against the INT32 CPU reference
+end-to-end (verified on SIDD and RawNIND full frames); narrowing the line
+buffers to the INT16 storage formats (luma Q10.5, chroma Q6.9) leaves the two
+near-lossless ($\approx$58--65\,dB PSNR on full frames --- the residual is
+exactly this storage quantization). Quality --- measured directly on the GPU
+INT16 output --- matches the FP32 reference to within 0.1--0.7\,dB
+(Tables~\ref{tab:sidd_medium},~\ref{tab:rawnind}). No 64-bit arithmetic is
+required anywhere in the shipping path (wide intermediates use paired-32-bit
+patterns).
 
 \paragraph{Feasibility, not product.} By a MAC-array throughput model,
 $0.5$--$1$\,TMAC/s of fixed-function compute --- modest by current ISP
