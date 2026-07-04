@@ -1,7 +1,14 @@
 # GALOSH
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21187219.svg)](https://doi.org/10.5281/zenodo.21187219)
+[![License](https://img.shields.io/badge/code-Apache--2.0-blue.svg)](LICENSE)
+
 **Blind, training-free denoising of raw Bayer and sRGB/YUV images by
 parallel-friendly local shrinkage.**
+
+Preprint: [PDF (release asset)](https://github.com/luxgrain/GALOSH/releases/download/v0.1.0/galosh_paper.pdf)
+· [Zenodo (DOI 10.5281/zenodo.21187219)](https://doi.org/10.5281/zenodo.21187219)
+· arXiv: in progress
 
 GALOSH (Generalized Anscombe LOcal SHrinkage) is a **classical** image denoiser
 redesigned for modern parallel hardware:

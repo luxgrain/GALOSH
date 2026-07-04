@@ -1,7 +1,12 @@
 cff-version: 1.2.0
 message: >-
   If you use GALOSH in your research, please cite it using the metadata below.
-  A preprint is in preparation (arXiv ID will be added here on release).
+  The preprint is archived on Zenodo (DOI below); the arXiv identifier will be
+  added here once available.
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21187219
+    description: "Preprint (Zenodo)"
 title: "GALOSH: Blind, Training-Free Denoising of Raw Bayer and sRGB Images by Parallel-Friendly Local Shrinkage"
 type: software
 authors:
@@ -23,4 +28,5 @@ preferred-citation:
     - family-names: Sato
       given-names: Yoshiro
   year: 2026
-  notes: "arXiv preprint in preparation; identifier to be added on release."
+  doi: 10.5281/zenodo.21187219
+  notes: "Preprint (Zenodo); arXiv identifier to be added on release."
