@@ -13,6 +13,13 @@
 \usepackage{xcolor}
 \usepackage{caption}
 \captionsetup{font=small}
+% CJK: tectonic/XeTeX はフォント指定が無いと日本語グリフを黙って落とす
+% (pandoc の HTML 化はこのブロックを無視するので安全)。太字は和文慣習で
+% ゴシック代用。Yu Mincho/Yu Gothic = Windows 標準搭載。
+\usepackage{xeCJK}
+\setCJKmainfont[BoldFont={Yu Gothic Bold}]{Yu Mincho}
+\setCJKsansfont{Yu Gothic}
+\setCJKmonofont{MS Gothic}
 
 \title{\textbf{GALOSH: 並列フレンドリな局所シュリンケージによる\\
 Raw Bayer・sRGB 画像のブラインド・学習不要デノイジング}}

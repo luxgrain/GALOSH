@@ -27,7 +27,7 @@ Method & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$
 \midrule
 \multicolumn{8}{l}{\textit{GALOSH (ours) --- blind, training-free}}\\
 \quad GALOSH FP32          & \textbf{48.13} & \textbf{0.9883} & \textbf{0.2030} & \textbf{0.1690} & 8.62 & 12.6 & 0.76\\
-\quad GALOSH INT16\,$^{\dagger}$ & \underline{47.43} & \underline{0.9881} & \underline{0.2030} & \underline{0.1694} & \underline{8.62} & 103.6$^{\dagger}$ & 2.7\\
+\quad GALOSH INT16\,$^{\dagger}$ & \underline{47.42} & \underline{0.9881} & \underline{0.2030} & \underline{0.1694} & \underline{8.62} & 103.6$^{\dagger}$ & 2.7\\
 % GALOSH numbers = canonical GPU pipeline w/ jinc ANTI-RINGING, full SIDD-Medium-80 set:
 % FP32 = o32 GPU, INT16 = i16 GPU (lf=5 cf=9; near-lossless vs the r32 CPU
 % reference, ~58-65 dB end-to-end on full frames = the INT16 storage quantization;
