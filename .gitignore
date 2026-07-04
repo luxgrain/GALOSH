@@ -146,3 +146,4 @@ docs/paper/galosh_arxiv_v1.tar.gz
 # public viewer bundle (881 MB; published via the gh-pages branch, not main —
 # regenerate with benchmark/scripts/make_viewer_public.py)
 benchmark/viewer_public/
+docs/paper/spl/*.pdf
