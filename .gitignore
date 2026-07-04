@@ -147,3 +147,6 @@ docs/paper/galosh_arxiv_v1.tar.gz
 # regenerate with benchmark/scripts/make_viewer_public.py)
 benchmark/viewer_public/
 docs/paper/spl/*.pdf
+
+# local backups (git bundles, filter-repo state) — never tracked, user-managed
+_backup/
