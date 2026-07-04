@@ -114,8 +114,27 @@ def build_index():
     start = src.find("const D=")
     jstart = start + len("const D=")
     D, jlen = json.JSONDecoder().raw_decode(src[jstart:])
-    for ds in D["datasets"]:
-        ds["name"] = DS_NAMES.get(ds["key"], ds["name"])
+    # Rebuild the raw datasets from the encoded directories: the legacy JSON
+    # capped RawNIND raw at 196 (high-ISO) scenes, but the published viewer
+    # serves the FULL sets. Method order + labels are taken from the legacy JSON.
+    label_order = {ds["key"]: [(im["k"], im["label"]) for im in ds["scenes"][0]["imgs"]]
+                   for ds in D["datasets"]}
+    rebuilt = []
+    for key in ("sidd_medium", "rawnind"):
+        root = OUT / "results_raw" / "cmp" / key
+        scenes = []
+        for sd in sorted(p for p in root.iterdir() if p.is_dir()):
+            gt = sd / "_gt.jpg"
+            if not gt.exists():
+                continue
+            with Image.open(gt) as im:
+                w, h = im.size
+            imgs = [{"k": k, "label": lbl,
+                     "img": f"results_raw/cmp/{key}/{sd.name}/{k}.jpg"}
+                    for k, lbl in label_order[key] if (sd / f"{k}.jpg").exists()]
+            scenes.append({"scene": sd.name, "w": w, "h": h, "imgs": imgs})
+        rebuilt.append({"name": DS_NAMES[key], "key": key, "scenes": scenes})
+    D["datasets"] = rebuilt
     for key in SRGB_SETS:
         root = OUT / "results_srgb" / "cmp" / key
         scenes = []
