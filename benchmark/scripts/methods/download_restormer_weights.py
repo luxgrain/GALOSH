@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 
-WEIGHTS_DIR = Path(r"C:/Users/luxgrain/denoise_eval/weights/restormer")
+WEIGHTS_DIR = Path(__file__).resolve().parents[2] / "external" / "Restormer" / \n    "Denoising" / "pretrained_models"   # where the sRGB bench loads it from
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Candidate URLs -- try multiple hosts because release layouts change.

@@ -15,12 +15,21 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("GALOSH_ROOT", str(Path(__file__).resolve().parents[2])))
 PAPER = ROOT / "docs" / "paper"
-PANDOC = os.environ.get(
-    "PANDOC",
-    r"C:\Users\luxgrain\AppData\Local\Microsoft\WinGet\Packages"
-    r"\JohnMacFarlane.Pandoc_Microsoft.Winget.Source_8wekyb3d8bbwe\pandoc-3.10\pandoc"
-    if os.name == "nt" else "pandoc",
-)
+def _find_pandoc():
+    if os.environ.get("PANDOC"):
+        return os.environ["PANDOC"]
+    import shutil
+    hit = shutil.which("pandoc")
+    if hit:
+        return hit
+    # winget installs pandoc without touching PATH; probe its package dir
+    base = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
+    for p in base.glob("JohnMacFarlane.Pandoc*/**/pandoc.exe"):
+        return str(p)
+    raise SystemExit("pandoc not found - install it or set PANDOC")
+
+
+PANDOC = _find_pandoc()
 
 
 def strip_resizebox(s):
