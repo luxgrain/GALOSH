@@ -20,7 +20,7 @@ try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
 GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
-VAL = GALOSH / "benchmark" / "SIDD_Validation"
+VAL = Path(os.environ.get("GALOSH_SIDD_VAL", "benchmark/datasets/SIDD_Validation"))
 OUTROOT = GALOSH / "benchmark" / "sidd_validation"
 TMP = GALOSH / "benchmark" / "results" / "speed" / "_o32sweep_tmp"
 TMP.mkdir(parents=True, exist_ok=True)

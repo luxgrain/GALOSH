@@ -9,7 +9,6 @@ Usage:
   python benchmark/scripts/int_p0_gpu_compare.py            # 20 patches
   python benchmark/scripts/int_p0_gpu_compare.py --n 60
 """
-import os
 import argparse, os, re, subprocess, sys, random
 from pathlib import Path
 import numpy as np
@@ -23,7 +22,7 @@ except Exception: pass
 GALOSH   = Path(os.path.expanduser(r"~\GALOSH"))
 CPU_EXE  = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 GPU_EXE  = GALOSH / "standalone" / "galosh_int_p0_test.exe"
-SIDD_VAL = GALOSH / "benchmark" / "SIDD_Validation"
+SIDD_VAL = Path(os.environ.get("GALOSH_SIDD_VAL", "benchmark/datasets/SIDD_Validation"))
 TMP      = GALOSH / "benchmark" / "results" / "int_p0_gpu_tmp"
 TMP.mkdir(parents=True, exist_ok=True)
 

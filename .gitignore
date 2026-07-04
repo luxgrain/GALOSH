@@ -142,3 +142,7 @@ docs/archive/
 # arXiv submission bundle (build artifact; regenerate from docs/paper sources)
 docs/paper/arxiv_submission/
 docs/paper/galosh_arxiv_v1.tar.gz
+
+# public viewer bundle (881 MB; published via the gh-pages branch, not main —
+# regenerate with benchmark/scripts/make_viewer_public.py)
+benchmark/viewer_public/

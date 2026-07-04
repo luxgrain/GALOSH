@@ -15,7 +15,7 @@ import numpy as np
 from scipy.io import loadmat
 
 GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
-SIDD_VAL = GALOSH / "benchmark" / "SIDD_Validation"
+SIDD_VAL = Path(os.environ.get("GALOSH_SIDD_VAL", "benchmark/datasets/SIDD_Validation"))
 OUT = GALOSH / "benchmark" / "results" / "speed"
 OUT.mkdir(parents=True, exist_ok=True)
 
