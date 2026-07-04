@@ -6,7 +6,8 @@
 **Blind, training-free denoising of raw Bayer and sRGB/YUV images by
 parallel-friendly local shrinkage.**
 
-Preprint: [PDF (release asset)](https://github.com/luxgrain/GALOSH/releases/download/v0.1.0/galosh_paper.pdf)
+Preprint: [PDF (English)](https://github.com/luxgrain/GALOSH/releases/download/v0.1.0/galosh_paper.pdf)
+· [日本語版 PDF (Japanese translation)](https://github.com/luxgrain/GALOSH/releases/download/v0.1.0/galosh_paper_ja.pdf)
 · [Zenodo (DOI 10.5281/zenodo.21187219)](https://doi.org/10.5281/zenodo.21187219)
 · arXiv: in progress
 
