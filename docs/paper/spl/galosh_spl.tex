@@ -219,6 +219,18 @@ front-end; GALOSH is fully blind.}
 \label{fig:qual}
 \end{figure*}
 
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{../qualitative_srgb_sidd.png}
+\caption{sRGB domain, SIDD Medium (full frame). Columns: Noisy / CBM3D /
+Color-NLM / Guided / NAFNet-SIDD / SCUNet / Restormer-SIDD /
+\textbf{GALOSH-YUV (ours)} / GT, with per-image LPIPS ($\downarrow$). All
+methods blind; the classical baselines leave large residual noise on the
+correlated rendering noise, and GALOSH sits between them and the SIDD-trained
+networks.}
+\label{fig:qualsrgb}
+\end{figure*}
+
 \paragraph{Raw domain} Table~\ref{tab:raw}: among the tested blind,
 training-free methods GALOSH leads both datasets on the perceptual metric by
 a wide margin (LPIPS $0.203$/$0.240$ vs.\ $0.27$--$0.55$ for the BM3D/NLM

@@ -208,6 +208,17 @@ LPIPS（$\downarrow$）付き。古典的ベースラインにはノイズ考慮
 \label{fig:qual}
 \end{figure*}
 
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{../qualitative_srgb_sidd.png}
+\caption{sRGB ドメイン、SIDD Medium（フルフレーム）。列: Noisy / CBM3D /
+Color-NLM / Guided / NAFNet-SIDD / SCUNet / Restormer-SIDD /
+\textbf{GALOSH-YUV（提案）} / GT。画像ごとの LPIPS（$\downarrow$）付き。全手法
+ブラインド。古典的ベースラインは相関したレンダリングノイズに大きな残留ノイズを
+残し、GALOSH はそれらと SIDD 学習ネットワークの間に位置する。}
+\label{fig:qualsrgb}
+\end{figure*}
+
 \paragraph{raw ドメイン} 表~\ref{tab:raw}: 比較した blind・training-free 手法の
 中で GALOSH は両データセットの知覚指標で大差の最良（LPIPS $0.203$/$0.240$ 対
 BM3D/NLM 系の $0.27$--$0.55$、共有 VST 前段の有無によらず）であり、PSNR/SSIM
