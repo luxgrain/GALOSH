@@ -19,7 +19,7 @@ GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 EXE_FP = GALOSH / "standalone" / "galosh_raw_cpu.exe"
 EXE_INT = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 EXE_HP = GALOSH / "standalone" / "galosh_raw_cpu_int_hp.exe"
-RAWNIND = Path(r"E:\rawnind_bench")
+RAWNIND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
 WORK = GALOSH / "benchmark" / "results" / "int_gap_by_iso"
 WORK.mkdir(parents=True, exist_ok=True)
 

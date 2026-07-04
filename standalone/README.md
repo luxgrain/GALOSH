@@ -12,7 +12,7 @@ No block-matching, no sorting, no training, no noise profile.
 |---|---|---|---|
 | **CPU FP32** (o) | `galosh_raw_cpu.c` | `galosh_raw_cpu.exe` | reference / offline quality |
 | **CPU INT32** (r32) | `galosh_raw_cpu_int.c` | `galosh_raw_cpu_int.exe` | Q11.20 fixed-point reference (FP-free) |
-| **GPU FP32** (o32) | `galosh_raw_gpu.c` + `galosh.cl` | `galosh_raw_gpu.exe` | real-time (commodity GPU) |
+| **GPU FP32** (o32) | `galosh_raw_gpu.c` + `galosh.cl` | `galosh_raw_gpu.exe` | fast GPU path (measured 18 ms @1080p / 46 ms @4K on an RTX 4070 Ti) |
 | **GPU INT16** (i16) | `galosh_int_*.{clh,cl}` | `galosh_int_pipe_test.exe` | bit-exact vs r32 at INT32 storage; INT16-narrowed storage = near-lossless (~58-65 dB); fixed-point streaming **by design** (32 KB LDS, no FP) |
 
 At INT32 storage the GPU pipeline is bit-exact against the r32 CPU reference

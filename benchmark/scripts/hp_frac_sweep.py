@@ -15,7 +15,7 @@ except Exception: pass
 GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 STD = GALOSH / "standalone"
 EXE_FP = STD / "galosh_raw_cpu.exe"
-RAWNIND = Path(r"E:\rawnind_bench")
+RAWNIND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
 WORK = GALOSH / "benchmark" / "results" / "int_gap_by_iso"
 
 FRACS = [20, 24, 26, 28, 30, 36]

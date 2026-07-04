@@ -19,7 +19,7 @@ except Exception: pass
 
 GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 EXE_HP = GALOSH / "standalone" / "galosh_raw_cpu_int_hp.exe"
-RAWNIND = Path(r"E:\rawnind_bench")
+RAWNIND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
 WORK = GALOSH / "benchmark" / "results" / "perq_range_survey"
 WORK.mkdir(parents=True, exist_ok=True)
 

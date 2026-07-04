@@ -28,7 +28,7 @@ except Exception:
 GALOSH = Path(os.path.expanduser(r"~\GALOSH"))
 EXE = GALOSH / "standalone" / "galosh_raw_cpu_int.exe"
 SIDD_VAL = GALOSH / "benchmark" / "SIDD_Validation"
-RAWNIND = Path(r"E:\rawnind_bench")
+RAWNIND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
 TMP = GALOSH / "benchmark" / "results" / "int_short_bench_tmp"
 TMP.mkdir(parents=True, exist_ok=True)
 

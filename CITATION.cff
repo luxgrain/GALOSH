@@ -3,6 +3,8 @@ message: >-
   If you use GALOSH in your research, please cite it using the metadata below.
   The preprint is archived on Zenodo (DOI below); the arXiv identifier will be
   added here once available.
+# TODO(arXiv): when the arXiv ID is assigned, add it to `identifiers` below and
+# update `preferred-citation` (notes + arXiv DOI) to point at the arXiv version.
 identifiers:
   - type: doi
     value: 10.5281/zenodo.21187219

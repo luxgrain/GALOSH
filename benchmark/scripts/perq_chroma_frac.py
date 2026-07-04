@@ -16,7 +16,7 @@ except Exception: pass
 GALOSH = Path(os.path.expanduser(r"~\GALOSH")); STD = GALOSH / "standalone"
 SRC = str(STD / "galosh_raw_cpu_int_hp.c")
 EXE_FP = STD / "galosh_raw_cpu.exe"
-RAWNIND = Path(r"E:\rawnind_bench")
+RAWNIND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
 WORK = GALOSH / "benchmark" / "results" / "perq_range_survey"; WORK.mkdir(parents=True, exist_ok=True)
 
 PATCHES = ["D60-3__ISO400", "sewingmachine__ISO200", "7D-7__ISO400",

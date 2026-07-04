@@ -22,9 +22,10 @@ from PIL import Image
 
 GALOSH     = Path(__file__).resolve().parents[2]
 EXE_GPU    = GALOSH / "standalone" / "galosh_yuv_gpu.exe"
-BENCH_SIDD = Path(r"E:\img_dataset\sidd\medium_bench")
-RAWNIND_N  = Path("E:/img_dataset/rawnind_bench/__noisy_raw_render__")
-RAWNIND_G  = Path("E:/img_dataset/rawnind_bench/__gt_raw_render__")
+BENCH_SIDD = Path(os.environ.get("GALOSH_SIDD_BENCH", "benchmark/datasets/sidd_medium_bench"))
+RAWNIND_BASE = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
+RAWNIND_N  = RAWNIND_BASE / "__noisy_raw_render__"
+RAWNIND_G  = RAWNIND_BASE / "__gt_raw_render__"
 OUT_NAME   = {"sidd": "results_srgb_sidd_1024", "rawnind": "results_srgb_rawnind"}
 TMP        = GALOSH / "benchmark" / "_tmp"
 UCRT_BIN   = r"C:\msys64\ucrt64\bin"

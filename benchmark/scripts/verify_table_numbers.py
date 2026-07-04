@@ -11,9 +11,15 @@ RAW tables: recomputes per-method means from the raw campaign JSONs
 GALOSH_RAWNIND_RESULTS env var, else benchmark/results_raw_rawnind/) and
 compares them with docs/paper/galosh_raw_tables.tex AND _ja.tex.
 
-Tolerance = half a unit in the table's last printed decimal. Tables whose
-JSONs are not present on this machine are skipped with a note. Exits 1 on
-any mismatch.
+Tolerance = half a unit in the table's last printed decimal.
+
+Result semantics (exit code):
+  PASS (0)        every expected table had its JSONs present and ALL cells match.
+  FAIL (1)        at least one cell mismatches its JSON mean.
+  INCOMPLETE (2)  nothing (or only part) could be verified because benchmark
+                  JSONs are missing on this machine -- e.g. a clean checkout or
+                  the public tarball, which does not ship result JSONs. The
+                  skipped tables are listed; INCOMPLETE is NOT a pass.
 
   python benchmark/scripts/verify_table_numbers.py
 """
@@ -133,17 +139,20 @@ def raw_rows(block):
 
 
 def verify_raw():
-    bad = 0
+    bad = checked = 0
+    skipped = []
     for tex in RAW_TEXES:
         src = tex.read_text(encoding="utf-8")
         blocks = re.split(r"\\begin\{table\}", src)[1:]
         if len(blocks) < 2:
             print(f"[{tex.name}] SKIP - expected >=2 table envs")
+            skipped.append(f"{tex.name} (unparseable)")
             continue
         # table order in both files: SIDD Medium first, RawNIND second
         for (tag, jdir), block in zip(RAW_DIRS, blocks[:2]):
             if not jdir.exists():
                 print(f"[{tex.name}/{tag}] SKIP - {jdir} not present")
+                skipped.append(f"{tex.name}/{tag}")
                 continue
             rows = raw_rows(block)
             for disp, fname, key in RAW_METHODS:
@@ -154,25 +163,29 @@ def verify_raw():
                 means = raw_json_means(jdir, fname, key)
                 if means is None:
                     print(f"[{tex.name}/{tag}] {disp}: SKIP - {fname}:{key} missing")
+                    skipped.append(f"{tex.name}/{tag}:{disp}")
                     continue
                 for col, cell in zip(COLS, hit):
                     if cell is None:
                         continue
                     tol = 0.5 * 10 ** -len(cell.split(".")[1])
                     got = means[col]
+                    checked += 1
                     if abs(got - float(cell)) > tol + 1e-9:
                         print(f"[{tex.name}/{tag}] {disp} {col}: tex={cell} json={got:.4f}  MISMATCH")
                         bad += 1
-    return bad
+    return bad, checked, skipped
 
 
 def main():
     src = TEX.read_text(encoding="utf-8")
     tables = tex_tables(src)
-    bad = 0
+    bad = checked = 0
+    skipped = []
     for label, jpath in TABLES:
         if not jpath.exists():
             print(f"[{label}] SKIP - {jpath} not present (results not on this machine)")
+            skipped.append(label)
             continue
         means = json_means(jpath)
         rows = tables.get(label, {})
@@ -185,12 +198,27 @@ def main():
                 # tolerance = half a unit in the table's last printed decimal
                 tol = 0.5 * 10 ** -len(cell.split(".")[1])
                 got = means[key][col]
+                checked += 1
                 if abs(got - float(cell)) > tol + 1e-9:
                     print(f"[{label}] {texname} {col}: tex={cell} json={got:.4f}  MISMATCH")
                     bad += 1
-    bad += verify_raw()
-    print("RESULT:", "FAIL" if bad else "PASS - table numbers match the benchmark JSONs")
-    sys.exit(1 if bad else 0)
+    rbad, rchecked, rskipped = verify_raw()
+    bad += rbad; checked += rchecked; skipped += rskipped
+
+    # PASS only when every expected table verified with zero mismatches.
+    if bad:
+        print(f"RESULT: FAIL - {bad} mismatched cell(s) of {checked} verified")
+        sys.exit(1)
+    if checked == 0:
+        print("RESULT: INCOMPLETE - no benchmark JSONs found; 0 cells verified "
+              "(expected on a clean checkout: result JSONs are not shipped)")
+        sys.exit(2)
+    if skipped:
+        print(f"RESULT: INCOMPLETE - {checked} cell(s) verified OK, but skipped: "
+              + ", ".join(skipped))
+        sys.exit(2)
+    print(f"RESULT: PASS - all {checked} table cells match the benchmark JSONs")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

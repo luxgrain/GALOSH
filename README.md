@@ -28,10 +28,10 @@ redesigned for modern parallel hardware:
   depends on the domain and baseline), and practical on plain CPUs.
 
 On SIDD Medium and RawNIND (raw and sRGB, all methods blind), GALOSH is
-consistently the strongest blind, training-free method — ahead of the
-BM3D/NLM family even when those are given an oracle noise level — while
-trained networks remain ahead in their own training domain (reported honestly
-in the paper).
+consistently the strongest among the tested blind, training-free methods —
+ahead of the BM3D/NLM family even when those are given an oracle noise level —
+while trained networks remain ahead in their own training domain (reported
+honestly in the paper).
 
 ## Algorithm summary
 
@@ -69,7 +69,7 @@ regression at full resolution; output clamped to [0,1]. Input = sRGB float32
 | `standalone/` | **Canonical reference implementation** (CLI / exe) — the basis for the paper and all benchmarks |
 | `standalone/tests/` | Smoke tests + dataset-free micro-benchmark |
 | `benchmark/scripts/` | Full benchmark harness (SIDD / RawNIND, raw + sRGB) |
-| `benchmark/results_*/` | Benchmark outputs (JSON metrics, PNG artifacts; regenerable, not committed) |
+| `benchmark/results_*/` | Benchmark outputs — a few small timing-source JSONs are tracked; bulky regenerable artifacts (metrics JSONs, PNGs) are git-ignored |
 | `docs/paper/` | Manuscript sources (LaTeX, tables, figures) |
 | `*_hp.*` | **Diagnostic probes** — see below |
 
@@ -169,7 +169,27 @@ Third-party datasets are **not redistributed**. Download and prepare:
   (`.arw` originals); `benchmark/scripts/render_rawnind.py` produces the raw
   crops and sRGB renders the harness consumes.
 
-Then (paths at the top of each script point at the dataset root):
+The harness locates datasets and result trees through environment variables
+(defaults are repo-relative placeholders):
+
+```sh
+export GALOSH_SIDD_BENCH=/path/to/sidd_medium_bench        # SIDD .npy pairs
+export GALOSH_RAWNIND_BENCH=/path/to/rawnind_bench         # RawNIND crops/renders
+export GALOSH_RAWNIND_RESULTS=/path/to/rawnind_results     # RawNIND result JSONs
+```
+
+Expected layouts:
+
+```
+$GALOSH_SIDD_BENCH/                     $GALOSH_RAWNIND_BENCH/
+  <tag>_noisy_raw.npy                     __noisy_raw__/<scene>__ISO<n>.npy
+  <tag>_gt_raw.npy                        __gt_raw__/<scene>.npy
+  <tag>_gt_srgb.npy                       __gt_raw_render__/<scene>.png
+  scenes.json                             __noisy_raw_render__/<tag>.png
+                                          __metadata__/<scene>.json
+```
+
+Then:
 
 ```sh
 python benchmark/scripts/bench_raw_campaign.py --dataset sidd_medium   # raw domain
@@ -180,6 +200,18 @@ python benchmark/scripts/bench_yuv_srgb.py --dataset rawnind
 
 Results are written as JSON/CSV plus per-method PNG artifacts; the scripts in
 `benchmark/scripts/` also regenerate the paper tables and qualitative figures.
+
+**Table verification.** Every number printed in the paper's result tables is
+machine-checked against the benchmark JSONs:
+
+```sh
+python benchmark/scripts/verify_table_numbers.py
+```
+
+It reports `PASS` only when every expected JSON is present and every table
+cell matches. On a clean checkout (result JSONs are regenerable and not
+committed) it reports `RESULT: INCOMPLETE - no benchmark JSONs found` with a
+non-zero exit code — run the benchmarks first to make it meaningful.
 
 ## Fixed-point / streaming (design target, not a product)
 

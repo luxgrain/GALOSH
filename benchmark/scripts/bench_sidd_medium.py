@@ -42,7 +42,7 @@ from skimage.metrics import structural_similarity as ssim
 os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 
 BASE       = Path(__file__).parent.parent
-BENCH_DIR  = Path(r"E:\img_dataset\sidd\medium_bench")
+BENCH_DIR  = Path(os.environ.get("GALOSH_SIDD_BENCH", "benchmark/datasets/sidd_medium_bench"))
 OUTDIR     = BASE / "_tmp"
 RESULTS    = BASE / "_tmp"
 RESULTS.mkdir(exist_ok=True)

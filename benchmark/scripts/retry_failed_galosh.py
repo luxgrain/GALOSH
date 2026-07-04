@@ -1,6 +1,7 @@
 """Fresh-process retry of galosh on the RawNIND scenes where it crashed (CUDA<->OpenCL
 contention accumulates in a long run; a fresh process resets it). Recovers + merges
 into _metrics.json + the galosh PNG dir. Re-runnable (only re-tries still-missing tags)."""
+import os
 import sys, json
 import numpy as np
 from pathlib import Path
@@ -9,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_yuv_srgb as B
 
 R = Path(__file__).resolve().parents[2] / "benchmark" / "results_srgb_rawnind"
-ND = Path("E:/img_dataset/rawnind_bench/__noisy_raw_render__")
-GD = Path("E:/img_dataset/rawnind_bench/__gt_raw_render__")
+ND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench")) / "__noisy_raw_render__"
+GD = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench")) / "__gt_raw_render__"
 B.TMP.mkdir(parents=True, exist_ok=True)
 
 rows = json.load(open(R / "_metrics.json"))

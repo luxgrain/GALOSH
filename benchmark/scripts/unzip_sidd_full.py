@@ -1,8 +1,10 @@
-"""Unzip SIDD Full NOISY_RAW + GT_RAW from all 28 scenes to E:\\SIDD_extracted.
+"""Unzip SIDD Full NOISY_RAW + GT_RAW from all 28 scenes.
 
 Each scene has 150 .MAT noisy frames + 150 .MAT GT frames.
 Total ~340 GB unzipped.
 
+Set GALOSH_SIDD_FULL to the downloaded SIDD_Full directory and
+GALOSH_SIDD_EXTRACT to the (large) extraction target.
 Parallel: 4 scenes at a time (= I/O-bound, more workers don't help).
 """
 import os
@@ -14,8 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
-SIDD_FULL = Path(r"E:\SIDD_Full")
-EXTRACT_DIR = Path(r"E:\SIDD_extracted")
+SIDD_FULL = Path(os.environ.get("GALOSH_SIDD_FULL", "benchmark/datasets/SIDD_Full"))
+EXTRACT_DIR = Path(os.environ.get("GALOSH_SIDD_EXTRACT", "benchmark/datasets/SIDD_extracted"))
 EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 

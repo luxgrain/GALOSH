@@ -16,7 +16,7 @@ SCP = GALOSH / "benchmark" / "external" / "simple-camera-pipeline"
 sys.path.insert(0, str(SCP))
 from python.pipeline import run_pipeline_v2
 
-OUT = Path(os.environ.get("GALOSH_RAWNIND_BENCH", r"E:\img_dataset\rawnind_bench"))
+OUT = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
 RESULTS = OUT / "_metrics.json"
 RESULTS_CLASSICAL = OUT / "_metrics_classical.json"
 LOG = OUT / "logs" / "_rawnind_render.log"

@@ -18,7 +18,7 @@ from skimage.restoration import denoise_nl_means
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
-BENCH = Path(r"E:\img_dataset\sidd\medium_bench")
+BENCH = Path(os.environ.get("GALOSH_SIDD_BENCH", "benchmark/datasets/sidd_medium_bench"))
 
 
 def run_nlm_cfa_cpu(noisy: np.ndarray, sigma: float,

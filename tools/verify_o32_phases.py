@@ -9,10 +9,13 @@ GALOSH = Path(os.environ.get("GALOSH_ROOT", str(Path(__file__).resolve().parents
 EXE_CPU = GALOSH / "standalone" / "galosh_raw_cpu.exe"
 EXE_GPU = GALOSH / "standalone" / "galosh_raw_gpu.exe"
 
-CPU_DIR = Path(r"C:\tmp\verify_cpu"); CPU_DIR.mkdir(parents=True, exist_ok=True)
-GPU_DIR = Path(r"C:\tmp\verify_gpu"); GPU_DIR.mkdir(parents=True, exist_ok=True)
+import tempfile
+_TMP = Path(os.environ.get("GALOSH_TMP", tempfile.gettempdir()))
+CPU_DIR = _TMP / "verify_cpu"; CPU_DIR.mkdir(parents=True, exist_ok=True)
+GPU_DIR = _TMP / "verify_gpu"; GPU_DIR.mkdir(parents=True, exist_ok=True)
 
-INPUT = r"C:\tmp\real_in.bin"
+# input frame: raw float32 Bayer, W x H (set GALOSH_VERIFY_INPUT to point at one)
+INPUT = os.environ.get("GALOSH_VERIFY_INPUT", str(_TMP / "real_in.bin"))
 W, H = 256, 256
 
 # CPU run

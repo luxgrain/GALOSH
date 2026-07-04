@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("GALOSH_ROOT", str(Path(__file__).resolve().parents[2])))
 
-B = Path(r"E:\img_dataset\sidd\medium_bench")
+B = Path(os.environ.get("GALOSH_SIDD_BENCH", "benchmark/datasets/sidd_medium_bench"))
 scenes = json.load(open(B / "scenes.json"))
 outs = []
 for tag in [scenes[0]["tag"], scenes[40]["tag"]]:

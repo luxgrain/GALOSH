@@ -3,7 +3,7 @@
 Runs the confirmed RAW comparison set on full-frame images with 5 metrics
 (PSNR/SSIM on RAW Bayer; LPIPS/DISTS/NIQE on calibrated sRGB render) + per-method
 runtime.  Resume-able (per-image metrics JSON), storage-safe (metrics always;
-denoised .npy only if --save-npy).  Algorithm code = clean V2 (galosh-public).
+denoised .npy only if --save-npy).  Algorithm code = the public canonical pipeline (branch galosh-public).
 
 Methods (all blind / training-free except B2U/AP-BSN which are self-supervised DL):
   galosh_fp32     GALOSH GPU FP32 (o32, blind)
@@ -73,7 +73,7 @@ def build_render(dataset, stem, gr, gsf):
             return (lambda d: smb.raw_to_srgb_calibrated(d, affine),
                     smb.raw_to_srgb_calibrated(gr, affine))
         scene = stem.rsplit("__ISO", 1)[0]
-        _rb = os.environ.get("GALOSH_RAWNIND_BENCH", r"E:\img_dataset\rawnind_bench")
+        _rb = os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench")
         meta = json.load(open(rf"{_rb}\__metadata__\{scene}.json"))
         if _RND is None:
             import render_rawnind as _r; _RND = _r
@@ -187,7 +187,7 @@ def make_runners():
 
 # ---------- datasets ----------
 def load_sidd_medium():
-    base = Path(os.environ.get("GALOSH_SIDD_BENCH", r"E:\img_dataset\sidd\medium_bench"))
+    base = Path(os.environ.get("GALOSH_SIDD_BENCH", "benchmark/datasets/sidd_medium_bench"))
     items = []
     for nf in sorted(base.glob("*noisy_raw.npy")):
         stem = nf.name.replace("_noisy_raw.npy", "")
@@ -198,7 +198,7 @@ def load_sidd_medium():
 
 def load_rawnind():
     # noisy "scene__ISO###.npy" -> gt "scene.npy"; precomputed sRGB GT render for perceptual
-    base = Path(os.environ.get("GALOSH_RAWNIND_BENCH", r"E:\img_dataset\rawnind_bench"))
+    base = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
     nd, gd, grr = base / "__noisy_raw__", base / "__gt_raw__", base / "__gt_raw_render__"
     items = []
     if nd.exists():
@@ -208,7 +208,7 @@ def load_rawnind():
             if not gr.exists(): continue
             gs = grr / f"{scene}.npy"
             items.append((nf.stem, nf, gr, gs if gs.exists() else None))
-    return items, Path(os.environ.get("GALOSH_RAWNIND_RESULTS", r"E:\rawnind_bench_v2"))
+    return items, Path(os.environ.get("GALOSH_RAWNIND_RESULTS", "benchmark/results_raw_rawnind"))
 
 
 def main():

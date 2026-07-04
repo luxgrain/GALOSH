@@ -29,7 +29,7 @@ weights/
 *.onnx
 *.pt
 
-# --- Datasets (live in C:\Users\luxgrain\datasets\) ---
+# --- Datasets (kept outside the repo or under benchmark/datasets/; see README "Benchmarks") ---
 datasets/
 
 # --- Benchmark outputs (regeneratable, multi-GB) ---

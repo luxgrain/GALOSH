@@ -3,6 +3,7 @@
 TRUE std(noisy-gt) [oracle upper bound]) on a high-ISO RawNIND subset, to see whether the
 classical methods are handicapped by sigma under-estimation (correlated sRGB noise) rather than
 by the denoising algorithm. GALOSH (training-free) shown for reference on the same scenes."""
+import os
 import sys, json, numpy as np, cv2, bm3d
 from pathlib import Path
 from PIL import Image
@@ -10,7 +11,7 @@ from skimage.restoration import estimate_sigma
 sys.path.insert(0, "benchmark/scripts")
 import bench_yuv_srgb as B
 
-ND = Path("E:/img_dataset/rawnind_bench/__noisy_raw_render__"); GD = Path("E:/img_dataset/rawnind_bench/__gt_raw_render__")
+ND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench")) / "__noisy_raw_render__"; GD = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench")) / "__gt_raw_render__"
 R = Path("benchmark/results_srgb_rawnind"); r = json.load(open(R / "_metrics.json"))
 gal = {x['tag']: x for x in r if x['method'] == 'galosh_yuv_gpu_fp32' and x.get('ok')}
 

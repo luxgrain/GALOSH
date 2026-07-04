@@ -21,7 +21,7 @@ ARCH = GALOSH / "standalone" / "archive_int_iter"
 EXE_V0 = ARCH / "galosh_raw_cpu_int_v0_baseline.exe"
 EXE_V1 = ARCH / "galosh_raw_cpu_int_v1_bug11_broken.exe"
 EXE_FP = GALOSH / "standalone" / "galosh_raw_cpu.exe"
-RAWNIND = Path(r"E:\rawnind_bench")
+RAWNIND = Path(os.environ.get("GALOSH_RAWNIND_BENCH", "benchmark/datasets/rawnind_bench"))
 WORK = GALOSH / "benchmark" / "results" / "int_gap_by_iso"
 WORK.mkdir(parents=True, exist_ok=True)
 

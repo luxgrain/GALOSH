@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 ROOT = Path(os.environ.get("GALOSH_ROOT", str(Path(__file__).resolve().parents[2])))
 DIRS = {"sidd_medium": ROOT / "benchmark" / "results_raw_sidd",
-        "rawnind":     Path(r"E:\rawnind_bench_v2")}
+        "rawnind":     Path(os.environ.get("GALOSH_RAWNIND_RESULTS", "benchmark/results_raw_rawnind"))}
 # columns to show (artifact stem -> display label); _noisy/_gt are the input/GT.
 # BM3D/NLM use the VST (noise-aware) variants — the strongest classical baselines —
 # while GALOSH stays fully blind (user request 2026-06-27).

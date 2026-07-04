@@ -1,5 +1,5 @@
 % ============================================================================
-% GALOSH — arXiv manuscript v2 (re-centered draft, 2026-07-02)
+% GALOSH — arXiv manuscript
 % Positioning: parallel-friendly, training-free CLASSICAL denoising redesign,
 % fast, high-performing, multi-domain (RAW Bayer + YUV/RGB). ISP / fixed-point
 % = feasibility & mapping only. Supersedes galosh_raw_paper.tex (RAW/ISP-first
@@ -48,7 +48,8 @@ Every stage is local, data-independent, and regular --- the
 same computation graph for every pixel of every image. One core serves two
 domains: raw Bayer mosaics and sRGB/YUV images. On four real-noise benchmarks
 (SIDD Medium and RawNIND, raw and sRGB) GALOSH is consistently the strongest
-blind, training-free method --- surpassing BM3D- and NLM-family baselines even
+among the tested blind, training-free methods --- surpassing BM3D- and
+NLM-family baselines even
 when those are given an oracle noise level --- and approaches trained networks
 on raw data while remaining below in-domain trained networks at high ISO in
 sRGB. Being search-free makes it fast: $7\times$--$650\times$ faster than
@@ -100,7 +101,8 @@ transform provides it). Our contributions:
 stages are all local, regular, and data-independent, with a shared core and two
 domain front-ends (raw Bayer and sRGB/YUV) (Sec.~\ref{sec:method}).
 \item Evidence across four real-noise benchmarks that GALOSH is the strongest
-blind training-free method in both domains --- including against
+among the tested blind, training-free methods in both domains --- including
+against
 oracle-$\sigma$ classical baselines --- with an honest accounting of where
 trained networks remain ahead (Sec.~\ref{sec:results}).
 \item A speed study showing the practical value of search-freeness:
@@ -124,6 +126,12 @@ a second empirical Wiener pass with a pilot estimate is the standard refinement
 \emph{Locally-weighted regression}: LOESS~\cite{loess} fits a low-degree local
 polynomial under a kernel weight; the guided/joint-bilateral
 family~\cite{kopf,guidedfilter} makes one channel steer another.
+Beyond BM3D/NLM, the classical family includes low-rank patch models
+(WNNM~\cite{wnnm}), patch-prior optimization (EPLL~\cite{epll}), learned
+dictionaries (K-SVD~\cite{ksvd}), and the blind Noise Clinic
+pipeline~\cite{noiseclinic}; these are likewise search- or optimization-heavy,
+and we adopt BM3D/NLM --- with their CFA-aware and color variants --- as the
+strongest widely-reproduced representatives in our comparisons.
 GALOSH's claim is not any single component but their composition into a
 search-free, fully-blind, two-domain pipeline --- replacing BM3D's block
 matching with a cycle-spun local transform, and replacing its known-$\sigma$
@@ -236,6 +244,11 @@ $\sigma$ from the input; GALOSH uses its own blind fit; DL baselines are their
 published real-noise weights. Fidelity (PSNR/SSIM) is computed in each native
 domain; perceptual metrics (LPIPS~\cite{lpips}, DISTS~\cite{dists},
 NIQE~\cite{niqe}) on sRGB (raw results are rendered with per-image metadata).
+On full-frame sRGB ($\sim$15.8\,MP), the DL baselines run tiled inference
+(overlapping tiles, feathered), and LPIPS/DISTS are reported as the mean over
+the same $1024^2$ tile grid for \emph{every} method --- a single uniform
+protocol imposed by GPU-memory and metric-implementation limits at this
+resolution, not a per-method choice.
 
 \paragraph{Baselines are domain-appropriate by design.} Raw and sRGB denoising
 are different tasks with different proper baselines, so the two domains use
@@ -295,7 +308,7 @@ trained networks hold a moderate lead over GALOSH (+0.3--0.7\,dB), while
 GALOSH in turn leads the classical family by $\sim$2\,dB and is the only
 method in the blind training-free group that keeps gaining as noise grows.
 Separately, NAFNet-SIDD diverges numerically on 37 near-black scenes (raw
-outputs $\pm10^3$); GALOSH and all other baselines remain stable on the same
+outputs reach $\pm10^3$ before clipping); GALOSH and all other baselines remain stable on the same
 inputs --- a robustness advantage of the fixed, training-free computation.
 
 \subsection{Speed}\label{sec:speed}
@@ -341,9 +354,10 @@ INT16 output --- matches the FP32 reference to within 0.1--0.7\,dB
 required anywhere in the shipping path (wide intermediates use paired-32-bit
 patterns).
 
-\paragraph{Feasibility, not product.} By a MAC-array throughput model,
-$0.5$--$1$\,TMAC/s of fixed-function compute --- modest by current ISP
-standards --- would sustain real-time 1080p--4K; on-chip state is bounded by
+\paragraph{Feasibility, not product.} By a MAC-array throughput model, the
+per-pixel operation count is compatible with 1080p--4K-class streaming under
+a $0.5$--$1$\,TMAC/s fixed-function budget --- modest by current ISP
+standards; on-chip state is bounded by
 line buffers of the largest vertical kernel ($\sim$200\,KB at 1080p in INT16).
 We present these as design properties of the algorithm ("designed to map
 naturally onto fixed-point streaming hardware"); building and verifying such a
@@ -355,6 +369,7 @@ GALOSH does not beat trained networks in their own domain, and at high ISO in
 sRGB the trained networks retain a moderate quality lead; our claim is not
 state-of-the-art quality but the combination --- blind, training-free,
 multi-domain, search-free-parallel, and fast --- at quality that surpasses the
+tested members of the
 classical family even under oracle conditions. PSNR on raw SIDD remains
 slightly below the trained Blind2Unblind. The blind estimator under-estimates
 strongly correlated rendered noise (as all high-pass estimators do), which the
@@ -416,6 +431,14 @@ assessment: Unifying structure and texture similarity,'' \emph{IEEE TPAMI},
 2020.
 \bibitem{niqe} A.~Mittal, R.~Soundararajan, and A.~C.~Bovik, ``Making a
 `completely blind' image quality analyzer,'' \emph{IEEE SPL}, 2013.
+\bibitem{wnnm} S.~Gu, L.~Zhang, W.~Zuo, and X.~Feng, ``Weighted nuclear norm
+minimization with application to image denoising,'' \emph{CVPR}, 2014.
+\bibitem{epll} D.~Zoran and Y.~Weiss, ``From learning models of natural image
+patches to whole image restoration,'' \emph{ICCV}, 2011.
+\bibitem{ksvd} M.~Elad and M.~Aharon, ``Image denoising via sparse and
+redundant representations over learned dictionaries,'' \emph{IEEE TIP}, 2006.
+\bibitem{noiseclinic} M.~Lebrun, M.~Colom, and J.-M.~Morel, ``The noise
+clinic: A blind image denoising algorithm,'' \emph{IPOL}, 2015.
 \end{thebibliography}
 
 % ----------------------------------------------------------------- Tables
