@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bench_raw_v2_campaign as C
+import bench_raw_campaign as C
 import bench_sidd_medium as smb
 
 def psnr(a, b):

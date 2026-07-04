@@ -11,7 +11,7 @@ import numpy as np
 from skimage.restoration import denoise_nl_means
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bench_raw_v2_campaign as C
+import bench_raw_campaign as C
 
 GALOSH = Path(__file__).resolve().parents[2]
 CPU_EXE = GALOSH / "standalone" / "galosh_raw_cpu.exe"

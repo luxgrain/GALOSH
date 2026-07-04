@@ -36,7 +36,7 @@ sys.path.insert(0, str(SCRIPTS / "methods"))
 import bench_sidd_medium as smb  # for run_nlm_cfa_cuda
 from bm3d_cfa import run_bm3d_cfa
 
-BENCH_OUT = Path(r"E:\rawnind_bench")
+BENCH_OUT = Path(os.environ.get("GALOSH_RAWNIND_BENCH", r"E:\img_dataset\rawnind_bench"))
 METRICS_JSON = BENCH_OUT / "_metrics.json"
 
 

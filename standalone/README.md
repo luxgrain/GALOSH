@@ -1,4 +1,4 @@
-# GALOSH RAW V2 — canonical pipeline
+# GALOSH standalone — canonical RAW pipeline
 
 Fully-blind RAW Bayer denoiser (Generalized Anscombe LOcal SHrinkage).
 **Canonical algorithm = GALOSH_RAW_O**: GAT-normalized overlapping 2×2 WHT
@@ -6,7 +6,7 @@ luma shrinkage (BayesShrink-MAD + empirical Wiener, cycle-spun) + 3-level
 multi-scale LOESS chroma pyramid with L-guided joint-bilateral upsample.
 No block-matching, no sorting, no training, no noise profile.
 
-## Four precisions (the paper "GALOSH RAW V2")
+## Four precisions
 
 | precision | source | binary | role |
 |---|---|---|---|
@@ -42,12 +42,15 @@ ablation builds that expose `--variant=g..n`.
 ## Usage
 
 ```sh
-./galosh_raw_cpu.exe   in.bin out.bin W H galosh 1.0 1.0 1.0 0 0   # CPU FP32, blind
-./galosh_raw_gpu.exe   in.bin out.bin W H 1.0 1.0 1.0 0 0 0        # GPU FP32 (o32 default)
-./galosh_raw_cpu_int.exe in.bin out.bin W H galosh 1.0 1.0 1.0 0 0 --variant=r32
+./galosh_raw_cpu.exe     in.bin out.bin W H galosh 1.0 1.0 1.0 0 0   # CPU FP32, blind
+./galosh_raw_gpu.exe     in.bin out.bin W H 1.0 1.0 1.0 0 0 0        # GPU FP32 (o32 default)
+./galosh_raw_cpu_int.exe in.bin out.bin W H galosh 1.0 1.0 1.0 0 0   # CPU INT32 (single pipeline)
 ```
 Input/output = raw float32, row-major, single-channel Bayer in [0,1]. Noise is
-estimated blind (Foi–Alenius α/σ²); pass `0 0` for alpha/sigma to estimate.
+estimated blind (per-image Poisson–Gaussian α/σ² fit); pass `0 0` for
+alpha/sigma to estimate. On Windows/MSYS2, run with `C:\msys64\ucrt64\bin` on
+`PATH` (the OpenMP runtime `libgomp-1.dll` lives there). Set `GALOSH_VERBOSE=1`
+for per-phase diagnostics (all exes are quiet by default).
 
 ## Deprecated lineage (ablation only)
 

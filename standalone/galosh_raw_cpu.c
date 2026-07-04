@@ -15,7 +15,7 @@
  * No block-matching, no sorting, no training, no noise profile.  The same
  * algorithm ships at four precisions: CPU FP32 (this file) / CPU INT32
  * (galosh_raw_cpu_int.c) / GPU FP32 (galosh_raw_gpu.c) / GPU INT16
- * (galosh_int_*.cl).  See README_RAW_V2.md.
+ * (galosh_int_*.cl).  See README.md (standalone).
  *
  * Usage: galosh_raw_cpu in.bin out.bin W H galosh <strength> <luma> <chroma> <alpha> <sigma_sq>
  *   I/O = raw float32, row-major, single-channel Bayer in [0,1].  alpha=sigma=0 -> blind.

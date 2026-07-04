@@ -1,4 +1,4 @@
-"""GALOSH RAW V2 overnight benchmark campaign (SIDD Medium / RawNIND, full-frame).
+"""GALOSH RAW benchmark campaign (SIDD Medium / RawNIND, full-frame).
 
 Runs the confirmed RAW comparison set on full-frame images with 5 metrics
 (PSNR/SSIM on RAW Bayer; LPIPS/DISTS/NIQE on calibrated sRGB render) + per-method
@@ -16,8 +16,8 @@ Methods (all blind / training-free except B2U/AP-BSN which are self-supervised D
                   = "no GALOSH estimation"; isolates GALOSH's blind-estimation gain)
   b2u             Blind2Unblind (self-supervised RAW DL)
 
-  python bench_raw_v2_campaign.py --dataset sidd_medium [--methods a,b] [--save-npy] [--limit N]
-  python bench_raw_v2_campaign.py --dataset rawnind   ...
+  python bench_raw_campaign.py --dataset sidd_medium [--methods a,b] [--save-npy] [--limit N]
+  python bench_raw_campaign.py --dataset rawnind   ...
 """
 from __future__ import annotations
 import os, sys, json, time, argparse, traceback, glob
@@ -73,7 +73,8 @@ def build_render(dataset, stem, gr, gsf):
             return (lambda d: smb.raw_to_srgb_calibrated(d, affine),
                     smb.raw_to_srgb_calibrated(gr, affine))
         scene = stem.rsplit("__ISO", 1)[0]
-        meta = json.load(open(rf"E:\rawnind_bench\__metadata__\{scene}.json"))
+        _rb = os.environ.get("GALOSH_RAWNIND_BENCH", r"E:\img_dataset\rawnind_bench")
+        meta = json.load(open(rf"{_rb}\__metadata__\{scene}.json"))
         if _RND is None:
             import render_rawnind as _r; _RND = _r
         return (lambda d: _RND.render(d, meta), _RND.render(gr, meta))
@@ -186,7 +187,7 @@ def make_runners():
 
 # ---------- datasets ----------
 def load_sidd_medium():
-    base = Path(r"E:\img_dataset\sidd\medium_bench")
+    base = Path(os.environ.get("GALOSH_SIDD_BENCH", r"E:\img_dataset\sidd\medium_bench"))
     items = []
     for nf in sorted(base.glob("*noisy_raw.npy")):
         stem = nf.name.replace("_noisy_raw.npy", "")
@@ -197,7 +198,7 @@ def load_sidd_medium():
 
 def load_rawnind():
     # noisy "scene__ISO###.npy" -> gt "scene.npy"; precomputed sRGB GT render for perceptual
-    base = Path(r"E:\img_dataset\rawnind_bench")
+    base = Path(os.environ.get("GALOSH_RAWNIND_BENCH", r"E:\img_dataset\rawnind_bench"))
     nd, gd, grr = base / "__noisy_raw__", base / "__gt_raw__", base / "__gt_raw_render__"
     items = []
     if nd.exists():
@@ -207,7 +208,7 @@ def load_rawnind():
             if not gr.exists(): continue
             gs = grr / f"{scene}.npy"
             items.append((nf.stem, nf, gr, gs if gs.exists() else None))
-    return items, Path(r"E:\rawnind_bench_v2")
+    return items, Path(os.environ.get("GALOSH_RAWNIND_RESULTS", r"E:\rawnind_bench_v2"))
 
 
 def main():

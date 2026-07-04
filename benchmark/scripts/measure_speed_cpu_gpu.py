@@ -8,7 +8,7 @@ import sys, time
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
-import bench_raw_v2_campaign as camp
+import bench_raw_campaign as camp
 
 SP = Path(__file__).resolve().parents[1] / "results_raw" / "speed"
 nr = np.fromfile(SP / "noisy_1080p.bin", dtype=np.float32).reshape(1080, 1920)

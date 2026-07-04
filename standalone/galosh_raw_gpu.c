@@ -2001,8 +2001,10 @@ download_phase:
     /* Report GPU-only time for benchmarks (parseable) */
     fprintf(stderr, "[GPU_PIPELINE_TIME] %.2f\n", t_pipe);
 
-    /* Read back params for debug info */
-    {
+    /* Read back params for debug info — dev diagnostics, GALOSH_VERBOSE-gated
+     * (quiet by default, matching the INT CPU reference exe).
+     * デバッグ用読み戻し。GALOSH_VERBOSE 指定時のみ出力（既定は静粛）。 */
+    if(getenv("GALOSH_VERBOSE") != NULL) {
         float h_params[PARAMS_SIZE];
         clEnqueueReadBuffer(queue, params_buf, CL_TRUE, 0,
                             PARAMS_SIZE * sizeof(float), h_params, 0, NULL, NULL);

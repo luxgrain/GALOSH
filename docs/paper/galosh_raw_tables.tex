@@ -32,7 +32,7 @@ Method & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$
 % FP32 = o32 GPU, INT16 = i16 GPU (lf=5 cf=9; near-lossless vs the r32 CPU
 % reference, ~58-65 dB end-to-end on full frames = the INT16 storage quantization;
 % at INT32 storage the GPU pipeline is bit-exact vs r32, verified 2026-07-04).
-% Source: bench_raw_v2_campaign.py (_metrics_antiring.json; galosh_fp32 + vst_galosh
+% Source: bench_raw_campaign.py (_metrics_antiring.json; galosh_fp32 + vst_galosh
 % re-verified 2026-07-02 on the GPU exe in _metrics_revst_gpu.json, 0 failures).
 % GPU times: fp32/vst = dedicated uncontended same-session runs
 % (_revst_gpu_time_sidd_medium.json); int16 GPU = i16 campaign mean.

@@ -143,7 +143,7 @@ Notes:
 
 ## Tests and expected output
 
-`make test` runs 19 smoke cases through the RAW (FP32 + INT32) and YUV paths
+`make test` runs 20 smoke cases through the RAW (FP32 + INT32) and YUV paths
 (+ GPU when available) and ends with `SMOKE: PASS`. `make bench-small` denoises
 a seeded synthetic Poisson–Gaussian pair and must report a PSNR gain for every
 method (typical: raw FP32 ≈ +15 dB, raw INT32 ≈ +15 dB, YUV ≈ +7 dB on the
@@ -164,8 +164,8 @@ Third-party datasets are **not redistributed**. Download and prepare:
 Then (paths at the top of each script point at the dataset root):
 
 ```sh
-python benchmark/scripts/bench_raw_v2_campaign.py --dataset sidd_medium   # raw domain
-python benchmark/scripts/bench_raw_v2_campaign.py --dataset rawnind
+python benchmark/scripts/bench_raw_campaign.py --dataset sidd_medium   # raw domain
+python benchmark/scripts/bench_raw_campaign.py --dataset rawnind
 python benchmark/scripts/bench_yuv_srgb.py --dataset sidd --crop 0        # sRGB, full frame
 python benchmark/scripts/bench_yuv_srgb.py --dataset rawnind
 ```

@@ -3,7 +3,7 @@
  * Bit-faithful integer port of the FP32 pipeline (galosh_raw_cpu.c): no float,
  * no FP64 — 64-bit intermediates use paired-int32 emulation (fxp_acc).  This is
  * the canonical INT reference; the GPU INT16 port (galosh_int_*.cl) is bit-exact
- * to it.  Q11.20 storage (range +-2048).  See README_RAW_V2.md.
+ * to it.  Q11.20 storage (range +-2048).  See README.md (standalone).
  *
  * Usage: galosh_raw_cpu_int in.bin out.bin W H galosh <strength> <luma> <chroma> <alpha> <sigma_sq>
  *   I/O = raw float32 Bayer in [0,1].  alpha=sigma=0 -> blind.  GALOSH_VERBOSE=1 -> progress.

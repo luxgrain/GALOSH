@@ -12,21 +12,21 @@
  {
   "method": "galosh_raw_fp32",
   "psnr": 38.97,
-  "time_s": 0.094,
+  "time_s": 0.077,
   "gain_db": 15.87,
   "improves": true
  },
  {
   "method": "galosh_raw_int32",
   "psnr": 38.46,
-  "time_s": 0.61,
+  "time_s": 0.618,
   "gain_db": 15.36,
   "improves": true
  },
  {
   "method": "galosh_yuv_fp32",
   "psnr": 30.72,
-  "time_s": 0.111,
+  "time_s": 0.069,
   "gain_db": 7.62,
   "improves": true
  }
