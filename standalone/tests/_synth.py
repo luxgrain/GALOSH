@@ -35,7 +35,7 @@ def gen(case, w, h, c, path):
     print(f"gen {case} {w}x{h}x{c} -> {path}")
 
 
-def check(path, w, h, c):
+def check(path, w, h, c, ref=None):
     a = np.fromfile(path, dtype=np.float32)
     want = w * h * c
     ok = True
@@ -45,6 +45,15 @@ def check(path, w, h, c):
         print(f"  NON-FINITE values: {np.count_nonzero(~np.isfinite(a))}"); ok = False
     if a.size and (a.min() < -0.25 or a.max() > 1.25):
         print(f"  RANGE SUSPECT: [{a.min():.3f}, {a.max():.3f}]"); ok = False
+    if a.size and ref is not None:
+        # brightness sanity: a denoiser must roughly preserve the input mean.
+        # Catches all-zero / all-saturated collapses that size/finite/range miss.
+        r = np.fromfile(ref, dtype=np.float32)
+        if r.size == a.size:
+            dm = abs(float(a.mean()) - float(r.mean()))
+            if dm > 0.10:
+                print(f"  MEAN DRIFT: out {a.mean():.4f} vs in {r.mean():.4f} (|d|={dm:.4f} > 0.10)")
+                ok = False
     if a.size:
         print(f"  stats: min {a.min():.4f} max {a.max():.4f} mean {a.mean():.4f} std {a.std():.4f}")
     sys.exit(0 if ok else 1)
@@ -61,6 +70,7 @@ if __name__ == "__main__":
     if m == "gen":
         gen(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
     elif m == "check":
-        check(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+        check(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]),
+              sys.argv[6] if len(sys.argv) > 6 else None)
     elif m == "psnr":
         psnr(sys.argv[2], sys.argv[3])

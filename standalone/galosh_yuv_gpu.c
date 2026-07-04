@@ -64,11 +64,16 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
 
     /* --- Read 3ch sRGB input --- */
     float *srgb = alloc_float(3 * npix);
+    if(!srgb) { fprintf(stderr, "[YUV_GAT] Memory allocation failed (%zu px)\n", npix); return 1; }
     {
         FILE *f = fopen(input_file, "rb");
-        if(!f) { fprintf(stderr, "[YUV_GAT] Cannot open %s\n", input_file); return 1; }
-        fread(srgb, sizeof(float), 3 * npix, f);
+        if(!f) { fprintf(stderr, "[YUV_GAT] Cannot open %s\n", input_file); free_aligned(srgb); return 1; }
+        size_t nrd = fread(srgb, sizeof(float), 3 * npix, f);
         fclose(f);
+        if(nrd != 3 * npix) {
+            fprintf(stderr, "[YUV_GAT] Read %zu floats, expected %zu\n", nrd, 3 * npix);
+            free_aligned(srgb); return 1;
+        }
     }
     fprintf(stderr, "[YUV_GAT] %dx%d, strength_y=%.3f, strength_c=%.3f\n",
             width, height, strength_y, strength_c);
@@ -1060,14 +1065,19 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     clFinish(queue);
     double t_gpu = get_time_ms() - t_pipe_start;
 
-    clEnqueueReadBuffer(queue, srgb_buf, CL_TRUE, 0,
-                        3 * npix * sizeof(float), srgb, 0, NULL, NULL);
+    err = clEnqueueReadBuffer(queue, srgb_buf, CL_TRUE, 0,
+                              3 * npix * sizeof(float), srgb, 0, NULL, NULL);
+    if(err != CL_SUCCESS) {
+        fprintf(stderr, "[YUV_GAT] output download failed: err=%d\n", (int)err);
+        goto yg_cleanup;
+    }
 
     {
         FILE *f = fopen(output_file, "wb");
         if(!f) { fprintf(stderr, "[YUV_GAT] Cannot write %s\n", output_file); goto yg_cleanup; }
-        fwrite(srgb, sizeof(float), 3 * npix, f);
+        size_t nwr = fwrite(srgb, sizeof(float), 3 * npix, f);
         fclose(f);
+        if(nwr != 3 * npix) { fprintf(stderr, "[YUV_GAT] Short write to %s\n", output_file); goto yg_cleanup; }
     }
 
     /* Profiling report */
@@ -1257,6 +1267,11 @@ int main(int argc, char **argv)
     const float sy          = (float)atof(argv[5]);
     const float sc          = (float)atof(argv[6]);
     const int   dev         = (argc > 7) ? atoi(argv[7]) : 0;
+    if(width <= 0 || height <= 0 ||
+       (size_t)width > SIZE_MAX / (3 * sizeof(float)) / (size_t)height) {
+        fprintf(stderr, "[YUV_GAT] Invalid dimensions %dx%d\n", width, height);
+        return 1;
+    }
     fprintf(stderr, "[YUV_GPU_%c] variant=%s\n",
             g_galosh_yuv_q_gpu ? 'Q' : 'O',
             g_galosh_yuv_q_gpu ? "Q (Laplacian-MAD σ + multi-scale chroma)" :

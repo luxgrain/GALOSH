@@ -7,7 +7,7 @@ denoised .npy only if --save-npy).  Algorithm code = clean V2 (galosh-public).
 
 Methods (all blind / training-free except B2U/AP-BSN which are self-supervised DL):
   galosh_fp32     GALOSH GPU FP32 (o32, blind)
-  galosh_int16    GALOSH INT16 (r32 CPU = bit-exact to GPU i16, blind)
+  galosh_int16    GALOSH INT16 (GPU i16; near-lossless to the r32 CPU reference, blind)
   bm3d_cfa        BM3D-CFA (blind MAD sigma)
   vst_bm3d_cfa    VST(gen.Anscombe)+BM3D-CFA (blind alpha/sigma)
   nlm_cfa         NLM-CFA  (blind MAD sigma)
@@ -124,8 +124,9 @@ def run_cpu_exe(exe, noisy, w, h, uid, alpha=0.0, sigma=0.0):
 
 
 def run_galosh_i16_gpu(noisy, w, h, uid):
-    """GPU INT16 (i16) = the DEPLOYED INT16 product (CPU r32 is dev/verify only, and is
-    bit-exact/zero-loss to this).  Full P0..P10 on GPU via galosh_int_pipe_test phase 10
+    """GPU INT16 (i16) = the DEPLOYED INT16 product (CPU r32 is dev/verify only;
+    near-lossless to this, ~64 dB end-to-end -- one Phase-0 guard not yet mirrored,
+    so not bit-identical).  Full P0..P10 on GPU via galosh_int_pipe_test phase 10
     with i16 storage (lf=9 cf=9); output is Q11.20 int32 -> /2^20 raw float [0,1].
     Matches the paper's claim that the shipped pipeline is the GPU variant for BOTH
     precisions (the speed table is GPU-only)."""

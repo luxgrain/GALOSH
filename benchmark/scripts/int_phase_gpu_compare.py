@@ -1,4 +1,7 @@
-"""Per-phase GPU vs CPU bit-exact comparison for the i16 GPU port.
+"""Per-phase GPU vs CPU comparison for the i16 GPU port (bit-exact at INT32
+storage where the phases are mirrored; NOTE: since the 2026-06-22 Phase-0 wshift
+fix on the CPU side, one guard is not yet mirrored on the GPU, so full-frame
+end-to-end agreement is near-lossless (~64 dB), not bit-identical).
 
 For phase N, the CPU r32 reference (run with GALOSH_INT_RAW_DUMP_DIR) dumps the
 working in_gat buffer as raw int32 (pN_ingat.bin) and prints "PN_RAW ...".  The

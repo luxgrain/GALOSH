@@ -2344,12 +2344,11 @@ static void phase4_chroma_halfres(const fxp32 *in_gat_q20,
 }
 
 /* ============================================================================
- * Smoke-test main — read FP32 raw, convert to Q11.20, GAT forward, convert
- * back to FP32, write.
- *
- * For Phase 1 verification (= no denoising).  Real denoising will be added
- * in Stage 1c.  The output image is meaningful only for smoke checking that
- * GAT_int matches GAT_fp32 within precision.
+ * CLI main — the full INT32 (r32, Q11.20) fixed-point denoising pipeline:
+ * read FP32 raw .bin, convert to Q11.20, run Phase 0..10 (blind noise
+ * estimation, GAT, dark-ref, WHT L/C decomposition, LOSH shrinkage, chroma
+ * LOESS + guided upsample, inverse), convert back to FP32, write.
+ * Usage mirrors galosh_raw_cpu.exe.
  * ========================================================================== */
 #ifdef GALOSH_OPCOUNT
 long long g_n_mac = 0, g_n_sf = 0;   /* no64-exempt: op-count instrumentation (see galosh_cpu_int.h) */
@@ -2391,8 +2390,9 @@ int main(int argc, char **argv) {
   const float sigma_sq_in = (argc > 10) ? (float)atof(argv[10]) : 0.0f;
   (void)chroma_str;
 
-  if(width <= 0 || height <= 0) {
-    fprintf(stderr, "Invalid dimensions: %dx%d\n", width, height);
+  if(width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
+     (size_t)width > SIZE_MAX / sizeof(float) / (size_t)height) {
+    fprintf(stderr, "Invalid dimensions: %dx%d (need positive, even W/H)\n", width, height);
     return 1;
   }
 
@@ -2415,6 +2415,7 @@ int main(int argc, char **argv) {
   fxp32 *out_q20 = (fxp32 *)malloc(npixels * sizeof(fxp32));
   if(!in_f32 || !out_f32 || !in_q20 || !out_q20) {
     fprintf(stderr, "Memory allocation failed\n");
+    free(in_f32); free(out_f32); free(in_q20); free(out_q20);
     return 1;
   }
 
@@ -2425,6 +2426,7 @@ int main(int argc, char **argv) {
   fclose(fin);
   if(nread != npixels) {
     fprintf(stderr, "Read %zu floats, expected %zu\n", nread, npixels);
+    free(in_f32); free(out_f32); free(in_q20); free(out_q20);
     return 1;
   }
 
@@ -2451,6 +2453,27 @@ int main(int argc, char **argv) {
             alpha_q20, sigma_sq_q20);
   }
 
+  /* Degenerate-model guard: a flat / noise-free input (constant frames,
+   * synthetic tests) estimates alpha at the 1-LSB floor with sigma_sq == 0.
+   * That model is BELOW the Q11.20 GAT dynamic range (2/sqrt(alpha) overflows
+   * the ±2048 integer part), which used to collapse the output to all-zero.
+   * There is nothing to denoise -> return the input unchanged (identity); the
+   * FP32 reference effectively does the same under its 1e-4/1e-6 floors.
+   * ノイズが測定できない入力は identity で返す（Q11.20 の GAT レンジ外の
+   * 退化モデルで全ゼロ崩壊していた問題の修正）。実シーンは必ず σ²>0 なので
+   * ベンチマーク結果には影響しない。 */
+  if(alpha_q20 <= 1 && sigma_sq_q20 <= 0) {
+    fprintf(stderr, "  Phase 0: no measurable noise (alpha at floor, sigma_sq = 0)"
+                    " -> identity output\n");
+    FILE *fid = fopen(output_file, "wb");
+    if(!fid) { fprintf(stderr, "Cannot open %s for writing\n", output_file); return 1; }
+    size_t nw_id = fwrite(in_f32, sizeof(float), npixels, fid);
+    fclose(fid);
+    free(in_f32); free(out_f32); free(in_q20); free(out_q20);
+    if(nw_id != npixels) { fprintf(stderr, "Short write to %s\n", output_file); return 1; }
+    return 0;
+  }
+
   /* ========== Phase 1: GAT forward + per-CFA σ + unified_sigma normalize ========== */
   fxp_gat_params gat_p;
   fxp_gat_precompute(&gat_p, alpha_q20, sigma_sq_q20);
@@ -2470,6 +2493,26 @@ int main(int argc, char **argv) {
   clock_t t0 = clock();
   phase1_gat_full(in_q20, out_q20, width, height, &gat_p,
                   &unified_sigma_q, sigma_gat_ch);
+  /* Noise-free-input guard.  On a flat / noise-free frame (constant images,
+   * synthetic tests) the measured GAT-domain residual collapses toward 0;
+   * correctly-modeled real noise measures ~1.0 here by construction, and even
+   * ultra-clean real captures stay orders of magnitude above this floor.
+   * Normalizing by such a sigma (1/sigma up to the fxp_recip cap) drives the
+   * Q11.20 pipeline out of range and used to collapse the output to all-zero.
+   * There is nothing to denoise -> return the input unchanged.
+   * ノイズが測定できない入力（unified_sigma ≈ 0）は identity で返す。
+   * 実シーンの GAT 後残差は設計上 ~1.0 なのでベンチ結果には影響しない。 */
+  if(unified_sigma_q < fxp_from_float(0.01f)) {
+    fprintf(stderr, "  Phase 1: no measurable noise (unified_sigma=%.4f < 0.01)"
+                    " -> identity output\n", fxp_to_float(unified_sigma_q));
+    FILE *fid = fopen(output_file, "wb");
+    if(!fid) { fprintf(stderr, "Cannot open %s for writing\n", output_file); return 1; }
+    size_t nw_id = fwrite(in_f32, sizeof(float), npixels, fid);
+    fclose(fid);
+    free(in_f32); free(out_f32); free(in_q20); free(out_q20);
+    if(nw_id != npixels) { fprintf(stderr, "Short write to %s\n", output_file); return 1; }
+    return 0;
+  }
   double elapsed = (double)(clock() - t0) / CLOCKS_PER_SEC;
   if(g_verbose) fprintf(stderr, "  Phase 1 (%.3f s): unified_sigma=%.4f (per-ch: %.4f %.4f %.4f %.4f)\n",
           elapsed, fxp_to_float(unified_sigma_q),
@@ -3021,9 +3064,10 @@ int main(int argc, char **argv) {
 
   FILE *fout = fopen(output_file, "wb");
   if(!fout) { fprintf(stderr, "Cannot open %s for writing\n", output_file); return 1; }
-  fwrite(out_f32, sizeof(float), npixels, fout);
+  size_t nwrote = fwrite(out_f32, sizeof(float), npixels, fout);
   fclose(fout);
-  if(g_verbose) fprintf(stderr, "  Output: %s (Phase 1 GAT-domain, clamped /4 for viewing)\n",
+  if(nwrote != npixels) { fprintf(stderr, "Short write to %s\n", output_file); return 1; }
+  if(g_verbose) fprintf(stderr, "  Output: %s (Phase 10 result, raw [0,1])\n",
           output_file);
 
 #ifdef GALOSH_OPCOUNT

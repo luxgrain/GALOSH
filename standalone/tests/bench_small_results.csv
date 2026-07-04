@@ -1,6 +1,6 @@
 method,psnr,gain_db,time_s,improves
 noisy_raw,23.1,,0.0,
 noisy_yuv,23.1,,0.0,
-galosh_raw_fp32,38.97,15.87,0.09,True
-galosh_raw_int32,38.46,15.36,0.618,True
-galosh_yuv_fp32,30.72,7.62,0.116,True
+galosh_raw_fp32,38.97,15.87,0.094,True
+galosh_raw_int32,38.46,15.36,0.61,True
+galosh_yuv_fp32,30.72,7.62,0.111,True

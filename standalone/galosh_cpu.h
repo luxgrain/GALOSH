@@ -1538,8 +1538,12 @@ static void galosh_pass2(const float *restrict noisy,
                          const int stride);
 /* libm has double j1(double); UCRT64 mingw lacks the float variant j1f.
  * The jinc kernel evaluates at small x values where double precision is
- * well within float range, so casting is harmless. */
+ * well within float range, so casting is harmless.  MinGW's math.h already
+ * declares j1 (dllimport) — re-declaring it there only produced a warning,
+ * so the fallback prototype is for strict-ISO toolchains that hide POSIX j1. */
+#if !defined(__MINGW32__) && !defined(__MINGW64__)
 extern double j1(double x);
+#endif
 
 /* ================================================================
  * Bilinear plane rotation -- helper for multi-orientation WHT averaging.

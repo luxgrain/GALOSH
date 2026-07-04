@@ -51,14 +51,14 @@ domains: raw Bayer mosaics and sRGB/YUV images. On four real-noise benchmarks
 blind, training-free method --- surpassing BM3D- and NLM-family baselines even
 when those are given an oracle noise level --- and approaches trained networks
 on raw data while remaining below in-domain trained networks at high ISO in
-sRGB. Being search-free makes it fast: one to two orders of magnitude
-faster than the DL baselines on the same GPU at full benchmark size (0.76\,s
-per 16-MP raw frame vs.\ 5.6\,s; 0.87\,s per 15.8-MP sRGB frame vs.\
-13.5--565\,s), and the only strong method in the comparison that also runs
-practically on plain CPUs.
+sRGB. Being search-free makes it fast: $7\times$--$650\times$ faster than
+the DL baselines on the same GPU at full benchmark size, depending on domain
+(0.76\,s per 16-MP raw frame vs.\ 5.6\,s; 0.87\,s per 15.8-MP sRGB frame
+vs.\ 13.5--565\,s), and the only strong method in the comparison that also
+runs practically on plain CPUs.
 The fixed, data-independent structure is designed to map naturally onto
 fixed-point and streaming hardware, which we support with an operation-count
-analysis and a bit-exact INT16 fixed-point realization.
+analysis and a working INT16 fixed-point realization.
 \end{abstract}
 
 % ----------------------------------------------------------------- Intro
@@ -104,9 +104,9 @@ blind training-free method in both domains --- including against
 oracle-$\sigma$ classical baselines --- with an honest accounting of where
 trained networks remain ahead (Sec.~\ref{sec:results}).
 \item A speed study showing the practical value of search-freeness:
-one to two orders of magnitude faster than the DL baselines on one GPU,
-CPU-practical, and,
-by an operation-count analysis plus a bit-exact INT16 realization, well suited
+$7\times$--$650\times$ faster than the DL baselines on one GPU (domain-%
+dependent), CPU-practical, and,
+by an operation-count analysis plus a working INT16 realization, well suited
 to fixed-point streaming implementations (Sec.~\ref{sec:speed},~\ref{sec:map}).
 \end{itemize}
 
@@ -330,12 +330,14 @@ operations per pixel, resolution-independent ($3391$ at 1080p vs.\ $3370$ at
 learned baselines, with local, data-independent access patterns throughout.
 
 \paragraph{Fixed-point realization.} The shrinkage core admits a pure INT16
-storage / INT32 accumulate fixed-point form; our CPU reference and GPU
-streaming implementation of it agree bit-exactly over the full pipeline, and
-its quality matches the FP32 reference to within 0.1--0.7\,dB
-(Tables~\ref{tab:sidd_medium},~\ref{tab:rawnind}). No 64-bit arithmetic is
-required anywhere in the shipping path (wide intermediates use paired-32-bit
-patterns).
+storage / INT32 accumulate fixed-point form. Its GPU streaming implementation
+matches the INT32 CPU reference to near-lossless end-to-end accuracy
+($\approx$64\,dB PSNR on full frames; one Phase-0 guard is not yet mirrored
+between the two, so they are close but not bit-identical), and its quality ---
+measured directly on the GPU INT16 output --- matches the FP32 reference to
+within 0.1--0.7\,dB (Tables~\ref{tab:sidd_medium},~\ref{tab:rawnind}). No
+64-bit arithmetic is required anywhere in the shipping path (wide
+intermediates use paired-32-bit patterns).
 
 \paragraph{Feasibility, not product.} By a MAC-array throughput model,
 $0.5$--$1$\,TMAC/s of fixed-function compute --- modest by current ISP
@@ -367,8 +369,8 @@ regression --- retains and in fact extends the classical family's quality
 (beating it even at oracle noise levels) while making the computation local,
 regular, data-independent, and therefore parallel and fast. One training-free
 core handles both raw Bayer mosaics and rendered sRGB images, runs
-one to two orders of magnitude faster than learned baselines on a GPU,
-remains practical on
+$7\times$--$650\times$ faster than learned baselines on a GPU (domain-%
+dependent), remains practical on
 CPUs, and is designed to map naturally onto fixed-point streaming hardware.
 
 \begin{thebibliography}{19}\small

@@ -2276,9 +2276,10 @@ int main(int argc, char **argv)
   }
   (void)strength; /* strength is absorbed into luma_str/chroma_str */
 
-  if(width <= 0 || height <= 0)
+  if(width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
+     (size_t)width > SIZE_MAX / sizeof(float) / (size_t)height)
   {
-    fprintf(stderr, "Invalid dimensions: %dx%d\n", width, height);
+    fprintf(stderr, "Invalid dimensions: %dx%d (need positive, even W/H)\n", width, height);
     return 1;
   }
 
@@ -2294,15 +2295,26 @@ int main(int argc, char **argv)
   const size_t npixels = (size_t)width * height;
   float *in = dt_alloc_align_float(npixels);
   float *out = dt_alloc_align_float(npixels);
-  if(!in || !out) { fprintf(stderr, "Memory allocation failed\n"); return 1; }
+  if(!in || !out)
+  {
+    fprintf(stderr, "Memory allocation failed\n");
+    dt_free_align(in); dt_free_align(out);
+    return 1;
+  }
 
   FILE *fin = fopen(input_file, "rb");
-  if(!fin) { fprintf(stderr, "Cannot open %s\n", input_file); return 1; }
+  if(!fin)
+  {
+    fprintf(stderr, "Cannot open %s\n", input_file);
+    dt_free_align(in); dt_free_align(out);
+    return 1;
+  }
   size_t nread = fread(in, sizeof(float), npixels, fin);
   fclose(fin);
   if(nread != npixels)
   {
     fprintf(stderr, "Read %zu floats, expected %zu\n", nread, npixels);
+    dt_free_align(in); dt_free_align(out);
     return 1;
   }
 
@@ -2328,8 +2340,9 @@ int main(int argc, char **argv)
   /* Write output */
   FILE *fout = fopen(output_file, "wb");
   if(!fout) { fprintf(stderr, "Cannot open %s for writing\n", output_file); return 1; }
-  fwrite(out, sizeof(float), npixels, fout);
+  size_t nwrote = fwrite(out, sizeof(float), npixels, fout);
   fclose(fout);
+  if(nwrote != npixels) { fprintf(stderr, "Short write to %s\n", output_file); return 1; }
 
   fprintf(stderr, "  Output: %s\n", output_file);
 

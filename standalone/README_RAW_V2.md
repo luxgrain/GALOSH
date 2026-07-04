@@ -13,11 +13,13 @@ No block-matching, no sorting, no training, no noise profile.
 | **CPU FP32** (o) | `galosh_raw_cpu.c` | `galosh_raw_cpu.exe` | reference / offline quality |
 | **CPU INT32** (r32) | `galosh_raw_cpu_int.c` | `galosh_raw_cpu_int.exe` | Q11.20 fixed-point reference (FP-free) |
 | **GPU FP32** (o32) | `galosh_raw_gpu.c` + `galosh.cl` | `galosh_raw_gpu.exe` | real-time (commodity GPU) |
-| **GPU INT16** (i16) | `galosh_int_*.{clh,cl}` | `galosh_int_pipe_test.exe` | bit-exact vs r32; **ISP-embeddable by design** (32 KB LDS, streaming, no FP) |
+| **GPU INT16** (i16) | `galosh_int_*.{clh,cl}` | `galosh_int_pipe_test.exe` | near-lossless vs r32 (~64 dB end-to-end); fixed-point streaming **by design** (32 KB LDS, no FP) |
 
-INT16 (i16) is bit-exact to INT32 (r32); both are −0.37 dB vs FP32 (essentially
-equivalent). The INT16 design is the silicon-embeddable evidence (not its GPU
-speed, which carries paired-int32 emulation overhead).
+INT16 (i16) matches INT32 (r32) to near-lossless end-to-end accuracy (~64 dB
+PSNR on full frames; one Phase-0 guard is not yet mirrored on the GPU, so the
+two are close but not bit-identical); both are ~-0.4 dB vs FP32 (essentially
+equivalent quality). The INT16 design supports the fixed-point mapping claim
+(not its GPU speed, which carries paired-int32 emulation overhead).
 
 ## Build
 

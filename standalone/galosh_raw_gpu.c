@@ -90,11 +90,16 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
 
     /* --- Read input --- */
     float *raw = alloc_float(npix);
+    if(!raw) { fprintf(stderr, "Memory allocation failed (%zu px)\n", npix); return 1; }
     {
         FILE *f = fopen(input_file, "rb");
-        if(!f) { fprintf(stderr, "Cannot open %s\n", input_file); return 1; }
-        fread(raw, sizeof(float), npix, f);
+        if(!f) { fprintf(stderr, "Cannot open %s\n", input_file); free_aligned(raw); return 1; }
+        size_t nrd = fread(raw, sizeof(float), npix, f);
         fclose(f);
+        if(nrd != npix) {
+            fprintf(stderr, "Read %zu floats, expected %zu\n", nrd, npix);
+            free_aligned(raw); return 1;
+        }
     }
 
     /* ================================================================
@@ -1977,8 +1982,9 @@ download_phase:
     {
         FILE *f = fopen(output_file, "wb");
         if(!f) { fprintf(stderr, "Cannot write %s\n", output_file); goto cl_cleanup; }
-        fwrite(raw, sizeof(float), npix, f);
+        size_t nwr = fwrite(raw, sizeof(float), npix, f);
         fclose(f);
+        if(nwr != npix) { fprintf(stderr, "Short write to %s\n", output_file); goto cl_cleanup; }
     }
 
     double t_total = get_time_ms() - t_total_start;
@@ -2245,6 +2251,12 @@ int main(int argc, char **argv)
     const float chroma_str  = (float)atof(argv[7]);
     const float alpha       = (float)atof(argv[8]);
     const float sigma_sq    = (float)atof(argv[9]);
+
+    if(width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
+       (size_t)width > SIZE_MAX / sizeof(float) / (size_t)height) {
+        fprintf(stderr, "Invalid dimensions %dx%d (need positive, even W/H)\n", width, height);
+        return 1;
+    }
 
     /* Optional positional [cl_dev]. */
     int dev = 0;

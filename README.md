@@ -15,9 +15,9 @@ redesigned for modern parallel hardware:
   fixed computation graph runs for every pixel of every image.
 - **Multi-domain** — one shared core serves two thin front-ends:
   **GALOSH-RAW** (Bayer mosaic) and **GALOSH-YUV/RGB** (rendered sRGB images).
-- **Fast** — the fixed structure parallelizes trivially: roughly one to two
-  orders of magnitude faster than trained-network baselines on the same GPU at
-  full benchmark size, and practical on plain CPUs.
+- **Fast** — the fixed structure parallelizes trivially: 7x-650x faster than
+  trained-network baselines on the same GPU at full benchmark size (the ratio
+  depends on the domain and baseline), and practical on plain CPUs.
 
 On SIDD Medium and RawNIND (raw and sRGB, all methods blind), GALOSH is
 consistently the strongest blind, training-free method — ahead of the
@@ -61,8 +61,9 @@ regression at full resolution; output clamped to [0,1]. Input = sRGB float32
 | `standalone/` | **Canonical reference implementation** (CLI / exe) — the basis for the paper and all benchmarks |
 | `standalone/tests/` | Smoke tests + dataset-free micro-benchmark |
 | `benchmark/scripts/` | Full benchmark harness (SIDD / RawNIND, raw + sRGB) |
-| `benchmark/raw_v2_results/` | Paper sources (tables, figures, manuscript) |
-| `_ARCHIVE/`, `*_hp.*` | Archived variants and **diagnostic probes** — see below |
+| `benchmark/results_*/` | Benchmark outputs (JSON metrics, PNG artifacts; regenerable, not committed) |
+| `docs/paper/` | Manuscript sources (LaTeX, tables, figures) |
+| `*_hp.*` | **Diagnostic probes** — see below |
 
 **Canonical vs. archived vs. diagnostic.** The canonical pipeline is the code
 in `standalone/` listed below. Superseded experimental variants are kept (not
@@ -93,6 +94,20 @@ make bench-small  # seeded synthetic micro-benchmark -> tests/bench_small_result
 make check-no-int64
 # make is optional: ./build.sh {all|gpu|test|bench-small|check-no-int64} does the same
 ```
+
+**Windows (MSYS2), exact commands.** A plain `bash` from PowerShell/cmd may
+resolve to the WSL launcher and fail when no distro is installed — invoke the
+MSYS2 bash explicitly, put the ucrt64 toolchain on `PATH`, and point the test
+harness at a Python that has numpy (the harness reads `PYTHON`, defaulting to
+`python`):
+
+```powershell
+C:/msys64/usr/bin/bash.exe -lc "export PATH=/usr/bin:/c/msys64/ucrt64/bin:$PATH; export PYTHON='<python-with-numpy>'; cd /c/<path-to>/GALOSH/standalone; bash build.sh all && bash build.sh gpu && bash tests/run_smoke.sh && bash tests/run_bench_small.sh && bash check_no_int64.sh"
+```
+
+If MSYS2's own Python lacks numpy, either `pacman -S
+mingw-w64-ucrt-x86_64-python-numpy` or set `PYTHON` to any CPython 3.x that
+has it.
 
 The `.cl` kernel files must sit next to the executables (they do in-tree);
 the loaders resolve them relative to the executable, so the CLI can be invoked
@@ -164,8 +179,10 @@ GALOSH's search-free structure is **designed to map naturally onto fixed-point
 and streaming implementations**: the computation graph is fixed, per-pixel cost
 is constant (~3.4k MAC/pixel, resolution-independent), and on-chip state is
 bounded by line buffers. Two measured facts back this up: a pure
-INT16-storage / INT32-accumulate realization exists whose CPU reference and
-GPU streaming implementation agree bit-exactly, and the shipping INT path
+INT16-storage / INT32-accumulate realization exists whose GPU streaming
+implementation matches the INT32 CPU reference to near-lossless end-to-end
+accuracy (~64 dB PSNR on full frames; one Phase-0 guard is not yet mirrored,
+so the two are close but not bit-identical), and the shipping INT path
 contains **no native 64-bit arithmetic** (`make check-no-int64`; wide
 intermediates use paired-int32 / split-multiply patterns; profiling-only
 exemptions are marked `no64-exempt` in-source).

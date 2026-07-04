@@ -1,6 +1,7 @@
-"""Static consistency check for the paper sources (no LaTeX toolchain needed):
-\\input files exist, \\ref targets defined, \\cite keys present, figures exist,
-environments balanced. Run from benchmark/raw_v2_results/."""
+"""STRUCTURAL LaTeX check for the paper sources (no LaTeX toolchain needed).
+Scope: \\input files exist, \\ref targets defined, \\cite keys present, figures
+exist, environments balanced. It does NOT verify table numbers against the
+benchmark JSONs -- use verify_table_numbers.py for that. Run from docs/paper/."""
 import re
 import sys
 from pathlib import Path

@@ -715,6 +715,13 @@ int main(int argc, char **argv)
   const float alpha_cli  = (argc > 7) ? (float)atof(argv[7]) : 0.0f;
   const float sigma_cli  = (argc > 8) ? (float)atof(argv[8]) : 0.0f;
 
+  if(width <= 0 || height <= 0 ||
+     (size_t)width > SIZE_MAX / (3 * sizeof(float)) / (size_t)height)
+  {
+    fprintf(stderr, "invalid dimensions %dx%d\n", width, height);
+    return 1;
+  }
+
   init_galosh_kaiser();
 
   const size_t npx = (size_t)width * (size_t)height;
@@ -722,7 +729,12 @@ int main(int argc, char **argv)
 
   float *in_buf  = dt_alloc_align_float(npx * 3);
   float *out_buf = dt_alloc_align_float(npx * 3);
-  if(!in_buf || !out_buf) { fprintf(stderr, "alloc failed\n"); return 1; }
+  if(!in_buf || !out_buf)
+  {
+    fprintf(stderr, "alloc failed\n");
+    dt_free_align(in_buf); dt_free_align(out_buf);
+    return 1;
+  }
 
   FILE *fi = fopen(in_path, "rb");
   if(!fi) { fprintf(stderr, "cannot open %s\n", in_path); return 1; }
@@ -742,8 +754,9 @@ int main(int argc, char **argv)
 
   FILE *fo = fopen(out_path, "wb");
   if(!fo) { fprintf(stderr, "cannot open %s\n", out_path); return 1; }
-  fwrite(out_buf, 1, nbytes, fo);
+  const size_t wr = fwrite(out_buf, 1, nbytes, fo);
   fclose(fo);
+  if(wr != nbytes) { fprintf(stderr, "short write (%zu of %zu)\n", wr, nbytes); return 1; }
 
   dt_free_align(in_buf);
   dt_free_align(out_buf);

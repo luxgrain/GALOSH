@@ -26,7 +26,7 @@ run_case() {  # run_case <label> <exe+args-template> <W> <H> <C> <case> [expect-
     echo "FAIL($label): nonzero exit — tail:"; tail -2 "$T/${label}.log" | sed 's/^/    /'
     fails=$((fails+1)); return
   fi
-  if "$PY" tests/_synth.py check "$op" "$w" "$h" "$c" | sed "s/^/  [$label]/"; then
+  if "$PY" tests/_synth.py check "$op" "$w" "$h" "$c" "$ip" | sed "s/^/  [$label]/"; then
     echo "OK  ($label)"
   else
     echo "FAIL($label): output check"; fails=$((fails+1))
@@ -44,6 +44,8 @@ echo "=== RAW INT32 r32 CPU (galosh_raw_cpu_int.exe) ==="
 for cas in constant gradient-pg near-black; do
   run_case "raw_r32_$cas" './galosh_raw_cpu_int.exe "$ip" "$op" 128 96 galosh 1.0 1.0 1.0 0 0' 128 96 1 "$cas"
 done
+
+run_case "raw_r32_odd"   './galosh_raw_cpu_int.exe "$ip" "$op" 65 63 galosh 1.0 1.0 1.0 0 0' 65 63 1 gradient-pg may-fail
 
 echo "=== YUV/RGB FP32 CPU (galosh_yuv_cpu.exe) ==="
 for cas in constant random high-noise near-black gradient-pg; do
@@ -63,7 +65,7 @@ run_gpu_case() {  # run_gpu_case <label> <exe> <extra-args-before-dev> <W> <H> <
   for dev in 0 1 2 3; do
     rm -f "$op"
     if eval "./$exe \"\$ip\" \"\$op\" $w $h $args $dev" > "$T/${label}.log" 2>&1 && [ -f "$op" ]; then
-      if "$PY" tests/_synth.py check "$op" "$w" "$h" "$c" | sed "s/^/  [$label dev$dev]/"; then
+      if "$PY" tests/_synth.py check "$op" "$w" "$h" "$c" "$ip" | sed "s/^/  [$label dev$dev]/"; then
         echo "OK  ($label, device $dev)"; return
       fi
     fi

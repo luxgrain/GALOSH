@@ -19,7 +19,9 @@ weights. Bold / \underline{underline} = best / 2nd-best among the blind,
 training-free methods; the trained DL are an upper reference (NAFNet and
 Restormer are trained \emph{on} SIDD).}
 \label{tab:sidd_srgb}
-\setlength{\tabcolsep}{3.2pt}
+\setlength{\tabcolsep}{2pt}
+\footnotesize
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{l ccccc rr}
 \toprule
  & & & & & & \multicolumn{2}{c}{Time\,(s)}\\
@@ -29,17 +31,17 @@ Method & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & DISTS$\downarrow$
 Noisy input                & 25.69 & 0.424 & 0.790 & 0.380 & 5.86 & --- & ---\\
 \addlinespace[2pt]
 \multicolumn{8}{l}{\textit{Blind, training-free}}\\
-\quad \textbf{GALOSH-YUV (ours)} & \textbf{35.01} & \textbf{0.838} & \textbf{0.314} & \textbf{0.243} & \underline{5.41} & 2.50 & 0.87\\
-\quad CBM3D                & 27.09 & 0.493 & 0.721 & 0.349 & 5.52 & 118.6$^{1t}$ & ---\\
+\quad \textbf{GALOSH-YUV (ours)} & \textbf{35.01} & \textbf{0.837} & \textbf{0.314} & \textbf{0.243} & \underline{5.41} & 2.50 & 0.87\\
+\quad CBM3D                & 27.09 & 0.492 & 0.721 & 0.349 & 5.52 & 118.6$^{1t}$ & ---\\
 \quad Color-NLM            & \underline{28.92} & \underline{0.656} & \underline{0.534} & \underline{0.290} & \textbf{4.57} & 2.79 & ---\\
 \quad Guided filter        & 27.43 & 0.523 & 0.687 & 0.349 & 5.79 & 0.71 & ---\\
 \midrule
 \multicolumn{8}{l}{\textit{Trained DL (reference)}}\\
-\quad NAFNet-SIDD          & 41.94 & 0.942 & 0.168 & 0.154 & 7.69 & --- & 13.5\\
+\quad NAFNet-SIDD          & 41.94 & 0.942 & 0.167 & 0.154 & 7.69 & --- & 13.5\\
 \quad Restormer-SIDD       & 40.94 & 0.935 & 0.181 & 0.175 & 8.05 & --- & 565$^{v}$\\
 \quad SCUNet-real          & 36.09 & 0.902 & 0.252 & 0.234 & 9.30 & --- & 17.6\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 
 \vspace{2pt}
 {\footnotesize Per-image times for the full 15.8-MP frame, split by platform;
@@ -61,7 +63,9 @@ Table~\ref{tab:sidd_srgb}. This set is dominated by low-ISO scenes (684/1493
 below ISO\,2000), which compresses the aggregate scores toward the noisy input
 --- see the per-ISO breakdown in Table~\ref{tab:rawnind_srgb_iso}.}
 \label{tab:rawnind_srgb}
-\setlength{\tabcolsep}{3.2pt}
+\setlength{\tabcolsep}{2pt}
+\footnotesize
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{l ccccc rr}
 \toprule
  & & & & & & \multicolumn{2}{c}{Time\,(s)}\\
@@ -81,7 +85,7 @@ Noisy input                & 22.13 & 0.662 & 0.479 & 0.253 & 8.58 & --- & ---\\
 \quad Restormer-SIDD       & 23.63 & 0.873 & 0.207 & 0.206 & 9.46 & --- & 0.35\\
 \quad SCUNet-real          & 23.42 & 0.861 & 0.250 & 0.247 & 10.35 & --- & 0.14\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 
 \vspace{2pt}
 {\footnotesize Platform split and footnotes as in Table~\ref{tab:sidd_srgb}
@@ -101,6 +105,7 @@ the trained DL are moderately ahead of GALOSH. We report this breakdown because
 the aggregate of Table~\ref{tab:rawnind_srgb} hides both effects.}
 \label{tab:rawnind_srgb_iso}
 \setlength{\tabcolsep}{5pt}
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{l cccc}
 \toprule
  & ISO$<$400 & 400--2k & 2k--12.8k & $\geq$12.8k\\
@@ -115,10 +120,11 @@ NAFNet-SIDD      & 19.97$^{\dagger}$ & 24.44 & 22.67 & 22.56\\
 Restormer-SIDD   & 23.68 & 25.36 & 22.77 & 22.78\\
 SCUNet-real      & 23.52 & 25.26 & 22.62 & 22.36\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 
 \vspace{2pt}
 {\footnotesize Bold = best among the blind, training-free methods.
 $^{\dagger}$the near-black divergence cases (Table~\ref{tab:rawnind_srgb})
-fall in this band.}
+mostly fall in this band (29 of 37; the remaining 8 are in the 400--2k band,
+mildly depressing that entry as well).}
 \end{table}

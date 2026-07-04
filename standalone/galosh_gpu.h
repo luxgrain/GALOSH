@@ -48,7 +48,11 @@ static double get_time_ms(void) {
 }
 #endif
 
-/* OpenCL */
+/* OpenCL — target 1.2 (clCreateCommandQueue is core there, so no
+ * deprecation warnings from the 3.0 headers). */
+#ifndef CL_TARGET_OPENCL_VERSION
+#define CL_TARGET_OPENCL_VERSION 120
+#endif
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
 #else
@@ -216,11 +220,13 @@ static char *load_kernel_source(const char *filename, size_t *out_len) {
         f = fopen(alt, "rb");
         if(!f) { fprintf(stderr, "Cannot open %s (also tried %s)\n", filename, alt); return NULL; }
     }
-    fseek(f, 0, SEEK_END);
-    size_t len = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if(fseek(f, 0, SEEK_END) != 0) { fclose(f); fprintf(stderr, "seek failed: %s\n", filename); return NULL; }
+    long flen = ftell(f);
+    if(flen < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); fprintf(stderr, "tell/seek failed: %s\n", filename); return NULL; }
+    size_t len = (size_t)flen;
     char *src = (char *)malloc(len + 1);
-    fread(src, 1, len, f);
+    if(!src) { fclose(f); fprintf(stderr, "out of memory loading %s (%zu bytes)\n", filename, len); return NULL; }
+    if(fread(src, 1, len, f) != len) { fclose(f); free(src); fprintf(stderr, "short read: %s\n", filename); return NULL; }
     src[len] = 0;
     fclose(f);
     if(out_len) *out_len = len;

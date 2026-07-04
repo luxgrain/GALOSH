@@ -14,7 +14,9 @@ raw 領域ブラインド・デノイジング。全手法が \emph{blind}（ク
 太字 / \underline{下線} = blind・training-free 手法中の最良 / 2位。
 $\uparrow$: 高いほど良い、$\downarrow$: 低いほど良い。}
 \label{tab:sidd_medium}
-\setlength{\tabcolsep}{3.4pt}
+\setlength{\tabcolsep}{2pt}
+\footnotesize
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{l ccccc rr}
 \toprule
  & & & & & & \multicolumn{2}{c}{時間\,(s)}\\
@@ -25,7 +27,8 @@ $\uparrow$: 高いほど良い、$\downarrow$: 低いほど良い。}
 \quad GALOSH FP32          & \textbf{48.13} & \textbf{0.9883} & \textbf{0.2030} & \textbf{0.1690} & 8.62 & 12.6 & 0.76\\
 \quad GALOSH INT16\,$^{\dagger}$ & \underline{47.43} & \underline{0.9881} & \underline{0.2030} & \underline{0.1694} & \underline{8.62} & 103.6$^{\dagger}$ & 2.7\\
 % GALOSH 数値 = canonical GPU パイプライン（jinc アンチリンギング）、SIDD-Medium 全80枚:
-% FP32 = o32 GPU、INT16 = i16 GPU（lf=5 cf=9、r32 CPU 参照に対し zero-loss）。
+% FP32 = o32 GPU、INT16 = i16 GPU（lf=5 cf=9。r32 CPU 参照に対し near-lossless
+% ~64 dB end-to-end — Phase-0 ガード 1 箇所が GPU 未ミラー）。
 % galosh_fp32 + vst_galosh は 2026-07-02 に GPU exe で再検証（_metrics_revst_gpu.json、失敗0）。
 % GPU 時間: fp32/vst = 同一セッションの専用非競合計測、int16 = i16 campaign 平均。
 \addlinespace[2pt]
@@ -41,7 +44,7 @@ $\uparrow$: 高いほど良い、$\downarrow$: 低いほど良い。}
 \multicolumn{8}{l}{\textit{学習済み DL（上限参照、blind ではない）}}\\
 \quad Blind2Unblind        & 49.07 & 0.9924 & 0.1169 & 0.1281 & 9.43 & --- & 5.6\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 
 \vspace{2pt}
 {\footnotesize 画像あたりのフルサイズ時間をプラットフォーム別の列に分離
@@ -49,9 +52,10 @@ $\uparrow$: 高いほど良い、$\downarrow$: 低いほど良い。}
 プラットフォームでは未計測（BM3D に GPU 移植はなく、Blind2Unblind は CUDA
 必須）。NLM-CFA：GPU = CUDA 実装、CPU = 同一 patch/search パラメータの skimage
 参照実装（フルフレーム 12 枚の平均；RawNIND の CPU 値は 100 シーン標本の中央値）。GALOSH は両列に値を持つ
---- クロスプラットフォームの基準点である。$^{\dagger}$INT16 の品質は bit-exact
-な固定小数点パイプラインの値。CPU 時間は正確性優先の INT32 参照実装
-（速度未最適化）、GPU 時間はストリーミング i16 実装（\ref{sec:map}節参照）。}
+--- クロスプラットフォームの基準点である。$^{\dagger}$INT16 の品質はストリーミング
+INT16 GPU パイプラインで直接測定した値。CPU 時間は正確性優先の INT32 参照実装
+（INT16 出力に対し near-lossless、速度未最適化）、GPU 時間はストリーミング
+i16 実装（\ref{sec:map}節参照）。}
 \end{table}
 
 % ---------------------------------------------------------------- RawNIND
@@ -61,7 +65,9 @@ $\uparrow$: 高いほど良い、$\downarrow$: 低いほど良い。}
 おける raw 領域ブラインド・デノイジング。プロトコルと強調は
 表~\ref{tab:sidd_medium} と同じ。}
 \label{tab:rawnind}
-\setlength{\tabcolsep}{3.4pt}
+\setlength{\tabcolsep}{2pt}
+\footnotesize
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{l ccccc rr}
 \toprule
  & & & & & & \multicolumn{2}{c}{時間\,(s)}\\
@@ -87,7 +93,7 @@ $\uparrow$: 高いほど良い、$\downarrow$: 低いほど良い。}
 \multicolumn{8}{l}{\textit{学習済み DL（上限参照、blind ではない）}}\\
 \quad Blind2Unblind        & 30.68 & 0.7932 & 0.2215 & 0.2018 & 8.93 & --- & ---\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 
 \vspace{2pt}
 {\footnotesize プラットフォーム分離は表~\ref{tab:sidd_medium} と同じ。$512^2$
@@ -106,6 +112,7 @@ CPU（1 コア）と GPU（NVIDIA RTX 4070\,Ti）。速度の\emph{主比較}は
 $\sim$90\,ms は初回のみで償却）、他は end-to-end。}
 \label{tab:speed}
 \setlength{\tabcolsep}{8pt}
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{l rr}
 \toprule
 手法 & CPU (1 コア) & GPU\\
@@ -120,14 +127,14 @@ $\sim$90\,ms は初回のみで償却）、他は end-to-end。}
 \multicolumn{3}{l}{\textit{学習済み DL}}\\
 \quad Blind2Unblind                & ---$^{\dagger}$ & 0.74 s\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 
 \vspace{2pt}
 {\footnotesize GALOSH FP32（GPU）は 4K で 46\,ms、5K で 72\,ms までスケールし
 --- 同一 GPU 上で NLM-CFA の約 23$\times$、Blind2Unblind の約 40$\times$ ---
 CPU でも古典的ベースラインの $2$--$5\times$ 高速である（1.38\,s 対
 3.21/6.33\,s）：両プラットフォームで最速である。$^{\dagger}$Blind2Unblind の
-参照実装は CUDA 必須で CPU では動作しない。bit-exact な INT16 固定小数点版
+参照実装は CUDA 必須で CPU では動作しない。INT16 固定小数点版
 （\ref{sec:map}節）は CPU/GPU スループットではなく固定小数点ストリーミング
 ハードウェアへの写像を狙うため、速度エントリには含めない。}
 \end{table}
