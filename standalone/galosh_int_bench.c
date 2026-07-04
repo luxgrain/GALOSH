@@ -459,7 +459,7 @@ int main(int argc, char **argv) {
   printf("one-time bld : %7.2f ms (program build, %s)\n", t_build, built ? "from cache" : "from source");
   printf("per-frame    : median %7.3f ms | min %7.3f ms | mean %7.3f ms\n", tmed, tmin, tavg);
   printf("throughput   : %7.2f fps (median)  |  %.2f MP/s\n", 1000.0 / tmed, npix / 1e6 * (1000.0 / tmed));
-  printf("realtime     : 4K60 budget=16.67 ms -> %s ;  30fps budget=33.3 ms -> %s\n",
+  printf("budget check : 16.67 ms -> %s ;  33.3 ms -> %s\n",
          tmed <= 16.67 ? "PASS" : "miss", tmed <= 33.3 ? "PASS" : "miss");
 
   /* ---- one-shot per-group breakdown (clFinish-bounded; attributes the two

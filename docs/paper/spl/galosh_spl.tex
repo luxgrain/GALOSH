@@ -18,9 +18,7 @@ Parallel-Friendly Local Shrinkage}
 \thanks{A U.S. provisional patent application covering the methods described
 herein has been filed (App.\ No.\ 64/058,343, 6 May 2026).}%
 \thanks{Code and reproducible benchmarks:
-\texttt{https://github.com/luxgrain/GALOSH}. An extended version with the full
-per-dataset tables, per-ISO breakdowns, and the speed study is available as an
-arXiv preprint~\cite{galosharxiv}.}}
+\texttt{https://github.com/luxgrain/GALOSH}.}}
 
 \maketitle
 
@@ -40,12 +38,12 @@ methods --- surpassing BM3D- and NLM-family baselines even given an oracle
 noise level --- while running $7\times$--$650\times$ faster than trained
 baselines on the same GPU and practically on plain CPUs. The fixed structure
 is designed to map onto fixed-point streaming hardware, supported by a working
-INT16 realization.
+software INT16 fixed-point realization.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Image denoising, blind denoising, variance stabilization, Walsh--Hadamard
-transform, fixed-point arithmetic.
+Image denoising, blind denoising, variance stabilization, raw image
+processing, fixed-point arithmetic.
 \end{IEEEkeywords}
 
 \section{Introduction}
@@ -147,7 +145,8 @@ runs blind}: no clean/noisy pairs, no per-image noise oracle; classical
 baselines estimate $\sigma$ from the input, GALOSH uses its own blind fit, and
 learned baselines use their published real-noise weights. Fidelity
 (PSNR/SSIM) is computed in each native domain and perceptual metrics
-(LPIPS~\cite{lpips}) on sRGB; on full-frame sRGB the learned baselines run
+(LPIPS~\cite{lpips}) on sRGB --- raw outputs are rendered to sRGB with the
+same per-image calibrated renderer for every method; on full-frame sRGB the learned baselines run
 tiled inference and LPIPS is the mean over the same $1024^2$ tile grid for
 every method --- a uniform protocol imposed by memory and metric limits at
 that resolution. Baselines are domain-appropriate by design: CFA-capable
@@ -187,8 +186,9 @@ Blind2Unblind & 49.07 & 0.9924 & 0.1169 & 30.68 & 0.7932 & 0.2215\\
 \begin{table}[t]
 \centering
 \caption{sRGB-domain blind denoising on SIDD Medium sRGB (80 scenes, full
-${\sim}15.8$\,MP frames). Trained networks are an upper reference (NAFNet and
-Restormer are trained \emph{on} SIDD).}
+${\sim}15.8$\,MP frames). Bold / \underline{underline} = best / 2nd-best among
+the blind, training-free methods; the trained networks are an upper reference
+(NAFNet and Restormer are trained \emph{on} SIDD).}
 \label{tab:srgb}
 \setlength{\tabcolsep}{4pt}
 \footnotesize
@@ -220,7 +220,7 @@ most of the perceptual gap on RawNIND without any training (LPIPS $0.240$
 vs.\ $0.222$). The VST-ablation row isolates the source: giving the classical
 baselines GALOSH's own variance stabilization improves them only marginally,
 so the gap is the search-free local-shrinkage architecture, not the noise
-model. We also re-ran the noisiest RawNIND subset (ISO${\geq}6400$) giving
+model. We also re-ran the noisiest RawNIND subset (ISO${\geq}6400$, $n{=}30$) giving
 CBM3D and Color-NLM three $\sigma$ sources including ground-truth-computed
 oracles; even then both remain below fully blind GALOSH --- the advantage is
 the algorithm, not the estimate.
@@ -244,9 +244,9 @@ GALOSH denoises a 16-MP raw frame in $0.76$\,s (vs.\ $5.6$\,s for
 Blind2Unblind, $7\times$) and a $15.8$-MP sRGB frame in $0.87$\,s (vs.\
 $13.5$--$565$\,s for the tested networks, $15$--$650\times$); the GPU kernel
 pipeline runs 1080p in $18.2$\,ms and 4K in $46$\,ms. On a single CPU core at
-1080p it takes $1.38$\,s vs.\ $3.21$/$6.33$\,s for NLM-CFA/BM3D-CFA --- the
-only strong method in the comparison that is fastest on both platforms
-(measurement protocol and full tables in~\cite{galosharxiv}).
+1080p it takes $1.38$\,s vs.\ $3.21$/$6.33$\,s for NLM-CFA/BM3D-CFA --- among
+the measured methods, the fastest on both platforms
+(measurement protocol and full timing tables in~\cite{galosharxiv}).
 
 \section{Parallel and Fixed-Point Mapping}
 Removing the search fixes the computation graph, so the consequences can be

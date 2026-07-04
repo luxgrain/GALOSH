@@ -153,6 +153,8 @@ def build_index():
     # published bundle has no full-res assets: strip the link and its usage hint
     out = out.replace('<a class="open" href="${im.full}" target="_blank">full‑res ↗</a>', "")
     out = out.replace(" · click tile = full-res PNG", "")
+    # the source viewer is raw-only; the published one is multi-domain
+    out = out.replace("GALOSH RAW — synchronized", "GALOSH — synchronized")
     h1_end = out.find("</h1>")
     inject = ('<div class="hint">interactive comparison viewer (raw + sRGB, both '
               'benchmarks) — <a href="https://github.com/luxgrain/GALOSH" '
