@@ -17,10 +17,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[2] / "benchmark"
-DIRS = {"sidd": ROOT / "yuv_srgb_results_full",       # full-frame run (paper table source)
-        "sidd_crop": ROOT / "yuv_srgb_results",       # legacy central-1024^2 run
-        "rawnind": ROOT / "rawnind_srgb_results"}
-OUT  = ROOT / "raw_v2_results"   # paper directory (figures live next to the .tex)
+DIRS = {"sidd": ROOT / "results_srgb_sidd_full",      # full-frame run (paper table source)
+        "sidd_crop": ROOT / "results_srgb_sidd_1024", # legacy central-1024^2 run
+        "rawnind": ROOT / "results_srgb_rawnind"}
+OUT  = ROOT.parent / "docs" / "paper"   # figures live next to the .tex
 
 COLS = [("noisy", "Noisy"), ("cbm3d", "CBM3D"), ("color_nlm", "Color-NLM"),
         ("guided", "Guided"), ("nafnet", "NAFNet-SIDD"), ("scunet", "SCUNet"),

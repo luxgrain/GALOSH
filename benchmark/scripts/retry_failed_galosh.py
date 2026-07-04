@@ -8,7 +8,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_yuv_srgb as B
 
-R = Path(__file__).resolve().parents[2] / "benchmark" / "rawnind_srgb_results"
+R = Path(__file__).resolve().parents[2] / "benchmark" / "results_srgb_rawnind"
 ND = Path("E:/img_dataset/rawnind_bench/__noisy_raw_render__")
 GD = Path("E:/img_dataset/rawnind_bench/__gt_raw_render__")
 B.TMP.mkdir(parents=True, exist_ok=True)

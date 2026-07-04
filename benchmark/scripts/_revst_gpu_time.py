@@ -61,7 +61,7 @@ def main():
                      "time_median_s": float(np.median(res[mode]["t"])),
                      "raw_psnr_mean": float(np.mean(res[mode]["p"]))}
     print(json.dumps(out, indent=1), flush=True)
-    op = Path(__file__).resolve().parents[1] / "raw_v2_results" / f"_revst_gpu_time_{a.dataset}.json"
+    op = Path(__file__).resolve().parents[1] / "results_raw" / f"_revst_gpu_time_{a.dataset}.json"
     json.dump(out, open(op, "w"), indent=1)
     print(f"saved {op}", flush=True)
 

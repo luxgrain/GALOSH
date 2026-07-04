@@ -1,0 +1,247 @@
+% ============================================================================
+% GALOSH — 日本語版原稿（2026-06-27 組み立て）
+% Self-contained: \input{galosh_raw_tables_ja.tex} / \input{galosh_isp_table_ja.tex}
+% 図 qualitative_{rawnind,sidd_medium}.png は同ディレクトリ。
+% コンパイル: lualatex galosh_raw_paper_ja.tex（LuaTeX-ja / ltjsarticle）
+%   必要パッケージ: booktabs, graphicx, hyperref, amsmath
+% ============================================================================
+\documentclass[twocolumn,10pt]{ltjsarticle}
+\usepackage[margin=18mm]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\captionsetup{font=small}
+
+\title{\textbf{GALOSH: ISP 上で動く\\ブラインド・学習不要な raw 領域デノイザ}}
+\author{Yoshiro Sato\thanks{本稿で述べる手法に関して米国仮特許を出願済み
+（出願番号 64/058,343、2026 年 5 月 6 日）。}}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ----------------------------------------------------------------- Abstract
+\begin{abstract}
+本稿では \textbf{GALOSH}（Generalized Anscombe LOcal SHrinkage）を提案する。
+これは完全に\emph{ブラインド}かつ\emph{学習不要}で、raw Bayer モザイク上で
+直接動作するデノイザである。GALOSH はノイズフレームのみから画素ごとの
+Poisson--Gauss ノイズモデルを推定し、一般化 Anscombe 変換で分散を安定化した
+うえで、stride-1 の Walsh--Hadamard 輝度/色差分解に対する局所縮小（local
+shrinkage）の単一前向きパスと、輝度ガイド付きの色差再構成によりノイズを除去
+する。学習型と異なりクリーン/ノイズ対も学習も不要であり、ブロックマッチング
+型と異なり計算はデータ非依存かつ局所的である。2 つの実ノイズ raw ベンチマーク
+（SIDD Medium 80 枚のフル解像度画像、RawNIND 1493 枚のカメラ横断クロップ）に
+おいて、GALOSH は \emph{blind・training-free} 手法中で知覚品質（LPIPS/DISTS）
+最良でありながら、比較手法中で\emph{最小}の画素あたり演算量（$3.4\text{k}$
+MAC/画素、古典的 BM3D/NLM の $3.9$--$6.4\times$ 低、学習型の $18$--$360\times$
+低）で動作する。同一アルゴリズムは bit-exact な INT16 固定小数点実装を持ち、
+データ非依存・ラインバッファ式・フレームバッファ不要であって、演算量モデル
+上は控えめな ISP MAC アレイ（$0.5$--$1$~TMAC/s）で 1080p/4K 実時間に対応し、
+FP32 GPU パイプラインは既に 1080p を 55\,fps でデノイズする。GALOSH は
+オフライン raw デノイジングの品質とオンセンサ実時間配備性の間の隔たりを埋める。
+\end{abstract}
+
+% ----------------------------------------------------------------- Intro
+\section{はじめに}
+センサ生モザイクのデノイジング（デモザイク・色処理の前段）は、ノイズがまだ
+物理的な Poisson--Gauss 形に近く下流段で相関化されていないため、カメラ
+パイプライン中で最も信号を回復できる位置である。主要な手法群は 2 つに大別
+される。\emph{古典的}推定器（BM3D~\cite{bm3d}、非局所平均~\cite{nlm}）は
+学習不要だがノイズレベル既知を仮定し、BM3D は\emph{内容依存}のブロック
+マッチングに依存するため固定遅延のハードウェア段に不向きである。\emph{学習型}
+デノイザ（Blind2Unblind~\cite{b2u} や Neighbor2Neighbor のような自己教師あり、
+あるいは教師あり CNN）は優れた品質に達するが、学習データを要し、学習時の
+センサ/ノイズに縛られ、ISP のストリーミング段に収まらない演算量（数万
+MAC/画素、マルチスケール特徴バッファ）を持つ。
+
+我々は、実用的なオンセンサ・デノイザは同時に
+(i)~\emph{ブラインド}（ノイズをフレーム自身から推定、オラクル不要）、
+(ii)~\emph{学習不要}（データ不要、センサ横断で汎化）、
+(iii)~\emph{知覚的に強い}（PSNR だけでなく LPIPS/DISTS で評価）、
+(iv)~\emph{ISP 配備可能}（低くデータ非依存な演算量、ラインバッファ、
+フレームバッファ不要）でなければならないと主張する。GALOSH はこの 4 つを
+同時に満たすよう設計されている。貢献は以下の通り。
+\begin{itemize}\itemsep2pt
+\item ノイズモデルを画像ごとに推定し局所縮小の単一パスでデノイズする、
+ブラインド・学習不要な raw Bayer パイプライン（\ref{sec:method}節）。
+\item SIDD Medium と RawNIND において、\emph{blind・training-free} 手法中で
+最先端の知覚品質を、比較手法中で最小の画素あたり演算量で達成
+（\ref{sec:results}節）。
+\item bit-exact な INT16 固定小数点実装と、控えめな固定機能アレイで 1080p/4K
+実時間を示す演算量ベースの ISP スループットモデル（動作するストリーミング
+GPU 実装が裏付け、\ref{sec:int16}節）。
+\end{itemize}
+
+% ----------------------------------------------------------------- Method
+\section{手法}\label{sec:method}
+GALOSH は Bayer フレームを 11 段（P0--P10）の単一前向きパスで処理する。全
+パラメータはノイズモデルから導出されるか固定定数であり、画像ごとの調整は無い。
+
+\paragraph{P0 --- ブラインドノイズ推定。}
+局所平均/分散のビンに対する頑健な下側包絡回帰（Foi--Alenius 型推定）により、
+ノイズフレームのみから Poisson--Gauss モデル $\operatorname{Var}[x]=\alpha\,
+\mathbb{E}[x]+\sigma^2$ を当てはめ、オラクルなしで画像ごとの $(\alpha,\sigma^2)$
+を得る。
+
+\paragraph{P1 --- 分散安定化（GAT）。}
+一般化 Anscombe 変換 $f(x)=\tfrac{2}{\alpha}\sqrt{\alpha x+\tfrac38\alpha^2+
+\sigma^2}$ により信号依存ノイズを概ね単位分散に写し、単一の大域縮小しきい値が
+どこでも妥当になるようにする。CFA チャネルごとの MAD を残差スケールに用いて
+安定化フレームを正規化する。
+
+\paragraph{P2 --- 無彩色ダーク参照。}
+CFA を考慮した反復再重み付け（IRLS）で局所無彩色フロアを推定して減算し、色差
+チャネルが輝度シェーディングを吸収するのを防ぐ。
+
+\paragraph{P3--P4 --- 輝度/色差分解。}
+\emph{stride-1・サイクルスピン}の $2{\times}2$ Walsh--Hadamard 変換により各
+Bayer クアッドを 1 枚の輝度面 $L$ と 3 枚の色差面 $C_1,C_2,C_3$ に変換する。
+CFA は色差を輝度の半分のレートでサンプルするため、色差面は半解像度で保持する
+（帯域制限に忠実で情報損失なし）。
+
+\paragraph{P5 --- 局所縮小。}
+輝度は MAD 駆動しきい値のサイクルスピン局所縮小（LOSH）でフル解像度で
+デノイズする。色差は輝度ガイド付き LOESS（次数 1 の $Y$ ガイド局所線形回帰
+＝ガイデッドフィルタ）で半解像度デノイズし、3 段のスケールピラミッドとして
+構成することで、単一の強度パラメータが詳細保持から平坦部平滑化へ滑らかに
+推移する。
+
+\paragraph{P6--P7 --- 色差再構成。}
+デノイズした半解像度色差を、輝度ガイド付き joint-bilateral EWA Jinc-Lanczos-3
+（「K16」）カーネルでフル解像度へアップサンプルする。jinc 補間がフル解像度
+輝度に対する bilateral 重みで変調され、色差エッジが交差チャネル構造事前分布を
+介して輝度エッジに揃う。
+
+\paragraph{色差レンジのロバスト性。}
+ガイデッド LOESS 回帰と jinc アップサンプリングはいずれも\emph{非有界}な
+作用素である --- 次数 1 回帰はエッジで外挿し、jinc カーネルは局所データ範囲を
+超えてリンギングし得る負のサイドローブを持つ。放置すると、この色差オーバー
+シュートがホワイトバランス利得（特に青チャネル、$\sim\!2.7\times$）で増幅され、
+高コントラスト輝度エッジで孤立したマゼンタの斑点となる。そこで再構成した各
+色差値を\emph{局所入力色差レンジ}にクランプする（「デノイザは入力に無い色を
+作ってはならない」）。これは画素の $\sim\!1.4\%$ にのみ作用し、4 つの数値精度
+すべてで同一であり、集約的な知覚品質を改善する（\ref{sec:results}節）。
+
+\paragraph{P8--P10 --- 逆変換。}
+画素ごとの逆 WHT が $L,C_1,C_2,C_3$ を再結合し、ダーク参照を復元し、逆 GAT で
+線形 raw 領域へ戻す。出力はデノイズ済み Bayer フレームで、任意のデモザイク
+/ISP 後段にそのまま渡せる。
+
+% ----------------------------------------------------------------- Experiments
+\section{実験設定}\label{sec:exp}
+\paragraph{データセット。}\textbf{SIDD Medium}~\cite{sidd} --- 80 枚のフル解像度
+（$\sim$16\,MP）実ノイズ・スマートフォン Bayer 画像。\textbf{RawNIND}~\cite{rawnind}
+--- 多数のセンサ・ISO にまたがる 1493 枚のカメラ横断 $512{\times}512$ 実ノイズ
+クロップ。
+
+\paragraph{プロトコル。}全手法を\emph{ブラインド}（クリーン/ノイズ対なし、画像
+ごとのノイズオラクルなし）かつ\emph{学習不要}で実行する。ただし Blind2Unblind は
+学習済み自己教師ありネットワークで上限参照としてのみ掲載する。忠実度
+（PSNR/SSIM）は raw Bayer 出力上で、知覚指標（LPIPS, DISTS, NIQE）は較正済み
+sRGB レンダリング上で測る（画像ごとのホワイトバランスと色行列を DNG メタ
+データから取得、エッジ考慮デモザイク）。さらに分散安定化前段を共有する
+アブレーション（VST\,+\,手法）を報告し、GALOSH のネイティブ・ブラインド推定の
+寄与を切り分ける。
+
+\paragraph{比較手法。}GALOSH（FP32 参照、および bit-exact な INT16 固定小数点
+版）、ネイティブ MAD ノイズ推定付き古典的 BM3D-CFA / NLM-CFA、それらの VST
+前段アブレーション、学習済み上限としての Blind2Unblind。
+
+% ----------------------------------------------------------------- Results
+\section{結果}\label{sec:results}
+表~\ref{tab:sidd_medium} と表~\ref{tab:rawnind} に 2 つのベンチマークを示す。
+blind・training-free 手法中で GALOSH は両データセットの知覚指標（LPIPS, DISTS）
+で最良であり、PSNR/SSIM でも競争力がある。一方、古典的ベースラインは --- 共通の
+VST 前段を与えても --- 知覚品質で大きく劣る（LPIPS $\sim\!0.27$--$0.43$ 対
+GALOSH $\sim\!0.20$--$0.24$）。GALOSH は学習なしに、\emph{学習済み}の Blind2Unblind
+との隔たりの多くを埋める。
+
+\input{galosh_raw_tables_ja.tex}
+
+\paragraph{定性比較。}図~\ref{fig:qual_rawnind} と図~\ref{fig:qual_sidd} に高
+テクスチャのクロップを示す。ノイズレベルを与えた古典的ベースライン
+（VST\,+\,BM3D/NLM）は細かなテクスチャを過平滑化し残留色差ノイズを残すのに対し、
+GALOSH はテクスチャと文字の可読性を保ち、学習済み Blind2Unblind に近い知覚品質
+を示す。各セルの LPIPS が視覚的読み取りを定量的に裏付ける。
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{qualitative_rawnind.png}
+\caption{RawNIND 定性比較。列: Noisy / VST\,+\,NLM-CFA / VST\,+\,BM3D-CFA /
+Blind2Unblind（学習済み）/ \textbf{GALOSH（提案、blind）} / GT。各セルは LPIPS
+（$\downarrow$）。古典的ベースラインにはノイズレベルを与え（VST）、GALOSH は
+完全ブラインド。}
+\label{fig:qual_rawnind}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{qualitative_sidd_medium.png}
+\caption{SIDD Medium 定性比較（列・ラベルは図~\ref{fig:qual_rawnind} と同じ）。}
+\label{fig:qual_sidd}
+\end{figure*}
+
+% ----------------------------------------------------------------- INT16 / ISP
+\section{INT16 固定小数点と ISP 適合性}\label{sec:int16}
+GALOSH は、CPU 参照と GPU ストリーミング実装の間で\emph{bit-exact} な純 INT16
+固定小数点の第 2 実装を持つ。その目的はオンセンサ配備性であり、これは GPU/CPU
+計時では測れない --- これらのホストは FP 最適化されており固定小数点データパスを
+ソフトウェアで\emph{エミュレート}するに過ぎないが、実 ISP のデータパスは
+ネイティブに固定小数点だからである。ホスト非依存の指標は\textbf{画素あたり
+演算量}である。
+
+\paragraph{演算量。}全 P0--P10 パイプラインを計装すると、GALOSH は画素あたり
+$\approx\!3380$ 回の積和と $\approx\!137$ 回の LUT/特殊関数演算を要し、これらの
+カウントは\emph{解像度非依存}（1080p で $3390.9$、4K で $3370.3$）、すなわち
+データ非依存ストリーミングである。ISP MAC アレイモデル $\text{fps}=
+(\text{MAC\_rate}/3380)/\text{画素数}$ により、$0.5$~TMAC/s ブロック（極めて
+控えめ）で 1080p 実時間（73\,fps）、$1$~TMAC/s ブロックで 4K 実時間（36\,fps）
+に達する。
+
+\paragraph{メモリ。}GALOSH は行ストリーミングで、オンチップ状態は最大縦カーネル
+（WHT $8{\times}8$、LOESS 15-tap、K16 $5{\times}5$）で定まるラインバッファのみ、
+1080p で INT16 にして $\sim\!200$\,KB --- フル INT16 フレームの $20$--$40\times$
+小さく、決定的にフレームバッファが\emph{無い}。
+
+\paragraph{なぜ GALOSH でベースラインでないか。}表~\ref{tab:isp} に画素あたり
+演算量と、より本質的にストリーミング可能性を比較する。GALOSH は最軽量
+（BM3D/NLM の $3.9$--$6.4\times$ 低、学習型の $18$--$360\times$ 低）であり、
+データ非依存・局所アクセスである。BM3D の協調フィルタリングは\emph{どの}
+ブロックを束ねるかを実行時に内容から決めるため、固定遅延のストリーミング段に
+全くなり得ない --- MAC 数だけでは隠れる限界である。学習型はラインバッファでは
+なくマルチスケール特徴バッファを要する。GALOSH はこのように、軽量 $\times$
+データ非依存ストリーミング可能 $\times$ 知覚最良を唯一兼ね備え、GPU INT16
+ポートは\emph{動作する}ストリーミング固定小数点実装である（ストリーミング
+可能性は主張ではなく実証）。
+
+\input{galosh_isp_table_ja.tex}
+
+% ----------------------------------------------------------------- Conclusion
+\section{結論}
+GALOSH は、ブラインド・学習不要な raw デノイジングが知覚品質もハードウェア
+配備性も犠牲にする必要が無いことを示す。画像ごとの Poisson--Gauss 当てはめ、
+分散安定化 Walsh--Hadamard 輝度/色差縮小、輝度ガイド付き色差再構成により、
+2 つの実ノイズ raw ベンチマークで blind・training-free 手法中の知覚品質最良を
+--- 比較手法中で最小の画素あたり演算量で、控えめな ISP MAC アレイが実時間で
+動かせるデータ非依存・ラインバッファ式・フレームバッファ不要のパイプライン
+として --- 達成する。同じ分散安定化局所縮小コアは raw モザイクを超えて、既に
+処理済みの YUV/動画フレームへも自然に拡張できる。この領域は固有の時間方向
+ベースラインを伴うため、別稿で扱う。サイクル精度の HLS/FPGA 合成がシリコンへの
+自然な次段である。
+
+\begin{thebibliography}{9}\small
+\bibitem{bm3d} K.\ Dabov et al., ``Image denoising by sparse 3-D transform-domain
+collaborative filtering,'' \emph{IEEE TIP}, 2007.
+\bibitem{nlm} A.\ Buades et al., ``A non-local algorithm for image denoising,''
+\emph{CVPR}, 2005.
+\bibitem{b2u} Z.\ Wang et al., ``Blind2Unblind: Self-supervised image denoising
+with visible blind spots,'' \emph{CVPR}, 2022.
+\bibitem{sidd} A.\ Abdelhamed et al., ``A high-quality denoising dataset for
+smartphone cameras,'' \emph{CVPR}, 2018.
+\bibitem{rawnind} B.\ Brummer and C.\ De Vleeschouwer, ``Natural image noise
+dataset,'' \emph{CVPRW}, 2019.
+\end{thebibliography}
+
+\end{document}

@@ -189,7 +189,7 @@ def load_sidd_medium():
         stem = nf.name.replace("_noisy_raw.npy", "")
         gr, gs = base / f"{stem}_gt_raw.npy", base / f"{stem}_gt_srgb.npy"
         if gr.exists() and gs.exists(): items.append((stem, nf, gr, gs))
-    return items, GALOSH / "benchmark" / "sidd_medium_v2"
+    return items, GALOSH / "benchmark" / "results_raw_sidd"
 
 
 def load_rawnind():

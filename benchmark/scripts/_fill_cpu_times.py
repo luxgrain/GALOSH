@@ -64,7 +64,7 @@ def main():
            "note": "single-threaded; galosh = galosh_raw_cpu.exe blind incl file I/O; "
                    "nlm = skimage per-plane fast_mode patch5/search23 (matches CUDA params)"}
     print(json.dumps(res, indent=1))
-    op = GALOSH / "benchmark" / "raw_v2_results" / "_cpu_time_fill.json"
+    op = GALOSH / "benchmark" / "results_raw" / "_cpu_time_fill.json"
     json.dump(res, open(op, "w"), indent=1)
     print(f"saved {op}")
 

@@ -4,7 +4,7 @@ import json
 import numpy as np
 from pathlib import Path
 
-R = Path(__file__).resolve().parents[2] / "benchmark" / "rawnind_srgb_results"
+R = Path(__file__).resolve().parents[2] / "benchmark" / "results_srgb_rawnind"
 dl = json.load(open(R / "_metrics_dl1493.json"))   # all methods (galosh only 261) + _noisy
 gal = json.load(open(R / "_metrics.json"))          # galosh-only 1493 + _noisy
 

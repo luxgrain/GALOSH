@@ -1,0 +1,32 @@
+% ISP compute-weight + streamability 表（日本語キャプション、isp_throughput_model.md より）
+\begin{table}[t]
+\centering
+\caption{画素あたり演算量とストリーミング ISP 適合性。GALOSH の MAC/画素は
+計装（\texttt{-DGALOSH\_OPCOUNT}）による\emph{実測値}、他手法は標準的な
+アルゴリズムパラメータ / Conv2d フックによる。「Stream」= 固定遅延・ライン
+バッファ式の ISP 段に適合（データ非依存＋規則的局所アクセス）。GALOSH は
+最軽量\emph{かつ}本当にストリーミング可能な唯一の軽量手法であり、同時に
+blind 手法中で知覚品質（LPIPS）最良。}
+\label{tab:isp}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r c}
+\toprule
+手法 & MAC/画素 & 対 提案 & Stream? \\
+\midrule
+\textbf{GALOSH（提案）} & \textbf{3{,}380} & \textbf{1.0$\times$} & \textbf{yes（実証済）} \\
+NLM-CFA            & 13{,}225 & 3.9$\times$ & 可能だが演算 4$\times$ \\
+BM3D-CFA           & $\sim$21{,}632 & 6.4$\times$ & \textbf{no}（内容依存） \\
+Blind2Unblind      & $\sim$72k\,/\,1.22M & 21\,/\,360$\times$ & no（U-Net バッファ） \\
+NAFNet (raw)$^{*}$ & $\sim$61k\,/\,242k & 18\,/\,71$\times$ & no（U-Net バッファ） \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize Blind2Unblind: 1 forward / 17-forward re-visible 推論
+（wf48-d5 U-Net）。$^{*}$NAFNet は公開 raw モデルが無く、SOTA 復元 CNN を
+raw（4ch packed）に\emph{適用した場合}の MAC 予算であって実測値ではない。
+BM3D の協調的ブロックマッチングは実行時に内容から決まるため固定遅延データ
+パスになり得ない。$0.5$--$1$~TMAC/s の ISP MAC アレイで op-count モデル上
+1080p--4K 実時間。オンチップ状態は約 200\,KB の INT16 ラインバッファのみ
+（フレームバッファ不要）。}
+\end{table}

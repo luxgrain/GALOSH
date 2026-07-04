@@ -45,7 +45,7 @@ benchmark/archive/
 benchmark/external/
 benchmark/weights/
 benchmark/methods/
-benchmark/sidd_medium/
+benchmark/_tmp/
 benchmark/sidd/
 benchmark/kodak/
 benchmark/mcmaster/
@@ -108,3 +108,8 @@ tools/patent_figures/
 
 # --- Harness scratch ---
 standalone/tests/_smoke_tmp/
+
+# --- Paper build outputs (regenerable: tectonic / pandoc) ---
+docs/paper/*.pdf
+docs/paper/*.html
+docs/paper/archive/*.html

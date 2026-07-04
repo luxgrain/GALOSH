@@ -1,0 +1,257 @@
+% ============================================================================
+% GALOSH — arXiv manuscript (draft, assembled 2026-06-27)
+% Self-contained: \input{galosh_raw_tables.tex} for the result tables;
+% figures qualitative_{rawnind,sidd_medium}.png in the same directory.
+% Compile: pdflatex galosh_raw_paper.tex  (needs booktabs, graphicx, hyperref)
+% ============================================================================
+\documentclass[10pt,twocolumn]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+\usepackage{caption}
+\captionsetup{font=small}
+
+\title{\textbf{GALOSH: Blind, Training-Free Raw-Domain Denoising\\
+that Runs on an ISP}}
+\author{Yoshiro Sato\thanks{A U.S. provisional patent application covering the
+methods described herein has been filed (App.\ No.\ 64/058,343, 6 May 2026).}}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ----------------------------------------------------------------- Abstract
+\begin{abstract}
+We present \textbf{GALOSH} (Generalized Anscombe LOcal SHrinkage), a fully
+\emph{blind}, \emph{training-free} denoiser that operates directly on the raw
+Bayer mosaic. GALOSH estimates the per-image Poisson--Gaussian noise model from
+the noisy frame alone, variance-stabilizes it with a generalized Anscombe
+transform, and removes noise with a single forward pass of local shrinkage on a
+stride-1 Walsh--Hadamard luma/chroma decomposition followed by a luminance-guided
+chroma reconstruction. Unlike learned denoisers it requires no clean/noisy pairs
+and no training, and unlike block-matching methods its computation is
+data-independent and local. On two real-noise raw benchmarks --- SIDD Medium
+(80 full-resolution images) and RawNIND (1493 cross-camera crops) --- GALOSH is
+the best \emph{blind, training-free} method on perceptual quality (LPIPS/DISTS)
+while using the \emph{lowest} per-pixel compute of any method compared
+($3.4\text{k}$ MAC/pixel, $3.9$--$6.4\times$ below classical BM3D/NLM and
+$18$--$360\times$ below learned baselines). The same algorithm has a bit-exact
+INT16 fixed-point realization: data-independent, line-buffered, and
+frame-buffer-free, it maps onto a modest ISP MAC array
+($0.5$--$1$~TMAC/s) at real-time 1080p/4K by an operation-count model, and the
+FP32 GPU pipeline already denoises 1080p at 55\,fps. GALOSH thus closes the gap
+between offline raw denoising quality and on-sensor, real-time deployability.
+\end{abstract}
+
+% ----------------------------------------------------------------- Intro
+\section{Introduction}
+Denoising the raw sensor mosaic --- before demosaicing and color processing ---
+is where a camera pipeline has the most signal to recover, because the noise is
+still close to its physical Poisson--Gaussian form and has not been correlated by
+downstream stages. Two families dominate. \emph{Classical} estimators
+(BM3D~\cite{bm3d}, non-local means~\cite{nlm}) are training-free but assume a
+known noise level and, in the case of BM3D, rely on \emph{content-dependent}
+block matching that is ill-suited to a fixed-latency hardware stage. \emph{Learned}
+denoisers (self-supervised ones such as Blind2Unblind~\cite{b2u} and
+Neighbor2Neighbor, or supervised CNNs) reach excellent quality but need training
+data, are tied to the sensors/noise they were trained on, and carry a compute
+budget (tens of thousands of MACs/pixel, multi-scale feature buffers) that does
+not fit an image-signal-processor (ISP) streaming stage.
+
+We argue that a practical on-sensor denoiser must be simultaneously
+(i)~\emph{blind} (estimate the noise from the frame itself, no oracle),
+(ii)~\emph{training-free} (no data, generalizes across sensors),
+(iii)~\emph{perceptually strong} (judged by LPIPS/DISTS, not only PSNR), and
+(iv)~\emph{ISP-deployable} (low, data-independent compute; line buffers; no frame
+buffer). GALOSH is designed for all four at once. Its contributions are:
+\begin{itemize}\itemsep2pt
+\item A blind, training-free raw-Bayer pipeline that estimates the
+Poisson--Gaussian model per image and denoises in a single local-shrinkage pass
+(Sec.~\ref{sec:method}).
+\item State-of-the-art perceptual quality \emph{among blind, training-free
+methods} on SIDD Medium and RawNIND, at the lowest per-pixel compute of any
+method compared (Sec.~\ref{sec:results}).
+\item A bit-exact INT16 fixed-point realization and an operation-count ISP
+throughput model showing real-time 1080p/4K on a modest fixed-function array,
+backed by a working streaming GPU implementation (Sec.~\ref{sec:int16}).
+\end{itemize}
+
+% ----------------------------------------------------------------- Method
+\section{Method}\label{sec:method}
+GALOSH processes the Bayer frame in a single forward pass of eleven phases
+(P0--P10); all parameters are either derived from the noise model or fixed
+constants (no per-image tuning).
+
+\paragraph{P0 --- Blind noise estimation.}
+We fit a Poisson--Gaussian model $\operatorname{Var}[x]=\alpha\,\mathbb{E}[x]+
+\sigma^2$ from the noisy frame alone by a robust lower-envelope regression over
+local mean/variance bins (a Foi--Alenius-style estimator), giving the per-image
+$(\alpha,\sigma^2)$ with no oracle.
+
+\paragraph{P1 --- Variance stabilization (GAT).}
+A generalized Anscombe transform $f(x)=\tfrac{2}{\alpha}\sqrt{\alpha x+\tfrac38
+\alpha^2+\sigma^2}$ maps the signal-dependent noise to approximately unit
+variance, so a single global shrinkage threshold is valid everywhere. Per-CFA-channel
+MAD gives a residual scale used to normalize the stabilized frame.
+
+\paragraph{P2 --- Achromatic dark reference.}
+A CFA-aware iteratively-reweighted (IRLS) estimate of the local achromatic floor
+is subtracted, preventing the chroma channels from absorbing luminance shading.
+
+\paragraph{P3--P4 --- Luma/chroma decomposition.}
+A \emph{stride-1, cycle-spun} $2{\times}2$ Walsh--Hadamard transform turns each
+Bayer quad into one luma plane $L$ and three chroma planes $C_1,C_2,C_3$. Because
+the CFA samples chroma at half the luma rate, the chroma planes are kept at
+half resolution (band-limit-faithful, no information lost).
+
+\paragraph{P5 --- Local shrinkage.}
+Luma is denoised at full resolution by cycle-spun local shrinkage (LOSH) with an
+MAD-driven threshold. Chroma is denoised at half resolution by a luminance-guided
+LOESS (a degree-1, $Y$-guided local linear regression --- a guided filter), built
+as a 3-level scale pyramid so a single strength control walks smoothly from
+detail-preserving to flat-region-smoothing behavior.
+
+\paragraph{P6--P7 --- Chroma reconstruction.}
+The denoised half-resolution chroma is upsampled to full resolution by a
+luminance-guided joint-bilateral EWA Jinc-Lanczos-3 (``K16'') kernel: the jinc
+interpolation is modulated by a bilateral weight on the full-resolution luma, so
+chroma edges snap to luma edges via a cross-channel structural prior.
+
+\paragraph{Chroma-range robustness.}
+Both the guided-LOESS regression and the jinc upsampling are \emph{unbounded}
+operators --- a degree-1 regression extrapolates at edges, and the jinc kernel
+has negative side lobes that can ring past the local data range. Left unchecked,
+the resulting chroma over-shoot is amplified by the white-balance gain (notably
+the blue channel, $\sim\!2.7\times$) into isolated magenta speckles at high-contrast
+luma edges. We therefore clamp every reconstructed chroma value to the
+\emph{local input chroma range} (``the denoiser may not invent color the input
+lacks''). This touches $\sim\!1.4\%$ of pixels, is identical across all four
+numeric precisions, and improves aggregate perceptual quality (Sec.~\ref{sec:results}).
+
+\paragraph{P8--P10 --- Inversion.}
+A per-pixel inverse WHT recombines $L,C_1,C_2,C_3$, the dark reference is restored,
+and the inverse GAT returns to the linear raw domain. The output is a denoised
+Bayer frame, ready for any demosaic/ISP back-end.
+
+% ----------------------------------------------------------------- Experiments
+\section{Experimental Setup}\label{sec:exp}
+\paragraph{Datasets.} \textbf{SIDD Medium}~\cite{sidd} --- 80 full-resolution
+($\sim$16\,MP) real-noise smartphone Bayer images. \textbf{RawNIND}~\cite{rawnind}
+--- 1493 cross-camera $512{\times}512$ real-noise crops spanning many sensors and
+ISOs.
+
+\paragraph{Protocol.} All methods are run \emph{blind} (no clean/noisy pairs, no
+per-image noise oracle) and \emph{training-free}, except Blind2Unblind which is a
+trained self-supervised network shown only as an upper reference. Fidelity
+(PSNR/SSIM) is measured on the raw Bayer output; perceptual metrics (LPIPS, DISTS,
+NIQE) are computed on a calibrated sRGB render (per-image white-balance and color
+matrix from the DNG metadata; edge-aware demosaic). We additionally report
+ablations that share a variance-stabilizing front-end (VST\,+\,method), isolating
+the contribution of GALOSH's native blind estimation.
+
+\paragraph{Methods.} GALOSH (FP32 reference, and the bit-exact INT16 fixed-point
+variant); classical BM3D-CFA and NLM-CFA with native MAD noise estimation; their
+VST front-end ablations; and Blind2Unblind as a trained upper bound.
+
+% ----------------------------------------------------------------- Results
+\section{Results}\label{sec:results}
+Tables~\ref{tab:sidd_medium} and~\ref{tab:rawnind} report the two benchmarks.
+Among blind, training-free methods GALOSH is best on the perceptual metrics
+(LPIPS, DISTS) on both datasets, and competitive on PSNR/SSIM, while the classical
+baselines --- even with a shared VST front-end --- trail on perceptual quality by
+a wide margin (LPIPS $\sim\!0.27$--$0.43$ vs.\ GALOSH $\sim\!0.20$--$0.24$). GALOSH
+narrows much of the gap to the \emph{trained} Blind2Unblind without any training.
+
+\input{galosh_raw_tables.tex}
+
+\paragraph{Qualitative.} Figures~\ref{fig:qual_rawnind} and~\ref{fig:qual_sidd}
+show high-texture crops. The noise-aware classical baselines (VST\,+\,BM3D/NLM)
+over-smooth fine texture and leave residual chroma noise, whereas GALOSH preserves
+texture and text legibility at a perceptual quality close to the trained
+Blind2Unblind, with the per-cell LPIPS confirming the visual reading.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{qualitative_rawnind.png}
+\caption{RawNIND qualitative comparison. Columns: Noisy / VST\,+\,NLM-CFA /
+VST\,+\,BM3D-CFA / Blind2Unblind (trained) / \textbf{GALOSH (ours, blind)} / GT.
+Per-cell LPIPS ($\downarrow$). Classical baselines are given the noise level (VST);
+GALOSH is fully blind.}
+\label{fig:qual_rawnind}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{qualitative_sidd_medium.png}
+\caption{SIDD Medium qualitative comparison (same columns/labelling as
+Fig.~\ref{fig:qual_rawnind}).}
+\label{fig:qual_sidd}
+\end{figure*}
+
+% ----------------------------------------------------------------- INT16 / ISP
+\section{INT16 Fixed-Point and ISP Suitability}\label{sec:int16}
+GALOSH has a second realization in pure INT16 fixed-point that is
+\emph{bit-exact} between a CPU reference and a GPU streaming implementation. Its
+purpose is on-sensor deployability, which GPU/CPU timings do \emph{not} measure:
+those hosts are FP-optimized and merely \emph{emulate} a fixed-point datapath in
+software, whereas a real ISP datapath is natively fixed-point. The
+host-independent metric is the \textbf{operation count per pixel}.
+
+\paragraph{Compute.} Instrumented over the full P0--P10 pipeline, GALOSH costs
+$\approx\!3380$ multiply-accumulates and $\approx\!137$ LUT/special-function
+operations per pixel, and these counts are \emph{resolution-independent}
+($3390.9$ at 1080p vs.\ $3370.3$ at 4K), i.e.\ data-independent streaming. An ISP
+MAC-array model $\text{fps}=(\text{MAC\_rate}/3380)/\text{pixels}$ then shows a
+$0.5$~TMAC/s block (very modest) reaches real-time 1080p (73\,fps) and a
+$1$~TMAC/s block reaches real-time 4K (36\,fps).
+
+\paragraph{Memory.} GALOSH is row-streaming: the only on-chip state is the line
+buffers sized by the largest vertical kernel (WHT $8{\times}8$, LOESS 15-tap, K16
+$5{\times}5$), $\sim\!200$\,KB at 1080p in INT16 --- $20$--$40\times$ less than a
+full INT16 frame, and crucially with \emph{no} frame buffer.
+
+\paragraph{Why GALOSH and not the baselines.} Table~\ref{tab:isp} compares
+per-pixel compute and, more fundamentally, streamability. GALOSH is the lightest
+($3.9$--$6.4\times$ below BM3D/NLM, $18$--$360\times$ below the learned nets) and
+is data-independent with local access. BM3D's collaborative filtering decides
+\emph{which} blocks to group from content at run time, so it cannot be a
+fixed-latency streaming stage at all --- a limitation its MAC count alone hides.
+The learned nets need multi-scale feature buffers, not line buffers. GALOSH is
+thus uniquely light $\times$ data-independent-streamable $\times$ best-perceptual,
+and the GPU INT16 port is a \emph{working} streaming fixed-point implementation
+(streamability demonstrated, not asserted).
+
+\input{galosh_isp_table.tex}
+
+% ----------------------------------------------------------------- Conclusion
+\section{Conclusion}
+GALOSH shows that blind, training-free raw denoising need not trade away either
+perceptual quality or hardware deployability. A per-image Poisson--Gaussian fit, a
+variance-stabilized Walsh--Hadamard luma/chroma shrinkage, and a luminance-guided
+chroma reconstruction give the best perceptual quality among blind, training-free
+methods on two real-noise raw benchmarks --- at the lowest per-pixel compute of any
+method compared, in a data-independent, line-buffered, frame-buffer-free pipeline
+that a modest ISP MAC array runs in real time. The same variance-stabilized
+local-shrinkage core extends naturally beyond the raw mosaic to already-processed
+YUV/video frames; that domain, with its distinct temporal baselines, is the
+subject of a separate study. A cycle-accurate HLS/FPGA synthesis is the natural
+next step toward silicon.
+
+\begin{thebibliography}{9}\small
+\bibitem{bm3d} K.\ Dabov et al., ``Image denoising by sparse 3-D transform-domain
+collaborative filtering,'' \emph{IEEE TIP}, 2007.
+\bibitem{nlm} A.\ Buades et al., ``A non-local algorithm for image denoising,''
+\emph{CVPR}, 2005.
+\bibitem{b2u} Z.\ Wang et al., ``Blind2Unblind: Self-supervised image denoising
+with visible blind spots,'' \emph{CVPR}, 2022.
+\bibitem{sidd} A.\ Abdelhamed et al., ``A high-quality denoising dataset for
+smartphone cameras,'' \emph{CVPR}, 2018.
+\bibitem{rawnind} B.\ Brummer and C.\ De Vleeschouwer, ``Natural image noise
+dataset,'' \emph{CVPRW}, 2019.
+\end{thebibliography}
+
+\end{document}

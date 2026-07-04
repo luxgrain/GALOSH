@@ -8,7 +8,8 @@ reconciled sRGB->linear->YCbCr->GAT+LOSH / chroma-LOESS->sRGB product) against:
 
 Metrics (feedback_full_metrics): PSNR, SSIM, LPIPS(alex), DISTS, NIQE.
 Artifacts (feedback_png_persistence): per-method PNG + .npy, plus GT + noisy.
-Output:  benchmark/yuv_srgb_results/{<method>/<tag>.png|.npy, _metrics.json, _table.txt}
+Output:  benchmark/results_srgb_sidd_1024|results_srgb_sidd_full|results_srgb_rawnind/
+         {<method>/<tag>.png, _metrics.json, _table.txt}
 
 Blind sigma for BM3D/NLM = skimage.restoration.estimate_sigma (matches the
 "all methods blind" framing; GALOSH estimates its own alpha/sigma internally).
@@ -24,8 +25,8 @@ EXE_GPU    = GALOSH / "standalone" / "galosh_yuv_gpu.exe"
 BENCH_SIDD = Path(r"E:\img_dataset\sidd\medium_bench")
 RAWNIND_N  = Path("E:/img_dataset/rawnind_bench/__noisy_raw_render__")
 RAWNIND_G  = Path("E:/img_dataset/rawnind_bench/__gt_raw_render__")
-OUT_NAME   = {"sidd": "yuv_srgb_results", "rawnind": "rawnind_srgb_results"}
-TMP        = GALOSH / "benchmark" / "_yuv_bench_tmp"
+OUT_NAME   = {"sidd": "results_srgb_sidd_1024", "rawnind": "results_srgb_rawnind"}
+TMP        = GALOSH / "benchmark" / "_tmp"
 UCRT_BIN   = r"C:\msys64\ucrt64\bin"
 DEVICE     = "cuda"
 
@@ -312,7 +313,8 @@ def main():
         y0 = max(0, (H - n) // 2); x0 = max(0, (W - n) // 2)
         return np.ascontiguousarray(im[y0:y0 + min(n, H), x0:x0 + min(n, W)])
 
-    OUT = GALOSH / "benchmark" / (OUT_NAME[args.dataset] + ("_full" if not args.crop else ""))
+    OUT = GALOSH / "benchmark" / ("results_srgb_sidd_full" if (args.dataset == "sidd" and not args.crop)
+                              else OUT_NAME[args.dataset])
     TMP.mkdir(parents=True, exist_ok=True)
     methods = build_methods(set(args.methods))
     total = scene_count(args.dataset, args.scenes)

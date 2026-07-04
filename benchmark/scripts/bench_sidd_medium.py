@@ -43,8 +43,8 @@ os.environ["PATH"] = r"C:\msys64\ucrt64\bin;" + os.environ.get("PATH", "")
 
 BASE       = Path(__file__).parent.parent
 BENCH_DIR  = Path(r"E:\img_dataset\sidd\medium_bench")
-OUTDIR     = BASE / "sidd_medium"
-RESULTS    = BASE / "results"
+OUTDIR     = BASE / "_tmp"
+RESULTS    = BASE / "_tmp"
 RESULTS.mkdir(exist_ok=True)
 OUTDIR.mkdir(parents=True, exist_ok=True)
 

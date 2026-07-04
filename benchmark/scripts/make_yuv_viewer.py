@@ -2,7 +2,7 @@
 (wheel=zoom, drag=pan, all panes move together — same mechanism as the RAW viewer.html).
 
 Per dataset/scene: a full-resolution display JPG for every method + noisy + GT, plus the
-per-scene metrics. Output: benchmark/yuv_srgb_viewer/{viewer.html, imgs/}.
+per-scene metrics. Output: benchmark/viewer_srgb/{viewer.html, imgs/}.
 Display JPG is the native crop (SIDD 1024², RawNIND 512²); zoom on it reveals detail.
 """
 import json
@@ -10,16 +10,16 @@ from pathlib import Path
 from PIL import Image
 
 GAL = Path(__file__).resolve().parents[2]
-OUTV = GAL / "benchmark" / "yuv_srgb_viewer"
+OUTV = GAL / "benchmark" / "viewer_srgb"
 (OUTV / "imgs").mkdir(parents=True, exist_ok=True)
 
 ORDER = [("noisy", "Noisy (input)"), ("galosh_yuv_gpu_fp32", "GALOSH-YUV GPU (training-free)"),
          ("cbm3d", "CBM3D"), ("color_nlm", "Color-NLM"), ("guided", "Guided"),
          ("nafnet", "NAFNet-SIDD (DL)"), ("scunet", "SCUNet-real (DL)"),
          ("restormer", "Restormer-SIDD (DL)"), ("gt", "Ground truth")]
-DATASETS = [("sidd", "SIDD-Medium sRGB", GAL / "benchmark" / "yuv_srgb_results"),
-            ("rawnind", "RawNIND-rendered sRGB", GAL / "benchmark" / "rawnind_srgb_results")]
-RESDIR = {"sidd": "../yuv_srgb_results", "rawnind": "../rawnind_srgb_results"}
+DATASETS = [("sidd", "SIDD-Medium sRGB", GAL / "benchmark" / "results_srgb_sidd_1024"),
+            ("rawnind", "RawNIND-rendered sRGB", GAL / "benchmark" / "results_srgb_rawnind")]
+RESDIR = {"sidd": "../results_srgb_sidd_1024", "rawnind": "../results_srgb_rawnind"}
 MAXW = 1024
 
 
