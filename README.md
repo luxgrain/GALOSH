@@ -33,6 +33,59 @@ ahead of the BM3D/NLM family even when those are given an oracle noise level —
 while trained networks remain ahead in their own training domain (reported
 honestly in the paper).
 
+## Results
+
+**[▶ Interactive comparison viewer](https://luxgrain.github.io/GALOSH/)** —
+every benchmark scene (SIDD Medium 80 full frames + RawNIND 1493 crops), all
+methods side by side with synchronized pan/zoom (JPEG q92, chroma 4:4:4).
+
+Raw domain — **SIDD Medium**, 80 full-resolution frames, everything blind
+(PSNR/SSIM/LPIPS shown; DISTS/NIQE, RawNIND, and the VST-ablation rows are in
+the paper; per-image full-frame times, CPU single-threaded):
+
+| Method | PSNR↑ | SSIM↑ | LPIPS↓ | CPU s | GPU s |
+|---|---|---|---|---|---|
+| **GALOSH FP32** | **48.13** | **0.9883** | **0.2030** | 12.6 | **0.76** |
+| GALOSH INT16 | 47.42 | 0.9881 | 0.2030 | 103.6¹ | 2.7 |
+| BM3D-CFA | 46.74 | 0.9862 | 0.2725 | 40.4 | — |
+| NLM-CFA | 42.32 | 0.9729 | 0.3791 | 27.1 | 1.2 |
+| Blind2Unblind *(trained DL, upper ref.)* | 49.07 | 0.9924 | 0.1169 | — | 5.6 |
+
+sRGB domain — **SIDD Medium sRGB**, 80 scenes at full ~15.8 MP frames,
+everything blind:
+
+| Method | PSNR↑ | SSIM↑ | LPIPS↓ | CPU s | GPU s |
+|---|---|---|---|---|---|
+| **GALOSH-YUV** | **35.01** | **0.837** | **0.314** | 2.50 | **0.87** |
+| CBM3D | 27.09 | 0.492 | 0.721 | 118.6² | — |
+| Color-NLM | 28.92 | 0.656 | 0.534 | 2.79 | — |
+| Guided filter | 27.43 | 0.523 | 0.687 | 0.71 | — |
+| NAFNet-SIDD *(trained DL, upper ref.)* | 41.94 | 0.942 | 0.167 | — | 13.5 |
+| Restormer-SIDD *(trained DL, upper ref.)* | 40.94 | 0.935 | 0.181 | — | 565³ |
+
+Bold = best among the blind, training-free methods. ¹INT16 quality is measured
+on the streaming GPU pipeline; its CPU entry is the correctness-first INT32
+reference. ²Reference CBM3D package is effectively single-threaded.
+³VRAM-bound tiled attention on this 12-GB GPU. Trained networks are reported
+honestly as upper references — in their own training domain they stay ahead.
+
+**Raw domain, RawNIND** (high-ISO crops; per-image LPIPS below each crop —
+classical baselines get a noise-aware VST front-end, GALOSH is fully blind):
+
+![Raw qualitative, RawNIND](docs/assets/qualitative_rawnind.jpg)
+
+**Raw domain, SIDD Medium:**
+
+![Raw qualitative, SIDD Medium](docs/assets/qualitative_sidd_medium.jpg)
+
+**sRGB domain, SIDD Medium (full frame):**
+
+![sRGB qualitative, SIDD](docs/assets/qualitative_srgb_sidd.jpg)
+
+**sRGB domain, RawNIND (ISO 12800–25600):**
+
+![sRGB qualitative, RawNIND](docs/assets/qualitative_srgb_rawnind.jpg)
+
 ## Algorithm summary
 
 **GALOSH core** (shared by both domains)
