@@ -138,3 +138,7 @@ docs/GALOSH_概要.md
 docs/arxiv_v1_recentering_memo.md
 docs/figures/
 docs/archive/
+
+# arXiv submission bundle (build artifact; regenerate from docs/paper sources)
+docs/paper/arxiv_submission/
+docs/paper/galosh_arxiv_v1.tar.gz
