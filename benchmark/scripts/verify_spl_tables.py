@@ -1,4 +1,5 @@
-"""Verify the SPL draft's Table I / II cells against the benchmark JSONs."""
+"""Verify the SPL draft's Table I / II cells against the benchmark JSONs.
+Set SPL_TEX=galosh_spl_ja.tex to check the Japanese review copy."""
 import json
 import re
 import sys
@@ -9,7 +10,9 @@ GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
 sys.path.insert(0, str(GALOSH / "benchmark" / "scripts"))
 import verify_table_numbers as V
 
-src = (GALOSH / "docs" / "paper" / "spl" / "galosh_spl.tex").read_text(encoding="utf-8")
+import os as _os
+_tex = _os.environ.get("SPL_TEX", "galosh_spl.tex")
+src = (GALOSH / "docs" / "paper" / "spl" / _tex).read_text(encoding="utf-8")
 blocks = re.split(r"\\begin\{table\}", src)[1:]
 
 # ---- Table I: raw, two datasets side by side ----
