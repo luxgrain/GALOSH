@@ -29,7 +29,7 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
-GALOSH = Path(r"C:\Users\luxgrain\GALOSH")
+GALOSH = Path(os.environ.get("GALOSH_ROOT", str(Path(__file__).resolve().parents[2])))
 SCRIPTS = GALOSH / "benchmark" / "scripts"
 sys.path.insert(0, str(SCRIPTS)); sys.path.insert(0, str(SCRIPTS / "methods"))
 import bench_sidd_medium as smb   # render + 5-metric + runners (run_galosh_gpu, run_nlm_cfa_cuda, ...)
@@ -130,7 +130,7 @@ def run_galosh_i16_gpu(noisy, w, h, uid):
     Matches the paper's claim that the shipped pipeline is the GPU variant for BOTH
     precisions (the speed table is GPU-only)."""
     import subprocess
-    GPU_I16 = r"C:\Users\luxgrain\GALOSH\standalone\galosh_int_pipe_test.exe"
+    GPU_I16 = str(GALOSH / "standalone" / "galosh_int_pipe_test.exe")
     tmp = smb.OUTDIR
     uid = f"{uid}_{os.getpid()}"
     ip, op = tmp / f"_tmp_{uid}_in.raw", tmp / f"_tmp_{uid}_out.bin"

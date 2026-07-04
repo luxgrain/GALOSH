@@ -4,14 +4,15 @@ with per-cell LPIPS labels.
 
   python make_qualitative_figure.py --dataset rawnind --n 4
 """
-import argparse, json, sys
+import argparse, json, os, sys
 from pathlib import Path
 import numpy as np, cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-DIRS = {"sidd_medium": Path(r"C:\Users\luxgrain\GALOSH\benchmark\results_raw_sidd"),
+ROOT = Path(os.environ.get("GALOSH_ROOT", str(Path(__file__).resolve().parents[2])))
+DIRS = {"sidd_medium": ROOT / "benchmark" / "results_raw_sidd",
         "rawnind":     Path(r"E:\rawnind_bench_v2")}
 # columns to show (artifact stem -> display label); _noisy/_gt are the input/GT.
 # BM3D/NLM use the VST (noise-aware) variants — the strongest classical baselines —
@@ -142,7 +143,7 @@ def main():
             if r == 0: ax.set_title(label, fontsize=9)
             if cc == 0: ax.set_ylabel(scene[:18], fontsize=7)
     plt.tight_layout(pad=0.4)
-    out = Path(r"C:\Users\luxgrain\GALOSH\docs\paper") / f"qualitative_{args.dataset}.png"
+    out = ROOT / "docs" / "paper" / f"qualitative_{args.dataset}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=200, bbox_inches="tight")
     print(f"wrote {out}  ({nrow}x{ncol})", flush=True)

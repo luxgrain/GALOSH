@@ -53,7 +53,7 @@ benchmark/cbsd68/
 benchmark/rawnind/
 
 # --- Heavy method directories (NAFNet, PMN sources are upstream) ---
-methods/
+/methods/
 
 # --- Build / test logs ---
 *.txt
@@ -113,3 +113,28 @@ standalone/tests/_smoke_tmp/
 docs/paper/*.pdf
 docs/paper/*.html
 docs/paper/archive/*.html
+
+# --- Benchmark result artifacts (large / regenerable; the small source-of-truth
+#     JSONs under results_raw were added explicitly and stay tracked) ---
+benchmark/results_raw/
+benchmark/results_raw_sidd/
+benchmark/results_srgb_sidd_full/
+benchmark/results_srgb_sidd_1024/
+benchmark/results_srgb_rawnind/
+benchmark/viewer_srgb/
+
+# --- Official dataset distributions (never commit) ---
+benchmark/SIDD_Validation/
+benchmark/SIDD_Benchmark_Data/
+benchmark/SIDD_Benchmark_Code_v1.2/
+
+# --- Internal working notes (not part of the public release) ---
+docs/codex_review_prompt.md
+docs/codex_review_findings.md
+docs/handover_strategy_chat.md
+docs/paper_prompt.md
+docs/HANDOVER_*.md
+docs/GALOSH_概要.md
+docs/arxiv_v1_recentering_memo.md
+docs/figures/
+docs/archive/

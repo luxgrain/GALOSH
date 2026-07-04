@@ -31,8 +31,8 @@ EDITS = {
     'OUT  = ROOT.parent / "docs" / "paper"   # figures live next to the .tex'),
  ],
  "benchmark/scripts/make_qualitative_figure.py": [
-   (r'Path(r"C:\Users\luxgrain\GALOSH\benchmark\sidd_medium_v2")',
-    r'Path(r"C:\Users\luxgrain\GALOSH\benchmark\results_raw_sidd")'),
+   # (historical) an absolute sidd_medium_v2 -> results_raw_sidd repoint was applied
+   # here; that script now derives the repo root from __file__ / GALOSH_ROOT instead.
  ],
  "benchmark/scripts/bench_raw_v2_campaign.py": [
    ('GALOSH / "benchmark" / "sidd_medium_v2"',
