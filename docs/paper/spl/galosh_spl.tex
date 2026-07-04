@@ -209,27 +209,7 @@ SCUNet-real     & 36.09 & 0.902 & 0.252\\
 \end{tabular}
 \end{table}
 
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.92\textwidth]{../qualitative_rawnind.png}
-\caption{Raw domain, RawNIND. Columns: Noisy / VST+NLM-CFA / VST+BM3D-CFA /
-Blind2Unblind (trained) / \textbf{GALOSH (ours, blind)} / GT, with per-image
-LPIPS ($\downarrow$). The classical baselines are given the noise-aware VST
-front-end; GALOSH is fully blind.}
-\label{fig:qual}
-\end{figure*}
 
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.92\textwidth]{../qualitative_srgb_sidd.png}
-\caption{sRGB domain, SIDD Medium (full frame). Columns: Noisy / CBM3D /
-Color-NLM / Guided / NAFNet-SIDD / SCUNet / Restormer-SIDD /
-\textbf{GALOSH-YUV (ours)} / GT, with per-image LPIPS ($\downarrow$). All
-methods blind; the classical baselines leave large residual noise on the
-correlated rendering noise, and GALOSH sits between them and the SIDD-trained
-networks.}
-\label{fig:qualsrgb}
-\end{figure*}
 
 \paragraph{Raw domain} Table~\ref{tab:raw}: among the tested blind,
 training-free methods GALOSH leads both datasets on the perceptual metric by
@@ -297,6 +277,28 @@ tested members even under oracle conditions), extends it across two domains
 with one training-free core, and makes it fast: $7\times$--$650\times$ ahead
 of trained baselines on the same GPU, practical on plain CPUs, and designed
 to map onto fixed-point streaming hardware.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{../qualitative_rawnind.png}
+\caption{Raw domain, RawNIND. Columns: Noisy / VST+NLM-CFA / VST+BM3D-CFA /
+Blind2Unblind (trained) / \textbf{GALOSH (ours, blind)} / GT, with per-image
+LPIPS ($\downarrow$). The classical baselines are given the noise-aware VST
+front-end; GALOSH is fully blind.}
+\label{fig:qual}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{../qualitative_srgb_sidd.png}
+\caption{sRGB domain, SIDD Medium (full frame). Columns: Noisy / CBM3D /
+Color-NLM / Guided / NAFNet-SIDD / SCUNet / Restormer-SIDD /
+\textbf{GALOSH-YUV (ours)} / GT, with per-image LPIPS ($\downarrow$). All
+methods blind; the classical baselines leave large residual noise on the
+correlated rendering noise, and GALOSH sits between them and the SIDD-trained
+networks.}
+\label{fig:qualsrgb}
+\end{figure*}
 
 \begin{thebibliography}{21}\small
 \bibitem{bm3d} K.~Dabov, A.~Foi, V.~Katkovnik, and K.~Egiazarian, ``Image
