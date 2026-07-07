@@ -79,14 +79,13 @@ two paths use different operators at different aggressiveness with independent
 strength controls. The same core serves two thin front-ends. On raw,
 \textbf{GALOSH-RAW} inverts the usual order of operations: instead of
 treating the CFA as RGB with missing samples --- an interpolation problem
-to be demosaiced before denoising --- it treats the Bayer mosaic as a
-spatially multiplexed luma/chroma signal, in the spirit of frequency-domain
-CFA analysis~\cite{alleysson}, and demultiplexes it \emph{exactly} with a cycle-spun
-$2{\times}2$ Walsh--Hadamard transform --- full-resolution luminance,
-half-resolution chroma --- so the two noise
-populations can be treated differently before any demosaicer runs.
-\textbf{GALOSH-YUV/RGB} applies the same split to rendered sRGB images via
-a linear-light BT.709 transform. Our claim is not any single component but their
+--- it treats the Bayer mosaic as a spatially multiplexed luma/chroma
+signal, in the spirit of frequency-domain CFA analysis~\cite{alleysson},
+and demultiplexes it \emph{exactly} with a cycle-spun $2{\times}2$
+Walsh--Hadamard transform --- so the two noise populations are treated
+differently before any demosaicer runs. \textbf{GALOSH-YUV/RGB} applies
+the same split to rendered sRGB images via a linear-light BT.709
+transform. Our claim is not any single component but their
 composition into a search-free, fully blind, two-domain pipeline whose
 computation graph is fixed for every pixel of every image.
 
@@ -132,10 +131,9 @@ fit and GAT, a CFA-adapted achromatic dark reference (IRLS estimate of the
 achromatic floor) is subtracted, and a stride-1 cycle-spun $2{\times}2$
 Walsh--Hadamard transform demultiplexes the mosaic into one
 \emph{full-resolution} luminance plane --- the achromatic $2{\times}2$
-average evaluated at every pixel position, obtained exactly from the
-quad-aligned transform as a stride-1 sliding DC --- and three
-half-resolution chroma planes on the aligned quads; the decomposition is
-orthogonal and exactly invertible, with no interpolation involved. Chroma is denoised at
+average at every pixel, an exact stride-1 sliding DC of the quad-aligned
+transform --- and three half-resolution chroma planes on the aligned
+quads: orthogonal, exactly invertible, no interpolation. Chroma is denoised at
 half resolution, then returned to full resolution by a luminance-guided
 joint-bilateral EWA-jinc upsampling with an anti-ringing clamp to the local
 $2{\times}2$ input hull. The inverse WHT, dark restoration, and exact inverse
