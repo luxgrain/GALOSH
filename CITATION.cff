@@ -16,6 +16,7 @@ type: software
 authors:
   - family-names: Sato
     given-names: Yoshiro
+    orcid: "https://orcid.org/0009-0002-0933-9812"
 repository-code: "https://github.com/luxgrain/GALOSH"
 license: Apache-2.0
 keywords:
