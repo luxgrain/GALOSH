@@ -32,6 +32,7 @@ preferred-citation:
   authors:
     - family-names: Sato
       given-names: Yoshiro
+      orcid: "https://orcid.org/0009-0002-0933-9812"
   year: 2026
   doi: 10.48550/arXiv.2607.03768
   notes: "arXiv:2607.03768 [eess.IV]"
