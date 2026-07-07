@@ -76,11 +76,16 @@ guided/joint-bilateral tradition~\cite{kopf,guidedfilter}). The luma/chroma
 split is deliberate: luminance noise reads as grain and coexists with texture,
 whereas chroma noise reads as color blotches that are never acceptable, so the
 two paths use different operators at different aggressiveness with independent
-strength controls. The same core serves two thin front-ends:
-\textbf{GALOSH-RAW} on the Bayer mosaic (a $2{\times}2$ Walsh--Hadamard
-transform of each quad provides the luma/chroma split) and
-\textbf{GALOSH-YUV/RGB} on rendered sRGB images (a linear-light BT.709
-transform provides it). Our claim is not any single component but their
+strength controls. The same core serves two thin front-ends. On raw,
+\textbf{GALOSH-RAW} inverts the usual order of operations: instead of
+treating the CFA as RGB with missing samples --- an interpolation problem
+to be demosaiced before denoising --- it treats the Bayer mosaic as a
+spatially multiplexed luma/chroma signal, in the spirit of frequency-domain
+CFA analysis~\cite{alleysson}, and demultiplexes it \emph{exactly} with a
+$2{\times}2$ Walsh--Hadamard transform of each quad --- so the two noise
+populations can be treated differently before any demosaicer runs.
+\textbf{GALOSH-YUV/RGB} applies the same split to rendered sRGB images via
+a linear-light BT.709 transform. Our claim is not any single component but their
 composition into a search-free, fully blind, two-domain pipeline whose
 computation graph is fixed for every pixel of every image.
 
@@ -120,11 +125,14 @@ must not invent colors absent from its input''). The two paths expose
 independent strengths $s_L,s_C$; all benchmarks use fixed defaults.
 
 \subsection{Domain front-ends}
-\paragraph{GALOSH-RAW} operates directly on the Bayer mosaic: after the blind
+\paragraph{GALOSH-RAW} operates directly on the Bayer mosaic, treated as a
+luma/chroma-multiplexed signal rather than incomplete RGB: after the blind
 fit and GAT, a CFA-adapted achromatic dark reference (IRLS estimate of the
 achromatic floor) is subtracted, and a stride-1 cycle-spun $2{\times}2$
-Walsh--Hadamard transform maps each Bayer quad to one full-resolution
-luminance plane and three half-resolution chroma planes. Chroma is denoised at
+Walsh--Hadamard transform demultiplexes each Bayer quad into one
+full-resolution luminance plane and three half-resolution chroma planes ---
+an orthogonal, exactly invertible decomposition; no interpolation is
+involved. Chroma is denoised at
 half resolution, then returned to full resolution by a luminance-guided
 joint-bilateral EWA-jinc upsampling with an anti-ringing clamp to the local
 $2{\times}2$ input hull. The inverse WHT, dark restoration, and exact inverse
@@ -272,7 +280,9 @@ streaming hardware'' --- not as a completed ISP implementation.
 \section{Conclusion}
 Removing the search from classical denoising --- replacing block matching
 with variance-stabilized cycle-spun local shrinkage and luminance-guided
-chroma regression --- retains the classical family's quality (surpassing the
+chroma regression, and recasting CFA denoising from interpolation over
+missing RGB into an exact luma/chroma demultiplex --- retains the
+classical family's quality (surpassing the
 tested members even under oracle conditions), extends it across two domains
 with one training-free core, and makes it fast: $7\times$--$650\times$ ahead
 of trained baselines on the same GPU, practical on plain CPUs, and designed
@@ -344,6 +354,9 @@ dataset,'' \emph{CVPRW}, 2019.
 \bibitem{lpips} R.~Zhang, P.~Isola, A.~A.~Efros, E.~Shechtman, and O.~Wang,
 ``The unreasonable effectiveness of deep features as a perceptual metric,''
 \emph{CVPR}, 2018.
+\bibitem{alleysson} D.~Alleysson, S.~S\"usstrunk, and J.~H\'erault,
+``Linear demosaicing inspired by the human visual system,'' \emph{IEEE
+TIP}, 2005.
 \bibitem{galosharxiv} Y.~Sato, ``GALOSH: Blind, training-free denoising of raw
 Bayer and sRGB images by parallel-friendly local shrinkage,'' arXiv:2607.03768
 [eess.IV], 2026.
