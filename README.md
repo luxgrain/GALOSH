@@ -9,7 +9,7 @@ parallel-friendly local shrinkage.**
 Preprint: [PDF (English)](https://github.com/luxgrain/GALOSH/releases/download/v0.1.0/galosh_paper.pdf)
 · [日本語版 PDF (Japanese translation)](https://github.com/luxgrain/GALOSH/releases/download/v0.1.0/galosh_paper_ja.pdf)
 · [Zenodo (DOI 10.5281/zenodo.21187219)](https://doi.org/10.5281/zenodo.21187219)
-· arXiv: in progress
+· [arXiv:2607.03768](https://arxiv.org/abs/2607.03768)
 
 GALOSH (Generalized Anscombe LOcal SHrinkage) is a **classical** image denoiser
 redesigned for modern parallel hardware:
