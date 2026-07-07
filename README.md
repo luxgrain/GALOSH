@@ -106,8 +106,9 @@ as color blotches (aggressive smoothing, anchored to luma structure). The two
 paths expose independent strength controls.
 
 **GALOSH-RAW** adds the raw-only stages: CFA-aware achromatic dark reference,
-stride-1 cycle-spun 2×2 WHT decomposition of each Bayer quad into full-res
-luma + half-res chroma, and a luminance-guided joint-bilateral EWA-jinc chroma
+a cycle-spun 2×2 WHT decomposition of the mosaic into full-res luma (the
+achromatic 2×2 average at every pixel, a stride-1 sliding DC derived exactly
+from the quad-aligned transform) + half-res chroma on the aligned quads, and a luminance-guided joint-bilateral EWA-jinc chroma
 upsampling (anti-ringed). Input/output = linear raw Bayer float32 in [0,1].
 
 **GALOSH-YUV/RGB** adds the color-image front-end: inverse sRGB gamma →
