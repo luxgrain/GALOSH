@@ -1,0 +1,34 @@
+{
+ "cpu_fp32/synth_1080p": {
+  "deterministic": true,
+  "sha256": "9afd585b5c1bc72c0ed8fdec20c31b86977a2ee7c80771aec5f3fd0f4cafda6e"
+ },
+ "cpu_fp32/synth_small_edge": {
+  "deterministic": true,
+  "sha256": "d9fb90e5a9b6a067982cd4aee55849f67ebbcc3822c8755d4cfb47d03b52dc67"
+ },
+ "cpu_fp32/synth_dark": {
+  "deterministic": true,
+  "sha256": "6c55927193af1c7d9ea1c44ce61040efd998648853404c4bb161315f486ad94a"
+ },
+ "cpu_fp32/dng_Bayer_TEST_Pen-pile_ISO1600_sha1=1a26389": {
+  "deterministic": true,
+  "sha256": "354d8fe6bc8c36e69f140ff146af54d4a08e373ac44f12458ef1b7a04af3f07c"
+ },
+ "cpu_r32/synth_1080p": {
+  "deterministic": true,
+  "sha256": "b4257012671acb023a072d9fa7c45373b0870d628942c142c536a629592c8405"
+ },
+ "cpu_r32/synth_small_edge": {
+  "deterministic": true,
+  "sha256": "5244c84d182ae14eeb9e45b9a0e7be1a20636e8d7563203b8f4cd1f6f9c7ef8b"
+ },
+ "cpu_r32/synth_dark": {
+  "deterministic": true,
+  "sha256": "48f131c9a0dd1528746b23f610443f993a6ce131b4a751de9d3c577530498461"
+ },
+ "cpu_r32/dng_Bayer_TEST_Pen-pile_ISO1600_sha1=1a26389": {
+  "deterministic": true,
+  "sha256": "c36a355acc921d4b27cd6c003b2609b5d8da5a63f22129ec85938275b5817bbc"
+ }
+}

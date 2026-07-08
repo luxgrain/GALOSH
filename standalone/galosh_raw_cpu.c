@@ -2128,10 +2128,22 @@ int main(int argc, char **argv)
    * can append them anywhere on the CLI. */
   int new_argc = 0;
   char *positional[32];
+  /* [V2.0 A1] noise-model injection mode (parsed below, applied after input
+   * read).  デフォルト "fit" = 従来経路そのまま（byte-identical 保証）。 */
+  const char *noise_mode = "fit";
+  const char *noise_state_path = NULL;
   for(int i = 0; i < argc; i++)
   {
     const char *a = argv[i];
-    if(strncmp(a, "--stride=", 9) == 0)
+    if(strncmp(a, "--noise=", 8) == 0)
+    {
+      noise_mode = a + 8;
+    }
+    else if(strncmp(a, "--noise-state=", 14) == 0)
+    {
+      noise_state_path = a + 14;
+    }
+    else if(strncmp(a, "--stride=", 9) == 0)
     {
       g_galosh_stride = atoi(a + 9);
       if(g_galosh_stride < 1 || g_galosh_stride > 8) g_galosh_stride = 2;
@@ -2220,6 +2232,9 @@ int main(int argc, char **argv)
       "       [--stride=N]      (G-only: 1 or 2, default 2; A enables stride=1)\n"
       "       [--orient=N]      (G-only: 1 or 4, default 1; B enables orient=4)\n"
       "       [--lfr-kernel=K]  (G-only: box | ewajl3, default box; C: ewajl3)\n"
+      "       [--noise=M]       (fit | hold | every:N | ema:B; video-loop noise-model\n"
+      "                          injection -- stateful modes need --noise-state=FILE)\n"
+      "       [--noise-state=F] (one-line state file: alpha sigma_sq frames_since_fit)\n"
       "\n"
       "  method:  'galosh' or 'ours' (GALOSH local WHT shrinkage, default)\n"
       "  luma_str:   sigma_L for luma shrinkage (default 0.5, user-tunable)\n"
@@ -2316,6 +2331,102 @@ int main(int argc, char **argv)
     fprintf(stderr, "Read %zu floats, expected %zu\n", nread, npixels);
     dt_free_align(in); dt_free_align(out);
     return 1;
+  }
+
+  /* ================= [V2.0 A1] noise-model injection modes =================
+   * EN: Reference semantics for the video API (GPU: galosh_set_noise_update).
+   *   --noise=fit      per-frame blind fit (default; legacy path, untouched)
+   *   --noise=hold     use (alpha, sigma_sq) from --noise-state, no fit
+   *   --noise=every:N  refit when frames_since_fit >= N, else hold stored
+   *   --noise=ema:B    fit every frame, blend new = B*fit + (1-B)*stored
+   * The state file (--noise-state) is one line: alpha sigma_sq frames_since_fit,
+   * so a scripted video loop shares the model across frame-by-frame
+   * invocations.  The pipeline itself is untouched: stateful modes compute
+   * the model HERE and feed the existing override short-circuit (the
+   * argv[9]/argv[10] mechanism), which is why --noise=fit stays
+   * byte-identical to the legacy CLI.
+   * JP: 動画 API の参照意味論。fit は従来経路そのまま（byte-identical）。
+   * hold/every/ema は main 側でモデルを確定して既存 override 機構へ注入する
+   * だけで、パイプライン本体は無変更。state ファイルが フレーム間の共有点。 */
+  if(strcmp(noise_mode, "fit") != 0)
+  {
+    float st_a = 0.0f, st_s = 0.0f;
+    int st_n = -1;                      /* stored frames_since_fit; -1 = none */
+    if(noise_state_path)
+    {
+      FILE *sf = fopen(noise_state_path, "r");
+      if(sf)
+      {
+        if(fscanf(sf, "%f %f %d", &st_a, &st_s, &st_n) != 3) st_n = -1;
+        fclose(sf);
+      }
+    }
+    const int have_state = (st_n >= 0 && st_a > 0.0f);
+    float use_a = 0.0f, use_s = 0.0f;
+    int new_n = 0;
+
+    if(strcmp(noise_mode, "hold") == 0)
+    {
+      if(!have_state)
+      {
+        fprintf(stderr, "--noise=hold requires a valid --noise-state file\n");
+        dt_free_align(in); dt_free_align(out);
+        return 1;
+      }
+      use_a = st_a; use_s = st_s; new_n = st_n + 1;
+    }
+    else if(strncmp(noise_mode, "every:", 6) == 0)
+    {
+      const int N = atoi(noise_mode + 6);
+      if(have_state && st_n + 1 < (N > 0 ? N : 1))
+      {
+        use_a = st_a; use_s = st_s; new_n = st_n + 1;
+      }
+      else
+      {
+        const galosh_noise_params_t est = galosh_estimate_noise(in, width, height);
+        use_a = est.alpha; use_s = est.sigma_sq; new_n = 0;
+      }
+    }
+    else if(strncmp(noise_mode, "ema:", 4) == 0)
+    {
+      const float beta_in = (float)atof(noise_mode + 4);
+      const float b = (beta_in > 0.0f && beta_in <= 1.0f) ? beta_in : 1.0f;
+      const galosh_noise_params_t est = galosh_estimate_noise(in, width, height);
+      if(have_state)
+      {
+        use_a = b * est.alpha    + (1.0f - b) * st_a;
+        use_s = b * est.sigma_sq + (1.0f - b) * st_s;
+      }
+      else
+      {
+        use_a = est.alpha; use_s = est.sigma_sq;
+      }
+      new_n = 0;
+    }
+    else
+    {
+      fprintf(stderr, "Unknown --noise mode '%s' (fit|hold|every:N|ema:B)\n",
+              noise_mode);
+      dt_free_align(in); dt_free_align(out);
+      return 1;
+    }
+
+    g_galosh_alpha_override    = use_a;
+    g_galosh_sigma_sq_override = use_s;
+    fprintf(stderr, "  noise mode=%s: alpha=%.8f sigma_sq=%.10f (frames_since_fit=%d)\n",
+            noise_mode, use_a, use_s, new_n);
+    if(noise_state_path)
+    {
+      FILE *sf = fopen(noise_state_path, "w");
+      if(sf)
+      {
+        fprintf(sf, "%.9g %.9g %d\n", use_a, use_s, new_n);
+        fclose(sf);
+      }
+      else
+        fprintf(stderr, "WARNING: cannot write --noise-state %s\n", noise_state_path);
+    }
   }
 
   /* Process */
