@@ -121,8 +121,20 @@ def write_dng_skeleton(path: Path, data_u16: np.ndarray, cfa_pattern: bytes,
 # ----------------------------------------------------------------------
 # Per-file processing / 1 ファイルの処理
 # ----------------------------------------------------------------------
+def _mode_suffix(l_str: float, c_str: float, wht: int, upsample: str) -> str:
+    """Filename suffix encodes non-default modes so outputs never collide.
+    非デフォルトのモードはファイル名に刻む（衝突防止＋出所自明）。"""
+    parts = [f"l{_fmt(l_str)}", f"c{_fmt(c_str)}"]
+    if wht == 4:
+        parts.append("wht4")
+    if upsample == "fast":
+        parts.append("upfast")
+    return "_GALOSH_" + "_".join(parts)
+
+
 def process_dng(src: Path, l_str: float, c_str: float, use_gpu: bool,
-                exe_cpu: Path, exe_gpu, exiftool: Path) -> Path:
+                exe_cpu: Path, exe_gpu, exiftool: Path,
+                wht: int = 8, upsample: str = "jinc") -> Path:
     import rawpy
 
     raw = rawpy.imread(str(src))
@@ -159,13 +171,25 @@ def process_dng(src: Path, l_str: float, c_str: float, use_gpu: bool,
         tout = Path(td) / "out.bin"
         f32[:He, :We].tofile(tin)
 
+        mode_flags = []
+        if wht == 4:
+            mode_flags.append("--wht=4")
+        if upsample == "fast":
+            mode_flags.append("--upsample=fast")
+        if use_gpu and exe_gpu is not None and mode_flags:
+            # The OpenCL GPU exe predates the V2.0 fast modes; fall back.
+            # OpenCL 版は V2.0 fast モード未対応 → CPU にフォールバック。
+            print("[GALOSH]   note: --wht/--upsample not supported by the GPU "
+                  "pipeline yet; using CPU.")
+            use_gpu = False
         if use_gpu and exe_gpu is not None:
             cmd = [str(exe_gpu), str(tin), str(tout), str(We), str(He),
                    "1.0", f"{l_str}", f"{c_str}", "0", "0", "0"]
             cwd = str(exe_gpu.parent)  # galosh.cl lives next to the exe
         else:
             cmd = [str(exe_cpu), str(tin), str(tout), str(We), str(He),
-                   "galosh", "1.0", f"{l_str}", f"{c_str}", "0", "0"]
+                   "galosh", "1.0", f"{l_str}", f"{c_str}", "0", "0",
+                   *mode_flags]
             cwd = str(exe_cpu.parent)
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
@@ -189,7 +213,8 @@ def process_dng(src: Path, l_str: float, c_str: float, use_gpu: bool,
     if wb[0] > 0 and wb[1] > 0 and wb[2] > 0:
         as_shot = [wb[1] / wb[0], 1.0, wb[1] / wb[2]]
 
-    dst = src.with_name(f"{src.stem}_GALOSH_l{_fmt(l_str)}_c{_fmt(c_str)}.dng")
+    dst = src.with_name(src.stem + _mode_suffix(l_str, c_str, wht, upsample)
+                        + ".dng")
     write_dng_skeleton(dst, out_u16, cfa, [float(b) for b in blacks[:4]],
                        int(white), cm, as_shot, "GALOSH denoised")
     raw.close()
@@ -214,7 +239,9 @@ def process_dng(src: Path, l_str: float, c_str: float, use_gpu: bool,
     r = subprocess.run(
         [str(exiftool), "-TagsFromFile", str(src), "-all:all", "-unsafe",
          "-icc_profile", *calib, "-F",
-         f"-Software=GALOSH (arXiv:2607.03768) l={_fmt(l_str)} c={_fmt(c_str)}",
+         "-Software=GALOSH (arXiv:2607.03768)"
+         + _mode_suffix(l_str, c_str, wht, upsample).replace("_GALOSH_", " ")
+           .replace("_", " "),
          "-overwrite_original", str(dst)],
         capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
@@ -237,6 +264,12 @@ def main(argv=None):
                     help="chrominance strength s_C (default 1.0)")
     ap.add_argument("--gpu", action="store_true",
                     help="use the OpenCL GPU pipeline (o32) if available")
+    ap.add_argument("--wht", type=int, choices=(8, 4), default=8,
+                    help="luma WHT block: 8 = canonical (default), "
+                         "4 = fast (coarser grain)")
+    ap.add_argument("--upsample", choices=("jinc", "fast"), default="jinc",
+                    help="chroma upsample: jinc = canonical K16 (default), "
+                         "fast = guided bilinear (ring-free, slightly softer)")
     args = ap.parse_args(argv)
 
     exe_cpu = _find_tool("galosh_raw_cpu.exe")
@@ -258,7 +291,8 @@ def main(argv=None):
               f"{' gpu' if exe_gpu else ''}) ...", flush=True)
         try:
             dst = process_dng(src, args.luma, args.chroma, args.gpu,
-                              exe_cpu, exe_gpu, exiftool)
+                              exe_cpu, exe_gpu, exiftool,
+                              wht=args.wht, upsample=args.upsample)
             print(f"[GALOSH]   -> {dst}")
             ok += 1
         except SystemExit as e:
