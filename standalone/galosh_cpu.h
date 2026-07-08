@@ -626,6 +626,43 @@ static int compare_floats_galosh(const void *a, const void *b)
 float g_galosh_alpha_override = 0.0f;
 float g_galosh_sigma_sq_override = 0.0f;
 
+/* ================================================================
+ * [V2.0 A4] FP16 storage oracle (--f16-storage).
+ *
+ * EN: When enabled, the MAJOR inter-phase buffers of the O pipeline are
+ * rounded through IEEE binary16 (round-to-nearest-even) at the exact
+ * points where the Vulkan FP16 port will store them in 16-bit buffers
+ * (compute stays FP32 = "FP16 storage / FP32 accumulate", the same
+ * philosophy as the INT16 lf/cf storage narrowing).  This CPU build is
+ * therefore the bit-parity ORACLE for the GPU FP16 path, and the
+ * measured delta vs the FP32 canonical output IS the storage-
+ * quantization cost.  Rounded buffers (the v1 contract):
+ *   L_cs (P5 in), L_cs_pilot (pass1->pass2), L_cs_den (P5 out),
+ *   L_pixel + L_h_den (P6 guides), C1/2/3_h_den (P8 out),
+ *   C1/2/3_aligned (P9 out).  Pyramid-internal quarter/eighth buffers
+ *   stay FP32 in this contract revision.
+ * JP: 有効時、O パイプラインの主要フェーズ間バッファを binary16 で
+ * 丸める（演算は FP32 のまま = ストレージのみ半精度、i16 の lf/cf と
+ * 同じ思想）。Vulkan FP16 移植の bit-parity オラクルであり、正準 FP32
+ * 出力との差分がそのまま格納量子化コスト。 */
+int g_galosh_f16_storage = 0;
+
+static inline float galosh_f16_round(const float x)
+{
+  /* GCC >= 12 x86-64: correct RNE via _Float16 (F16C or soft-float). */
+  return (float)(_Float16)x;
+}
+
+static void galosh_f16_round_buf(float *buf, const size_t n)
+{
+  DT_OMP_FOR()
+  for(size_t i = 0; i < n; i++) buf[i] = galosh_f16_round(buf[i]);
+}
+
+/* Insert at a phase boundary: rounds in place only when the oracle is on. */
+#define GALOSH_F16_STAGE(buf, n) \
+  do { if(g_galosh_f16_storage) galosh_f16_round_buf((buf), (n)); } while(0)
+
 static galosh_noise_params_t galosh_estimate_noise(const float *raw,
                                                 const int width, const int height)
 {

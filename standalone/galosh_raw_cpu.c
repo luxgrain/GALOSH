@@ -1518,14 +1518,17 @@ static void galosh_raw_denoise(const float *const restrict in,
     if(!L_cs_pilot) goto cleanup_rawlc_o;
     /* [V2.0 A2] block size routed through --wht (default 8 = canonical O;
      * 4 = fast mode).  wiener_floor stays 1/B by construction. */
+    GALOSH_F16_STAGE(L_cs, npixels);          /* [A4] P5 input storage */
     galosh_pass1_blocked(L_cs, L_cs_pilot, width, height,
                           luma_strength, /*block=*/g_galosh_wht_block,
                           /*stride=*/2, /*use_robust_shrink=*/1);
+    GALOSH_F16_STAGE(L_cs_pilot, npixels);    /* [A4] pass1->pass2 buffer */
     O32_CPU_DUMP("p5_pilot", L_cs_pilot, npixels);
     galosh_pass2_blocked(L_cs, L_cs_pilot, L_cs_den, width, height,
                           luma_strength,
                           /*wiener_floor=*/(1.0f / (float)g_galosh_wht_block),
                           /*block=*/g_galosh_wht_block, /*stride=*/2);
+    GALOSH_F16_STAGE(L_cs_den, npixels);      /* [A4] P5 output storage */
     dt_free_align(L_cs_pilot);
   }
   O32_CPU_DUMP("p5_L_cs_den", L_cs_den, npixels);
@@ -1554,6 +1557,8 @@ static void galosh_raw_denoise(const float *const restrict in,
       L_h_den[(size_t)hr * halfwidth + hc] = L_cs_den[(size_t)fr * width + fc];
     }
   }
+  GALOSH_F16_STAGE(L_pixel, npixels);         /* [A4] P6 full-res guide */
+  GALOSH_F16_STAGE(L_h_den, chsize);          /* [A4] P6 half-res guide */
   O32_CPU_DUMP("p6_L_pixel", L_pixel, npixels);
   O32_CPU_DUMP("p6_L_h_den", L_h_den, chsize);
   dt_free_align(L_cs_den); L_cs_den = NULL;
@@ -1910,6 +1915,10 @@ static void galosh_raw_denoise(const float *const restrict in,
   C1_e_up = C2_e_up = C3_e_up = NULL;
   dt_free_align(L_h_den); L_h_den = NULL;
 
+  GALOSH_F16_STAGE(C1_h_den, chsize);         /* [A4] P8 blended chroma */
+  GALOSH_F16_STAGE(C2_h_den, chsize);
+  GALOSH_F16_STAGE(C3_h_den, chsize);
+
   /* ============== [LATEST: GALOSH_RAW_O] Phase 9 — Joint bilateral K16
    * EWA-JL3 upsample to full-res with L_pixel guide.  Identical to L
    * pipeline. ============== */
@@ -1921,6 +1930,9 @@ static void galosh_raw_denoise(const float *const restrict in,
   gat_chroma_upsample(C1_h_den, C2_h_den, C3_h_den, L_pixel,
                       C1_aligned, C2_aligned, C3_aligned,
                       halfwidth, halfheight, /*BW=*/1.5f);
+  GALOSH_F16_STAGE(C1_aligned, npixels);      /* [A4] P9 full-res chroma */
+  GALOSH_F16_STAGE(C2_aligned, npixels);
+  GALOSH_F16_STAGE(C3_aligned, npixels);
   O32_CPU_DUMP("p9_C1_aligned", C1_aligned, npixels);
   dt_free_align(C1_h_den); dt_free_align(C2_h_den); dt_free_align(C3_h_den);
   C1_h_den = C2_h_den = C3_h_den = NULL;
@@ -2202,6 +2214,11 @@ int main(int argc, char **argv)
       fprintf(stderr, "  --upsample=%s\n",
               g_galosh_upsample_fast ? "fast (guided bilinear)" : "jinc (K16)");
     }
+    else if(strcmp(a, "--f16-storage") == 0)
+    {
+      g_galosh_f16_storage = 1;
+      fprintf(stderr, "  --f16-storage (FP16 inter-phase storage oracle)\n");
+    }
     else if(strncmp(a, "--stride=", 9) == 0)
     {
       g_galosh_stride = atoi(a + 9);
@@ -2297,6 +2314,8 @@ int main(int argc, char **argv)
       "       [--wht=B]         (8 = canonical | 4 = fast luma LOSH, coarser grain)\n"
       "       [--upsample=K]    (jinc = canonical K16 | fast = guided bilinear,\n"
       "                          ring-free by construction, slightly softer chroma)\n"
+      "       [--f16-storage]   (FP16 inter-phase storage oracle: rounds major\n"
+      "                          phase buffers through binary16; GPU FP16 parity ref)\n"
       "\n"
       "  method:  'galosh' or 'ours' (GALOSH local WHT shrinkage, default)\n"
       "  luma_str:   sigma_L for luma shrinkage (default 0.5, user-tunable)\n"
