@@ -3585,6 +3585,107 @@ static void gat_h_inverse_overlap_add(const float *restrict L,
   }
 }
 
+/* ================================================================
+ * [V2.0 A3] gat_fast_guided_upsample — fast alternative to
+ * gat_k16_joint_bilateral_upsample (selected by --upsample=fast).
+ *
+ * EN: Guided BILINEAR 2x upsample.  Per output pixel only the nearest
+ * 2x2 half-res samples contribute (1/2/4 taps depending on sub-pixel
+ * phase), weighted bilinear x the SAME bilateral L-guide modulation as
+ * K16.  All weights are >= 0, so the result is a convex combination of
+ * source samples: jinc-style ringing is impossible BY CONSTRUCTION
+ * (the anti-ringing hull clamp is the identity here) and no
+ * sign-preserving sum floor is needed.  Cost: <= 4 taps vs K16's 25.
+ * Trade-off: the jinc's bandlimit-faithful sharpness is lost (slightly
+ * softer chroma) — quality labeled by the V2.0 bench.
+ * JP: 最近傍 2x2 のみのガイド付き bilinear（L bilateral 変調は K16 と
+ * 同一）。全重み非負の凸結合なのでリンギングは構造的にゼロ
+ * （クランプ不要）。jinc の帯域忠実な鋭さは失う（クロマがやや柔らか
+ * くなる）代わりに大幅に軽い。品質ラベルは V2.0 ベンチで確定。
+ * ================================================================ */
+static void gat_fast_guided_upsample(
+    const float *restrict c1_h,
+    const float *restrict c2_h,
+    const float *restrict c3_h,
+    const float *restrict L_pixel,
+    float *restrict c1_full,
+    float *restrict c2_full,
+    float *restrict c3_full,
+    const int halfwidth, const int halfheight,
+    const float BW)
+{
+  const int fw = 2 * halfwidth;
+  const int fh = 2 * halfheight;
+  const float inv_2sigma_sq = 1.0f / (2.0f * BW * BW);
+
+  DT_OMP_FOR()
+  for(int hy = 0; hy < halfheight; hy++)
+  {
+    for(int hx = 0; hx < halfwidth; hx++)
+    {
+      for(int si = 0; si < 4; si++)
+      {
+        const int sub_dy = si / 2;
+        const int sub_dx = si % 2;
+        const int fr = 2 * hy + sub_dy;
+        const int fc = 2 * hx + sub_dx;
+        if(fr >= fh || fc >= fw) continue;
+
+        const float L_c = L_pixel[(size_t)fr * fw + fc];
+        /* Bilinear tap weights per sub-pixel phase (offset 0 or +0.5):
+         * aligned (0)  -> single tap, weight 1
+         * offset (0.5) -> two taps, weights 0.5 / 0.5                 */
+        const float wy[2] = { sub_dy ? 0.5f : 1.0f, 0.5f };
+        const float wx[2] = { sub_dx ? 0.5f : 1.0f, 0.5f };
+
+        float sum_w = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for(int dy = 0; dy <= sub_dy; dy++)
+        {
+          int hyi = hy + dy;
+          if(hyi >= halfheight) hyi = halfheight - 1;
+          for(int dx = 0; dx <= sub_dx; dx++)
+          {
+            int hxi = hx + dx;
+            if(hxi >= halfwidth) hxi = halfwidth - 1;
+
+            /* L at the half-res sample's full-res TL position (same
+             * convention as K16; boundary-clamped). */
+            const int fri = 2 * hyi;
+            const int fci = 2 * hxi;
+            const float L_i = L_pixel[(size_t)((fri < fh) ? fri : fh - 1) * fw
+                                      + ((fci < fw) ? fci : fw - 1)];
+            const float dL = L_i - L_c;
+            const float w = wy[dy] * wx[dx] * expf(-dL * dL * inv_2sigma_sq);
+
+            const size_t hp = (size_t)hyi * halfwidth + hxi;
+            sum_w += w;
+            s1 += w * c1_h[hp];
+            s2 += w * c2_h[hp];
+            s3 += w * c3_h[hp];
+          }
+        }
+
+        const size_t fp = (size_t)fr * fw + fc;
+        if(sum_w > 1e-12f)
+        {
+          const float inv = 1.0f / sum_w;
+          c1_full[fp] = s1 * inv;
+          c2_full[fp] = s2 * inv;
+          c3_full[fp] = s3 * inv;
+        }
+        else
+        {
+          /* bilateral killed all taps (pathological): nearest sample */
+          const size_t hp = (size_t)hy * halfwidth + hx;
+          c1_full[fp] = c1_h[hp];
+          c2_full[fp] = c2_h[hp];
+          c3_full[fp] = c3_h[hp];
+        }
+      }
+    }
+  }
+}
+
 /* =================================================================
  * [LATEST: GALOSH_RAW_L] gat_k16_joint_bilateral_upsample — guide-aware
  * EWA Jinc-Lanczos-3 upsample of half-res chroma to full-res, with

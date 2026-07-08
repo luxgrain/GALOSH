@@ -61,6 +61,49 @@ static int g_galosh_lfr_kernel = 0;   /* [PREVIOUS: GALOSH_RAW_G] */
 static int g_galosh_unified    = 0;   /* [PREVIOUS: GALOSH_RAW_G] */
 static int g_galosh_k13_block  = 8;   /* [PREVIOUS: GALOSH_RAW_G] */
 
+/* [V2.0 A2] Full-res luma LOSH block size (--wht=4|8).
+ * EN: 8 = canonical O (default, byte-identical to the published pipeline).
+ *     4 = fast mode: Phase-5 WHT/shrinkage work scales ~B*log2(B) per pixel,
+ *     so 4x4 roughly halves the dominant luma stage in exchange for coarser
+ *     grain-scale separation (quality labeled by the V2.0 bench; the GPU
+ *     port mirrors this flag).  Distinct from g_galosh_k13_block above,
+ *     which selects the ARCHIVED K13 half-res-chroma block and is kept
+ *     untouched for bench-archive reproducibility.
+ * JP: 8 = 正準 O（既定、公開パイプラインと byte-identical）。4 = fast
+ *     モード: Phase 5 支配段の演算量がほぼ半減する代わりに粒状感の分離が
+ *     粗くなる（V2.0 ベンチでラベル付け、GPU 移植でも同フラグ）。上の
+ *     g_galosh_k13_block（ARCHIVED K13 の半解像度クロマ用）とは別物。 */
+static int g_galosh_wht_block  = 8;
+
+/* [V2.0 A3] Chroma upsample kernel (--upsample=jinc|fast).
+ * EN: 0 = jinc (canonical O: K16 EWA jinc-jinc + bilateral L guide +
+ *     anti-ringing hull clamp, default, byte-identical).  1 = fast:
+ *     guided bilinear (<= 4 taps, convex => ring-free by construction);
+ *     applied to ALL O-pipeline chroma upsample sites (pyramid
+ *     transitions + final half->full).  CPU-oriented speed option —
+ *     on GPU the K16 stage is ~1% of frame time (measured 2026-07-09).
+ * JP: 0 = 正準 jinc（既定、byte-identical）。1 = fast: ガイド付き
+ *     bilinear。O パイプラインの全アップサンプル箇所（ピラミッド遷移
+ *     ＋最終 half→full）に適用。CPU 向け速度オプション。 */
+static int g_galosh_upsample_fast = 0;
+
+/* [V2.0 A3] Dispatch wrapper: same signature as the two kernels. */
+static void gat_chroma_upsample(
+    const float *c1_h, const float *c2_h, const float *c3_h,
+    const float *L_pixel,
+    float *c1_full, float *c2_full, float *c3_full,
+    const int halfwidth, const int halfheight, const float BW)
+{
+  if(g_galosh_upsample_fast)
+    gat_fast_guided_upsample(c1_h, c2_h, c3_h, L_pixel,
+                             c1_full, c2_full, c3_full,
+                             halfwidth, halfheight, BW);
+  else
+    gat_k16_joint_bilateral_upsample(c1_h, c2_h, c3_h, L_pixel,
+                                     c1_full, c2_full, c3_full,
+                                     halfwidth, halfheight, BW);
+}
+
 /* [LATEST: GALOSH_RAW_M] Variant dispatch.
  *   'm' = GALOSH_RAW_M — H + hierarchical Bayesian Phase 5(C):
  *         R_local=7 LOESS (with σ_local²(x) emission) + R_global=15
@@ -1473,13 +1516,16 @@ static void galosh_raw_denoise(const float *const restrict in,
   {
     float *L_cs_pilot = dt_alloc_align_float(npixels);
     if(!L_cs_pilot) goto cleanup_rawlc_o;
+    /* [V2.0 A2] block size routed through --wht (default 8 = canonical O;
+     * 4 = fast mode).  wiener_floor stays 1/B by construction. */
     galosh_pass1_blocked(L_cs, L_cs_pilot, width, height,
-                          luma_strength, /*block=*/8, /*stride=*/2,
-                          /*use_robust_shrink=*/1);
+                          luma_strength, /*block=*/g_galosh_wht_block,
+                          /*stride=*/2, /*use_robust_shrink=*/1);
     O32_CPU_DUMP("p5_pilot", L_cs_pilot, npixels);
     galosh_pass2_blocked(L_cs, L_cs_pilot, L_cs_den, width, height,
-                          luma_strength, /*wiener_floor=*/(1.0f / 8.0f),
-                          /*block=*/8, /*stride=*/2);
+                          luma_strength,
+                          /*wiener_floor=*/(1.0f / (float)g_galosh_wht_block),
+                          /*block=*/g_galosh_wht_block, /*stride=*/2);
     dt_free_align(L_cs_pilot);
   }
   O32_CPU_DUMP("p5_L_cs_den", L_cs_den, npixels);
@@ -1659,9 +1705,9 @@ static void galosh_raw_denoise(const float *const restrict in,
     /* Crop L_h_den (chsize stride) to (fw × fh) for stride-matching K16. */
     gat_crop_2d_topleft(L_h_den, halfwidth, halfheight, L_for_q, fw, fh);
 
-    gat_k16_joint_bilateral_upsample(C1_loess_q, C2_loess_q, C3_loess_q, L_for_q,
-                                      C1_q_up_raw, C2_q_up_raw, C3_q_up_raw,
-                                      cq_w, cq_h, /*BW=*/1.5f);
+    gat_chroma_upsample(C1_loess_q, C2_loess_q, C3_loess_q, L_for_q,
+                        C1_q_up_raw, C2_q_up_raw, C3_q_up_raw,
+                        cq_w, cq_h, /*BW=*/1.5f);
 
     /* Pad-to-chsize via edge replication for the smoothstep blend. */
     gat_pad_2d_edge(C1_q_up_raw, fw, fh, C1_q_up, halfwidth, halfheight);
@@ -1696,9 +1742,9 @@ static void galosh_raw_denoise(const float *const restrict in,
     /* L_q is at (cq_w × cq_h); crop to (fw_eq × fh_eq) for K16 stride match. */
     gat_crop_2d_topleft(L_q, cq_w, cq_h, L_for_e, fw_eq, fh_eq);
 
-    gat_k16_joint_bilateral_upsample(C1_loess_e, C2_loess_e, C3_loess_e, L_for_e,
-                                      C1_e_to_q_raw, C2_e_to_q_raw, C3_e_to_q_raw,
-                                      ce_w, ce_h, /*BW=*/1.5f);
+    gat_chroma_upsample(C1_loess_e, C2_loess_e, C3_loess_e, L_for_e,
+                        C1_e_to_q_raw, C2_e_to_q_raw, C3_e_to_q_raw,
+                        ce_w, ce_h, /*BW=*/1.5f);
 
     /* Pad raw output (fw_eq × fh_eq) up to (cq_w × cq_h) for next K16 step. */
     C1_e_to_q = dt_alloc_align_float(cqsize);
@@ -1735,9 +1781,9 @@ static void galosh_raw_denoise(const float *const restrict in,
     }
     gat_crop_2d_topleft(L_h_den, halfwidth, halfheight, L_for_q2, fw_qh, fh_qh);
 
-    gat_k16_joint_bilateral_upsample(C1_e_to_q, C2_e_to_q, C3_e_to_q, L_for_q2,
-                                      C1_e_up_raw, C2_e_up_raw, C3_e_up_raw,
-                                      cq_w, cq_h, /*BW=*/1.5f);
+    gat_chroma_upsample(C1_e_to_q, C2_e_to_q, C3_e_to_q, L_for_q2,
+                        C1_e_up_raw, C2_e_up_raw, C3_e_up_raw,
+                        cq_w, cq_h, /*BW=*/1.5f);
 
     gat_pad_2d_edge(C1_e_up_raw, fw_qh, fh_qh, C1_e_up, halfwidth, halfheight);
     gat_pad_2d_edge(C2_e_up_raw, fw_qh, fh_qh, C2_e_up, halfwidth, halfheight);
@@ -1872,9 +1918,9 @@ static void galosh_raw_denoise(const float *const restrict in,
   C3_aligned = dt_alloc_align_float(npixels);
   if(!C1_aligned || !C2_aligned || !C3_aligned) goto cleanup_rawlc_o;
 
-  gat_k16_joint_bilateral_upsample(C1_h_den, C2_h_den, C3_h_den, L_pixel,
-                                    C1_aligned, C2_aligned, C3_aligned,
-                                    halfwidth, halfheight, /*BW=*/1.5f);
+  gat_chroma_upsample(C1_h_den, C2_h_den, C3_h_den, L_pixel,
+                      C1_aligned, C2_aligned, C3_aligned,
+                      halfwidth, halfheight, /*BW=*/1.5f);
   O32_CPU_DUMP("p9_C1_aligned", C1_aligned, npixels);
   dt_free_align(C1_h_den); dt_free_align(C2_h_den); dt_free_align(C3_h_den);
   C1_h_den = C2_h_den = C3_h_den = NULL;
@@ -2135,13 +2181,26 @@ int main(int argc, char **argv)
   for(int i = 0; i < argc; i++)
   {
     const char *a = argv[i];
-    if(strncmp(a, "--noise=", 8) == 0)
+    if(strncmp(a, "--wht=", 6) == 0)
+    {
+      const int b = atoi(a + 6);
+      g_galosh_wht_block = (b == 4) ? 4 : 8;
+      fprintf(stderr, "  --wht=%d (Phase 5 luma LOSH block size)\n",
+              g_galosh_wht_block);
+    }
+    else if(strncmp(a, "--noise=", 8) == 0)
     {
       noise_mode = a + 8;
     }
     else if(strncmp(a, "--noise-state=", 14) == 0)
     {
       noise_state_path = a + 14;
+    }
+    else if(strncmp(a, "--upsample=", 11) == 0)
+    {
+      g_galosh_upsample_fast = (strcmp(a + 11, "fast") == 0);
+      fprintf(stderr, "  --upsample=%s\n",
+              g_galosh_upsample_fast ? "fast (guided bilinear)" : "jinc (K16)");
     }
     else if(strncmp(a, "--stride=", 9) == 0)
     {
@@ -2235,6 +2294,9 @@ int main(int argc, char **argv)
       "       [--noise=M]       (fit | hold | every:N | ema:B; video-loop noise-model\n"
       "                          injection -- stateful modes need --noise-state=FILE)\n"
       "       [--noise-state=F] (one-line state file: alpha sigma_sq frames_since_fit)\n"
+      "       [--wht=B]         (8 = canonical | 4 = fast luma LOSH, coarser grain)\n"
+      "       [--upsample=K]    (jinc = canonical K16 | fast = guided bilinear,\n"
+      "                          ring-free by construction, slightly softer chroma)\n"
       "\n"
       "  method:  'galosh' or 'ours' (GALOSH local WHT shrinkage, default)\n"
       "  luma_str:   sigma_L for luma shrinkage (default 0.5, user-tunable)\n"
