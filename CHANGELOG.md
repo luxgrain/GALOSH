@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.0 — distributable Windows builds (2026-07-09)
+
+End-user distribution ZIPs (attached to the GitHub release):
+`GALOSH_RAW_win64.zip` (DNG in → denoised DNG out) and
+`GALOSH_YUV_win64.zip` (sRGB PNG in → denoised PNG out).
+
+- Drag & drop onto the exe (defaults `l=1 c=1`) or CLI
+  `galosh_raw.exe -l 0.8 -c 1.2 [--gpu] file.dng`; output written next to
+  the original as `<name>_GALOSH_l<L>_c<C>.dng/.png`, original untouched.
+- Fully blind: no noise profile, no training, any 2×2 Bayer CFA DNG
+  (X-Trans / monochrome / linear DNG rejected with a clear error).
+- Metadata copied completely from the original via bundled ExifTool
+  (EXIF / GPS / MakerNotes / XMP / ICC, plus the protected DNG
+  calibration tags — ColorMatrix1/2, CalibrationIlluminant1/2,
+  AsShotNeutral, ForwardMatrix, lens opcodes — which bulk copy skips).
+  Deliberately not copied: `NoiseProfile` (stale after denoising) and
+  `LinearizationTable` (output data is already linearized).
+- New tracked sources: `tools/dist/galosh_dng.py`, `tools/dist/galosh_png.py`
+  (PyInstaller onefile wrappers; UTF-8-safe subprocess handling on CJK
+  locales; per-channel black/white normalization; tifffile DNG skeleton).
+- SPL letter prior-art hardening (refs [22]–[26]: YOND, Noise2VST,
+  Dubois 2005, Hirakawa 2007, Park 2009) — manuscript as submitted to
+  IEEE Signal Processing Letters on 2026-07-09.
+
 ## v0.1.0 — first public release (2026, unreleased)
 
 Initial public snapshot of GALOSH: a blind, training-free, search-free classical
