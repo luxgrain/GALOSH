@@ -59,7 +59,9 @@ data-dependent control flow resist vectorization, GPU occupancy, and any
 fixed-latency budget. Learned methods reach excellent quality in the domain
 they were trained on, but need training pairs, carry tens-of-thousands of MACs
 per pixel, and degrade --- sometimes catastrophically --- outside their
-training distribution, which we also observe. Beyond BM3D/NLM, the classical
+training distribution, which we also observe; recent blind raw pipelines
+relax the data requirement but keep a trained network at the
+core~\cite{yond,noise2vst}. Beyond BM3D/NLM, the classical
 family includes low-rank patch models (WNNM~\cite{wnnm}), patch-prior
 optimization (EPLL~\cite{epll}), learned dictionaries (K-SVD~\cite{ksvd}), and
 the blind Noise Clinic pipeline~\cite{noiseclinic}; these are likewise search-
@@ -83,7 +85,7 @@ strength controls. The same core serves two thin front-ends. On raw,
 \textbf{GALOSH-RAW} inverts the usual order of operations: instead of
 treating the CFA as RGB with missing samples --- an interpolation problem
 --- it treats the Bayer mosaic as a spatially multiplexed luma/chroma
-signal, in the spirit of frequency-domain CFA analysis~\cite{alleysson},
+signal, in the spirit of frequency-domain CFA analysis~\cite{alleysson,dubois,hirakawa},
 and demultiplexes it \emph{exactly} with a cycle-spun $2{\times}2$
 Walsh--Hadamard transform --- so the two noise populations are treated
 differently before any demosaicer runs. \textbf{GALOSH-YUV/RGB} applies
@@ -136,7 +138,10 @@ Walsh--Hadamard transform demultiplexes the mosaic into one
 \emph{full-resolution} luminance plane --- the achromatic $2{\times}2$
 average at every pixel, an exact stride-1 sliding DC of the quad-aligned
 transform --- and three half-resolution chroma planes on the aligned
-quads: orthogonal, exactly invertible, no interpolation. Chroma is denoised at
+quads: orthogonal, exactly invertible, no interpolation. Component-transform
+denoising of the mosaic itself has precedents~\cite{hirakawa,park09}; what is
+new here is the exact cycle-spun demultiplex feeding a fully blind,
+search-free two-operator core. Chroma is denoised at
 half resolution, then returned to full resolution by a luminance-guided
 joint-bilateral EWA-jinc upsampling with an anti-ringing clamp to the local
 $2{\times}2$ input hull. The inverse WHT, dark restoration, and exact inverse
@@ -322,7 +327,7 @@ networks.}
 \end{figure*}
 
 \clearpage
-\begin{thebibliography}{21}\small
+\begin{thebibliography}{26}\small
 \bibitem{bm3d} K.~Dabov, A.~Foi, V.~Katkovnik, and K.~Egiazarian, ``Image
 denoising by sparse 3-D transform-domain collaborative filtering,'' \emph{IEEE
 TIP}, 2007.
@@ -372,6 +377,20 @@ TIP}, 2005.
 \bibitem{galosharxiv} Y.~Sato, ``GALOSH: Blind, training-free denoising of raw
 Bayer and sRGB images by parallel-friendly local shrinkage,'' arXiv:2607.03768
 [eess.IV], 2026.
+\bibitem{yond} H.~Feng, L.~Wang, Y.~Huang, T.~Li, L.~Zhu, and H.~Huang,
+``YOND: Practical blind raw image denoising free from camera-specific data
+dependency,'' arXiv:2506.03645 [eess.IV], 2025.
+\bibitem{noise2vst} S.~Herbreteau and M.~Unser, ``Self-calibrated
+variance-stabilizing transformations for real-world image denoising,''
+\emph{ICCV}, 2025.
+\bibitem{dubois} E.~Dubois, ``Frequency-domain methods for demosaicking of
+Bayer-sampled color images,'' \emph{IEEE SPL}, 2005.
+\bibitem{hirakawa} K.~Hirakawa, X.-L.~Meng, and P.~J.~Wolfe, ``A framework for
+wavelet-based analysis and processing of color filter array images with
+applications to denoising and demosaicking,'' \emph{ICASSP}, 2007.
+\bibitem{park09} S.~H.~Park, H.~S.~Kim, S.~Lansel, M.~Parmar, and
+B.~A.~Wandell, ``A case for denoising before demosaicking color filter array
+data,'' \emph{Asilomar Conf.\ Signals, Syst., Computers}, 2009.
 \end{thebibliography}
 
 \end{document}
