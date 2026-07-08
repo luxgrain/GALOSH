@@ -11,6 +11,9 @@ Preprint: [PDF (English)](https://github.com/luxgrain/GALOSH/releases/download/v
 · [Zenodo (DOI 10.5281/zenodo.21187219)](https://doi.org/10.5281/zenodo.21187219)
 · [arXiv:2607.03768](https://arxiv.org/abs/2607.03768)
 
+📦 **Download** — Windows standalone builds, no install needed: drag & drop a
+DNG or PNG onto the exe ([Releases](https://github.com/luxgrain/GALOSH/releases))
+
 GALOSH (Generalized Anscombe LOcal SHrinkage) is a **classical** image denoiser
 redesigned for modern parallel hardware:
 
