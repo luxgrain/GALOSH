@@ -12,15 +12,21 @@
  *     params kept in order.
  *   - galosh_chromaup_signs (line 2466)     — __constant → const array.
  *   - GAT_LUT_SIZE 4096 (galosh.cl line 1125).
- * RENAME: OpenCL arg `output` → `output_` (`output` is a GLSL reserved word). */
+ * RENAME: OpenCL arg `output` → `output_` (`output` is a GLSL reserved word).
+ *
+ * [V2.0 FP16 storage contract v1, dataflow_spec.md §4] L_pixel and
+ * C1/2/3_aligned are contract buffers → float16_t SSBOs (read side);
+ * LUT / params / output stay f32.  Compute stays f32. */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 #define GAT_LUT_SIZE 4096
 
-layout(std430, binding = 0) restrict readonly  buffer Buf0 { float L_pixel[]; };
-layout(std430, binding = 1) restrict readonly  buffer Buf1 { float C1_aligned[]; };
-layout(std430, binding = 2) restrict readonly  buffer Buf2 { float C2_aligned[]; };
-layout(std430, binding = 3) restrict readonly  buffer Buf3 { float C3_aligned[]; };
+layout(std430, binding = 0) restrict readonly  buffer Buf0 { float16_t L_pixel[]; };
+layout(std430, binding = 1) restrict readonly  buffer Buf1 { float16_t C1_aligned[]; };
+layout(std430, binding = 2) restrict readonly  buffer Buf2 { float16_t C2_aligned[]; };
+layout(std430, binding = 3) restrict readonly  buffer Buf3 { float16_t C3_aligned[]; };
 layout(std430, binding = 4) restrict writeonly buffer Buf4 { float output_[]; };
 layout(std430, binding = 5) restrict readonly  buffer Buf5 { float lut_d[]; };
 layout(std430, binding = 6) restrict readonly  buffer Buf6 { float lut_x[]; };
@@ -82,10 +88,10 @@ void main()
 
   /* OpenCL used (size_t) 64-bit index; GLSL uses 32-bit int (no INT64). */
   const int p = fy * pc.width + fx;
-  const float L  = L_pixel[p];
-  const float C1 = C1_aligned[p];
-  const float C2 = C2_aligned[p];
-  const float C3 = C3_aligned[p];
+  const float L  = float(L_pixel[p]);
+  const float C1 = float(C1_aligned[p]);
+  const float C2 = float(C2_aligned[p]);
+  const float C3 = float(C3_aligned[p]);
 
   /* BUG FIX 2026-05-10 (carried over from OpenCL): use inline SIGNS[slot][k]
    * directly, NO ch remapping via galosh_chromaup_ch_by_si (CPU

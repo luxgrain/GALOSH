@@ -2,7 +2,15 @@
 /* Transcribed from galosh.cl kernel galosh_o32_smoothstep_blend_3p (§6.14,
  * line 6169).  Literal port per PORT_CONVENTIONS.md.
  * Host dispatch: align_up(hw,16) x align_up(hh,16), local 16x16
- * (galosh_raw_gpu.c:1657-1659 "K_O32_8 smoothstep"). */
+ * (galosh_raw_gpu.c:1657-1659 "K_O32_8 smoothstep").
+ *
+ * [V2.0 FP16 storage contract v1, dataflow_spec.md §4] outputs are the
+ * C1/2/3_h_den contract buffers → float16_t stores (RNE); all 12 input
+ * anchors stay f32 (pyramid internals + C*_h are f32 in contract v1). */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+#include "galosh_f16_rne.glsl"
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(std430, binding =  0) restrict readonly  buffer Buf0  { float c1_h[]; };        /* anchor 0: noisy */
@@ -17,9 +25,9 @@ layout(std430, binding =  8) restrict readonly  buffer Buf8  { float c3_q_up[]; 
 layout(std430, binding =  9) restrict readonly  buffer Buf9  { float c1_e_up[]; };     /* anchor 3: 120 raw px */
 layout(std430, binding = 10) restrict readonly  buffer Buf10 { float c2_e_up[]; };
 layout(std430, binding = 11) restrict readonly  buffer Buf11 { float c3_e_up[]; };
-layout(std430, binding = 12) restrict writeonly buffer Buf12 { float c1_out[]; };
-layout(std430, binding = 13) restrict writeonly buffer Buf13 { float c2_out[]; };
-layout(std430, binding = 14) restrict writeonly buffer Buf14 { float c3_out[]; };
+layout(std430, binding = 12) restrict writeonly buffer Buf12 { float16_t c1_out[]; };  /* [FP16 v1] C1_h_den */
+layout(std430, binding = 13) restrict writeonly buffer Buf13 { float16_t c2_out[]; };  /* [FP16 v1] C2_h_den */
+layout(std430, binding = 14) restrict writeonly buffer Buf14 { float16_t c3_out[]; };  /* [FP16 v1] C3_h_den */
 
 layout(push_constant) uniform PC {
   int width;
@@ -76,7 +84,8 @@ void main()
     o3 = oneMt * lo3 + t * hi3;
   }
 
-  c1_out[p] = o1;
-  c2_out[p] = o2;
-  c3_out[p] = o3;
+  /* explicit RNE (AMD OpFConvert is RTZ — see galosh_f16_rne.glsl) */
+  c1_out[p] = float16_t(galosh_f16_rne(o1));
+  c2_out[p] = float16_t(galosh_f16_rne(o2));
+  c3_out[p] = float16_t(galosh_f16_rne(o3));
 }

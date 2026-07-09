@@ -21,7 +21,18 @@
  *  NOTE (faithful to source): unlike galosh_pass12_o32, the source has
  *  NO barrier between the tile load loop and the accumulator-zero loop
  *  (both write disjoint arrays; single barrier after both) — preserved.
- */
+ *
+ * [V2.0 FP16 storage contract v1, dataflow_spec.md §4] input = L_cs
+ * contract buffer → float16_t SSBO.  pilot_global stays an f32 dump
+ * buffer (dump format unchanged), but the written VALUE is rounded
+ * through f16 so it equals the oracle's dumped p5_pilot (the CPU dumps
+ * L_cs_pilot AFTER GALOSH_F16_STAGE rounds it).
+ * (日) 出力バッファ形式は f32 のまま、値のみ f16 丸め = オラクルの
+ *   丸め後ダンプと一致。 */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+#include "galosh_f16_rne.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;   /* host l2 = {8, 8} (g_tile_wg_dim) */
 
 /* ---- compile-time constants (galosh.cl §"Compile-time constants") ---- */
@@ -43,8 +54,9 @@ const float kaiser_1d[8] = float[8](
 );
 
 /* ---- OpenCL args: pointer args → SSBOs, scalars → push constants ---- */
-/* arg0: global const float *restrict input   (`input` is a GLSL reserved word) */
-layout(std430, binding = 0) readonly  buffer Buf0 { float input_buf[]; };
+/* arg0: global const float *restrict input   (`input` is a GLSL reserved word)
+ * [FP16 v1] = L_cs, f16 storage */
+layout(std430, binding = 0) readonly  buffer Buf0 { float16_t input_buf[]; };
 /* arg1: global       float *restrict pilot_global */
 layout(std430, binding = 1) writeonly buffer Buf1 { float pilot_global[]; };
 layout(push_constant) uniform PC {
@@ -141,7 +153,7 @@ void main()
     const int gx = tile_x - HALO + lx;
     const int gy = tile_y - HALO + ly;
     tile_in[i] = (gx >= 0 && gx < pc.width && gy >= 0 && gy < pc.height)
-                 ? input_buf[gy * pc.width + gx] : 0.0f;
+                 ? float(input_buf[gy * pc.width + gx]) : 0.0f;
   }
   for(int i = lid; i < O32_TILE_PIXELS; i += wg_size)
   {
@@ -239,8 +251,10 @@ void main()
     if(gx < pc.width && gy < pc.height)
     {
       const float d = denom[idx];
+      /* [FP16 v1] value rounded to f16 with explicit RNE (buffer stays f32
+       * for the dump format) = CPU's post-GALOSH_F16_STAGE p5_pilot dump. */
       pilot_global[gy * pc.width + gx] =
-          (d > 1e-10f) ? (numer[idx] / d) : tile_in[idx];
+          galosh_f16_rne((d > 1e-10f) ? (numer[idx] / d) : tile_in[idx]);
     }
   }
 }

@@ -19,7 +19,19 @@
  *    (GLSL has no pointer arithmetic; pure data movement, no arithmetic).
  *  - `(size_t)gy * width` global index cast dropped → int (npix < 2^31).
  *  - int-as-bool `(px % phase_stride)` → `!= 0` comparisons.
- */
+ *
+ * [V2.0 FP16 storage contract v1, dataflow_spec.md §4] L_cs (in) and
+ * L_cs_den (out) are contract buffers → float16_t SSBOs; compute stays
+ * f32.  The pass1→pass2 pilot lives in SHARED memory here (fused kernel):
+ * the CPU oracle rounds L_cs_pilot to binary16 between the passes
+ * (GALOSH_F16_STAGE(L_cs_pilot)), so the shared pilot STORE is rounded
+ * through float16_t and back — same rounding point, RNE.
+ * (日) pilot は共有メモリ常駐のため、格納時に f16 往復で丸めて
+ *   オラクルの pass1→pass2 丸め点と一致させる。 */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+#include "galosh_f16_rne.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;   /* host local2 = {8, 8} (g_tile_wg_dim) */
 
 /* ---- compile-time constants (galosh.cl §"Compile-time constants") ---- */
@@ -43,10 +55,12 @@ const float kaiser_1d[8] = float[8](
 );
 
 /* ---- OpenCL args: pointer args → SSBOs, scalars → push constants ---- */
-/* arg0: global const float *restrict input   (`input` is a GLSL reserved word) */
-layout(std430, binding = 0) readonly  buffer Buf0 { float input_buf[]; };
-/* arg1: global       float *restrict output (`output` is a GLSL reserved word) */
-layout(std430, binding = 1) writeonly buffer Buf1 { float output_buf[]; };
+/* arg0: global const float *restrict input   (`input` is a GLSL reserved word)
+ * [FP16 v1] = L_cs, f16 storage */
+layout(std430, binding = 0) readonly  buffer Buf0 { float16_t input_buf[]; };
+/* arg1: global       float *restrict output (`output` is a GLSL reserved word)
+ * [FP16 v1] = L_cs_den, f16 storage */
+layout(std430, binding = 1) writeonly buffer Buf1 { float16_t output_buf[]; };
 layout(push_constant) uniform PC {
   int   width;          /* arg2 */
   int   height;         /* arg3 */
@@ -147,7 +161,7 @@ void main()
     const int gx = tile_x - HALO + lx;
     const int gy = tile_y - HALO + ly;
     tile_in[i] = (gx >= 0 && gx < pc.width && gy >= 0 && gy < pc.height)
-                 ? input_buf[gy * pc.width + gx] : 0.0f;
+                 ? float(input_buf[gy * pc.width + gx]) : 0.0f;
   }
   memoryBarrierShared(); barrier();
 
@@ -245,11 +259,15 @@ void main()
     }
   }
 
-  /* ---- Step 4: Finalize Pass1 → pilot.  CPU fallback threshold = 1e-10f. */
+  /* ---- Step 4: Finalize Pass1 → pilot.  CPU fallback threshold = 1e-10f.
+   * [FP16 v1] pilot store rounded f32→f16→f32 (RNE) = oracle's
+   * GALOSH_F16_STAGE(L_cs_pilot) rounding point.  Shared array stays f32;
+   * only the VALUE is quantized.  (fallback tile_in is already
+   * f16-representable — rounding is idempotent there.) */
   for(int i = lid; i < O32_TILE_PIXELS; i += wg_size)
   {
     const float d = denom[i];
-    pilot[i] = (d > 1e-10f) ? (numer[i] / d) : tile_in[i];
+    pilot[i] = galosh_f16_rne((d > 1e-10f) ? (numer[i] / d) : tile_in[i]);
   }
   memoryBarrierShared(); barrier();
 
@@ -352,7 +370,9 @@ void main()
     if(gx < pc.width && gy < pc.height)
     {
       const float d = denom[idx];
-      output_buf[gy * pc.width + gx] = (d > 1e-10f) ? (numer[idx] / d) : tile_in[idx];
+      /* [FP16 v1] L_cs_den contract store: explicit RNE (galosh_f16_rne.glsl). */
+      output_buf[gy * pc.width + gx] =
+          float16_t(galosh_f16_rne((d > 1e-10f) ? (numer[idx] / d) : tile_in[idx]));
     }
   }
 }

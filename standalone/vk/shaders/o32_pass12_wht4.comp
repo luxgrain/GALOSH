@@ -13,7 +13,16 @@
  * JP: CPU --wht=4 の GPU ミラー。block[16] はレジスタに乗り（B3 で特定した
  *     スピルが消える）、位相ループも 16→4。品質ラベルは Phase A ベンチ準拠
  *     （高ノイズで -1.2dB の動画/速度優先モード）。
+ *
+ * [V2.0 FP16 storage contract v1, dataflow_spec.md §4] L_cs (in) /
+ * L_cs_den (out) = float16_t SSBOs, compute f32; SHARED pilot store
+ * rounded f32→f16→f32 (RNE) at the pass1→pass2 boundary — same contract
+ * points as o32_pass12 (see its header comment for the rationale).
  */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+#include "galosh_f16_rne.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 #define GALOSH_BS      4
@@ -33,8 +42,8 @@ layout(local_size_x = 8, local_size_y = 8) in;
  * the CPU construction kaiser_half_1d[i] = (k8[2i]+k8[2i+1])*0.5. */
 const float kaiser_1d[4] = float[4](0.469485f, 0.908910f, 0.908910f, 0.469485f);
 
-layout(std430, binding = 0) readonly  buffer Buf0 { float input_buf[]; };
-layout(std430, binding = 1) writeonly buffer Buf1 { float output_buf[]; };
+layout(std430, binding = 0) readonly  buffer Buf0 { float16_t input_buf[]; };   /* [FP16 v1] L_cs */
+layout(std430, binding = 1) writeonly buffer Buf1 { float16_t output_buf[]; };  /* [FP16 v1] L_cs_den */
 layout(push_constant) uniform PC {
   int   width;
   int   height;
@@ -125,7 +134,7 @@ void main()
     const int gx = tile_x - HALO + lx;
     const int gy = tile_y - HALO + ly;
     tile_in[i] = (gx >= 0 && gx < pc.width && gy >= 0 && gy < pc.height)
-                 ? input_buf[gy * pc.width + gx] : 0.0f;
+                 ? float(input_buf[gy * pc.width + gx]) : 0.0f;
   }
   memoryBarrierShared(); barrier();
 
@@ -213,10 +222,11 @@ void main()
     }
   }
 
+  /* [FP16 v1] pilot store rounded to f16 (explicit RNE) = oracle rounding point. */
   for(int i = lid; i < O32_TILE_PIXELS; i += wg_size)
   {
     const float d = denom[i];
-    pilot[i] = (d > 1e-10f) ? (numer[i] / d) : tile_in[i];
+    pilot[i] = galosh_f16_rne((d > 1e-10f) ? (numer[i] / d) : tile_in[i]);
   }
   memoryBarrierShared(); barrier();
 
@@ -314,7 +324,9 @@ void main()
     if(gx < pc.width && gy < pc.height)
     {
       const float d = denom[idx];
-      output_buf[gy * pc.width + gx] = (d > 1e-10f) ? (numer[idx] / d) : tile_in[idx];
+      /* [FP16 v1] L_cs_den contract store: explicit RNE (galosh_f16_rne.glsl). */
+      output_buf[gy * pc.width + gx] =
+          float16_t(galosh_f16_rne((d > 1e-10f) ? (numer[idx] / d) : tile_in[idx]));
     }
   }
 }

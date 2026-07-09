@@ -8,6 +8,13 @@
  * JP: OpenCL o32 ホストの忠実な Vulkan ミラー。設計図 HOST_BLUEPRINT.md
  *     が唯一の正で、逐次ディスパッチ＋全バリア（最適化は B3）。
  *
+ * [V2.0 FP16 storage contract v1, dataflow_spec.md §4] Inter-phase
+ * contract buffers (L_cs, L_cs_den, L_pixel, L_h_den, Cden1..3, Cal1..3)
+ * are binary16 SSBOs (half size); compute stays f32; the pass1→pass2
+ * pilot is rounded to f16 at its shared-memory store inside the fused
+ * pass12 kernels.  Parity oracle: galosh_raw_cpu.exe --f16-storage.
+ * (日) FP16 ストレージ契約 v1。演算 f32 / 契約点のみ f16 格納。
+ *
  * CLI (CPU-exe compatible):
  *   galosh_vk.exe in.bin out.bin W H galosh <strength> <luma> <chroma> <alpha> <sigma_sq>
  * Env: GALOSH_VK_DEVICE, GALOSH_VERBOSE, GALOSH_DUMP_DIR, GALOSH_O32_PHASE_STRIDE
@@ -17,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 #include <vulkan/vulkan.h>
 
@@ -99,6 +107,11 @@ enum {
   K_FWD_L, K_CHROMA_EX, K_PASS12, K_PASS1_DUMP, K_P6_FUSED,
   K_BOX2, K_BOX2_3P, K_LOESS_T, K_CROP, K_K16, K_PAD, K_SMOOTH, K_INV,
   K_PASS12_W4, K_FASTUP,          /* [B6] fast-mode siblings */
+  /* [FP16 v1] site variants (dataflow_spec.md §4): contract-buffer f16
+   * bindings at specific dispatch sites; the f32 originals keep serving
+   * the pyramid-internal sites.  ONE shader set, site-selected — never
+   * per-GPU. */
+  K_BOX2_H16, K_CROP_H16, K_LOESS_T_G16, K_K16_F16, K_FASTUP_F16,
   K_COUNT
 };
 static Kern g_k[K_COUNT] = {
@@ -134,6 +147,12 @@ static Kern g_k[K_COUNT] = {
   [K_INV]       = { "o32_inverse_wht_dark_gat",   9,  8 },
   [K_PASS12_W4] = { "o32_pass12_wht4",            2, 16 },
   [K_FASTUP]    = { "o32_fastup_3p",              7, 12 },
+  /* [FP16 v1] same nbind/push as their f32 originals */
+  [K_BOX2_H16]   = { "o32_box_downsample_2x_h16",     2,  8 },
+  [K_CROP_H16]   = { "o32_crop_2d_topleft_h16",       2, 16 },
+  [K_LOESS_T_G16]= { "o32_loess_chroma_3p_tiled_g16", 7, 12 },
+  [K_K16_F16]    = { "o32_k16_jbu_3p_f16",            7, 12 },
+  [K_FASTUP_F16] = { "o32_fastup_3p_f16",             7, 12 },
 };
 
 static char g_exe_dir[1024];
@@ -294,6 +313,48 @@ static void dump_buf(const char *dir, const char *name, Buf *b, size_t nfloats)
   free(tmp);
 }
 
+/* [FP16 v1] IEEE binary16 → binary32 widen (exact; handles subnormal /
+ * inf / NaN).  Host-side only — used to keep the GALOSH_DUMP_DIR .bin
+ * dumps and the small-image guard output in f32 format while the device
+ * buffers hold f16.  (日) ダンプ形式は f32 のまま、ホストで拡張。 */
+static float half_to_float(uint16_t h)
+{
+  const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t e = (h >> 10) & 0x1Fu;
+  uint32_t m = h & 0x3FFu;
+  uint32_t bits;
+  if(e == 0)
+  {
+    if(m == 0) bits = s;                        /* ±0 */
+    else
+    {                                           /* subnormal: renormalize */
+      e = 127 - 15 + 1;
+      while(!(m & 0x400u)) { m <<= 1; e--; }
+      m &= 0x3FFu;
+      bits = s | (e << 23) | (m << 13);
+    }
+  }
+  else if(e == 31) bits = s | 0x7F800000u | (m << 13);      /* inf / NaN */
+  else             bits = s | ((e - 15 + 127) << 23) | (m << 13);
+  float f; memcpy(&f, &bits, 4);
+  return f;
+}
+
+/* [FP16 v1] dump a contract (f16-storage) buffer: read raw binary16,
+ * widen on the host, write the usual f32 .bin (verify-harness compat). */
+static void dump_buf_f16(const char *dir, const char *name, Buf *b, size_t nvals)
+{
+  if(!dir) return;
+  uint16_t *raw16 = malloc(nvals * 2);
+  download(b, raw16, nvals * 2, 0);
+  float *tmp = malloc(nvals * 4);
+  for(size_t i = 0; i < nvals; i++) tmp[i] = half_to_float(raw16[i]);
+  char path[1200]; snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+  FILE *f = fopen(path, "wb");
+  if(f) { fwrite(tmp, 4, nvals, f); fclose(f); }
+  free(tmp); free(raw16);
+}
+
 /* ================= main ================= */
 int main(int argc, char **argv)
 {
@@ -360,6 +421,9 @@ int main(int argc, char **argv)
   const int kq_w = 2 * cq_w, kq_h = 2 * cq_h;
   const int ke_w = 2 * ce_w, ke_h = 2 * ce_h;
   const size_t full_f = npix * 4, ch_f = chsize * 4;
+  /* [FP16 v1] contract buffers stored as binary16 → halved byte sizes
+   * (dataflow_spec.md §4). */
+  const size_t full_h16 = npix * 2, ch_h16 = chsize * 2;
   const size_t cq_f = (size_t)cq_w * cq_h * 4, ce_f = (size_t)ce_w * ce_h * 4;
   const size_t kq_f = (size_t)kq_w * kq_h * 4, ke_f = (size_t)ke_w * ke_h * 4;
   const int ne_n_bx = hw / 8, ne_n_by = hh / 8;
@@ -390,10 +454,12 @@ int main(int argc, char **argv)
   vkGetPhysicalDeviceProperties(g_pd, &g_props);
   fprintf(stderr, "[vk] device[%u] = %s\n", di, g_props.deviceName);
 
-  /* No optional device features required: FP64 was removed from the
-   * shader set (dark-ref/LUT kernels now use compensated Kahan FP32),
-   * so ONE unmodified shader set runs on NVIDIA + AMD + Intel Arc
-   * (Arc lacks shaderFloat64). */
+  /* FP64 stays out of the shader set (Arc lacks shaderFloat64).
+   * [FP16 v1] Two features are required for the FP16 storage contract —
+   * probe confirmed ALL 3 GPUs (NVIDIA/AMD/Arc) support both, so this
+   * remains ONE vendor-agnostic shader set with no per-GPU branching:
+   *   - storageBuffer16BitAccess (float16_t SSBO members)
+   *   - shaderFloat16            (float16_t casts = the RNE round points) */
 
   uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &qn, NULL);
   VkQueueFamilyProperties qf[16]; if(qn > 16) qn = 16;
@@ -404,7 +470,16 @@ int main(int argc, char **argv)
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
     .queueFamilyIndex = g_qi, .queueCount = 1, .pQueuePriorities = &prio };
+  /* [FP16 v1] enable 16-bit SSBO storage + float16 arithmetic (both core
+   * features by Vulkan 1.2; enabled via pNext chain, no extension strings). */
+  VkPhysicalDevice16BitStorageFeatures f16stor = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+    .storageBuffer16BitAccess = VK_TRUE };
+  VkPhysicalDeviceShaderFloat16Int8Features f16arith = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+    .pNext = &f16stor, .shaderFloat16 = VK_TRUE };
   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+    .pNext = &f16arith,
     .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = NULL };
   CHECK(vkCreateDevice(g_pd, &dci, NULL, &g_dev));
   vkGetDeviceQueue(g_dev, g_qi, 0, &g_q);
@@ -440,8 +515,9 @@ int main(int argc, char **argv)
   Buf blk_m   = DEVBUF(ne_total * 4), blk_v = DEVBUF(ne_total * 4);
   Buf dt_hist = DEVBUF(4096 * 4), dl_hist = DEVBUF(4096 * 4);
   Buf in_gat  = DEVBUF(full_f);
-  Buf L_cs    = DEVBUF(full_f), L_cs_den = DEVBUF(full_f);
-  Buf L_pixel = DEVBUF(full_f), L_h_den = DEVBUF(ch_f);
+  /* [FP16 v1] contract buffers = f16 storage (half size); C*_h stay f32. */
+  Buf L_cs    = DEVBUF(full_h16), L_cs_den = DEVBUF(full_h16);
+  Buf L_pixel = DEVBUF(full_h16), L_h_den = DEVBUF(ch_h16);
   Buf C1_h = DEVBUF(ch_f), C2_h = DEVBUF(ch_f), C3_h = DEVBUF(ch_f);
   Buf L_q  = DEVBUF(cq_f > 4 ? cq_f : 4), L_e = DEVBUF(ce_f > 4 ? ce_f : 4);
   Buf L_for_q = DEVBUF(kq_f > 4 ? kq_f : 4), L_for_e = DEVBUF(ke_f > 4 ? ke_f : 4);
@@ -453,7 +529,7 @@ int main(int argc, char **argv)
   TRI(Cqup_r, kq_f); TRI(Cqup, ch_f);
   TRI(Ceq_r, ke_f);  TRI(Ceq, cq_f);
   TRI(Ceup_r, kq_f); TRI(Ceup, ch_f);
-  TRI(Cden, ch_f);   TRI(Cal, full_f);
+  TRI(Cden, ch_h16); TRI(Cal, full_h16);   /* [FP16 v1] contract buffers */
   Buf pilot_dbg = dump_dir ? DEVBUF(full_f)
                            : DEVBUF(4);   /* tiny placeholder when unused */
 
@@ -495,17 +571,21 @@ int main(int argc, char **argv)
   /* [B6] fast-mode kernel selection (same buffer graph, swapped pipelines) */
   const int kid_p12 = (wht_block == 4) ? K_PASS12_W4 : K_PASS12;
   const int kid_up  = upsample_fast ? K_FASTUP : K_K16;
+  /* [FP16 v1] the FINAL upsample site (K_O32_9) touches contract buffers
+   * (Cden f16 in, L_pixel f16 guide, Cal f16 out) → needs the _f16 variant
+   * of WHICHEVER upsampler --upsample selected; pyramid sites keep kid_up. */
+  const int kid_up_final = upsample_fast ? K_FASTUP_F16 : K_K16_F16;
   VkDescriptorSet s_p12      = SET(kid_p12, &L_cs, &L_cs_den);
   VkDescriptorSet s_p1d      = SET(K_PASS1_DUMP, &L_cs, &pilot_dbg);
   VkDescriptorSet s_p6       = SET(K_P6_FUSED, &L_cs_den, &L_pixel, &L_h_den);
-  VkDescriptorSet s_Lq       = SET(K_BOX2, &L_h_den, &L_q);
-  VkDescriptorSet s_Le       = SET(K_BOX2, &L_q, &L_e);
+  VkDescriptorSet s_Lq       = SET(K_BOX2_H16, &L_h_den, &L_q);   /* [FP16 v1] 7a: f16 in */
+  VkDescriptorSet s_Le       = SET(K_BOX2, &L_q, &L_e);           /* 7b: all f32 */
   VkDescriptorSet s_Cq       = SET(K_BOX2_3P, &C1_h, &C2_h, &C3_h, &C_q1, &C_q2, &C_q3);
   VkDescriptorSet s_Ce       = SET(K_BOX2_3P, &C_q1, &C_q2, &C_q3, &C_e1, &C_e2, &C_e3);
-  VkDescriptorSet s_lo_h     = SET(K_LOESS_T, &L_h_den, &C1_h, &C2_h, &C3_h, &Cl_h1, &Cl_h2, &Cl_h3);
+  VkDescriptorSet s_lo_h     = SET(K_LOESS_T_G16, &L_h_den, &C1_h, &C2_h, &C3_h, &Cl_h1, &Cl_h2, &Cl_h3);  /* [FP16 v1] 7e: f16 guide */
   VkDescriptorSet s_lo_q     = SET(K_LOESS_T, &L_q, &C_q1, &C_q2, &C_q3, &Cl_q1, &Cl_q2, &Cl_q3);
   VkDescriptorSet s_lo_e     = SET(K_LOESS_T, &L_e, &C_e1, &C_e2, &C_e3, &Cl_e1, &Cl_e2, &Cl_e3);
-  VkDescriptorSet s_cropq    = SET(K_CROP, &L_h_den, &L_for_q);
+  VkDescriptorSet s_cropq    = SET(K_CROP_H16, &L_h_den, &L_for_q);   /* [FP16 v1] 7h: f16 in */
   VkDescriptorSet s_k16_q2h  = SET(kid_up, &Cl_q1, &Cl_q2, &Cl_q3, &L_for_q, &Cqup_r1, &Cqup_r2, &Cqup_r3);
   VkDescriptorSet s_pad_q[3] = {
     SET(K_PAD, &Cqup_r1, &Cqup1), SET(K_PAD, &Cqup_r2, &Cqup2), SET(K_PAD, &Cqup_r3, &Cqup3) };
@@ -519,7 +599,7 @@ int main(int argc, char **argv)
   VkDescriptorSet s_smooth   = SET(K_SMOOTH, &C1_h, &C2_h, &C3_h, &Cl_h1, &Cl_h2, &Cl_h3,
                                    &Cqup1, &Cqup2, &Cqup3, &Ceup1, &Ceup2, &Ceup3,
                                    &Cden1, &Cden2, &Cden3);
-  VkDescriptorSet s_k16_fin  = SET(kid_up, &Cden1, &Cden2, &Cden3, &L_pixel, &Cal1, &Cal2, &Cal3);
+  VkDescriptorSet s_k16_fin  = SET(kid_up_final, &Cden1, &Cden2, &Cden3, &L_pixel, &Cal1, &Cal2, &Cal3);  /* [FP16 v1] */
   VkDescriptorSet s_inv      = SET(K_INV, &L_pixel, &Cal1, &Cal2, &Cal3, &raw,
                                    &lut_d, &lut_x, &lut_p, &params);
 
@@ -698,13 +778,13 @@ int main(int argc, char **argv)
   if(dump_dir)
   {
     dump_buf(dump_dir, "p2_in_gat", &in_gat, npix);
-    dump_buf(dump_dir, "p3_L_cs", &L_cs, npix);
+    dump_buf_f16(dump_dir, "p3_L_cs", &L_cs, npix);          /* [FP16 v1] */
     dump_buf(dump_dir, "p4_C1_h", &C1_h, chsize);
     dump_buf(dump_dir, "p4_C2_h", &C2_h, chsize);
     dump_buf(dump_dir, "p4_C3_h", &C3_h, chsize);
-    dump_buf(dump_dir, "p5_L_cs_den", &L_cs_den, npix);
-    dump_buf(dump_dir, "p6_L_pixel", &L_pixel, npix);
-    dump_buf(dump_dir, "p6_L_h_den", &L_h_den, chsize);
+    dump_buf_f16(dump_dir, "p5_L_cs_den", &L_cs_den, npix);  /* [FP16 v1] */
+    dump_buf_f16(dump_dir, "p6_L_pixel", &L_pixel, npix);    /* [FP16 v1] */
+    dump_buf_f16(dump_dir, "p6_L_h_den", &L_h_den, chsize);  /* [FP16 v1] */
     /* pilot dump: extra dispatch (matches OpenCL debug path) */
     cb = cb_begin();
     PCI(0, W); PCI(1, H); PCF(2, strength * luma_str);
@@ -714,20 +794,22 @@ int main(int argc, char **argv)
     dump_buf(dump_dir, "p5_pilot", &pilot_dbg, npix);
   }
 
-  /* small-image guard (blueprint trap #8) */
+  /* small-image guard (blueprint trap #8).  [FP16 v1] L_pixel is f16 now:
+   * a raw device copy into the f32 `raw` buffer would misinterpret bits,
+   * so download the f16 buffer and widen on the host instead. */
   if(cq_w < 4 || cq_h < 4 || ce_w < 4 || ce_h < 4)
   {
-    cb = cb_begin();
-    VkBufferCopy c = { .size = full_f };
-    vkCmdCopyBuffer(cb, L_pixel.buf, raw.buf, 1, &c);
-    cb_submit_wait(cb);
-    goto download_phase;
+    uint16_t *h16 = malloc(full_h16);
+    download(&L_pixel, h16, full_h16, 0);
+    for(size_t i = 0; i < npix; i++) img[i] = half_to_float(h16[i]);
+    free(h16);
+    goto write_phase;
   }
 
   /* ================= SEG D: P7 pyramid + P8-10 ================= */
   cb = cb_begin();
   PCI(0, hw); PCI(1, hh);
-  dispatch_k(cb, K_BOX2, s_Lq, pc, 2,
+  dispatch_k(cb, K_BOX2_H16, s_Lq, pc, 2,
              (uint32_t)AUP(cq_w, 16), (uint32_t)AUP(cq_h, 16), 1, "K_O32_7a L_q");
   PCI(0, cq_w); PCI(1, cq_h);
   dispatch_k(cb, K_BOX2, s_Le, pc, 2,
@@ -740,7 +822,7 @@ int main(int argc, char **argv)
              (uint32_t)AUP(ce_w, 16), (uint32_t)AUP(ce_h, 16), 1, "K_O32_7d C_e");
   /* LOESS: strength_c pushed EXPLICITLY at all 3 scales (blueprint trap #2) */
   PCI(0, hw); PCI(1, hh); PCF(2, 1.0f);
-  dispatch_k(cb, K_LOESS_T, s_lo_h, pc, 3,
+  dispatch_k(cb, K_LOESS_T_G16, s_lo_h, pc, 3,
              (uint32_t)AUP(hw, 24), (uint32_t)AUP(hh, 24), 1, "K_O32_7e LOESS_h_t");
   PCI(0, cq_w); PCI(1, cq_h); PCF(2, 1.0f);
   dispatch_k(cb, K_LOESS_T, s_lo_q, pc, 3,
@@ -749,7 +831,7 @@ int main(int argc, char **argv)
   dispatch_k(cb, K_LOESS_T, s_lo_e, pc, 3,
              (uint32_t)AUP(ce_w, 24), (uint32_t)AUP(ce_h, 24), 1, "K_O32_7g LOESS_e_t");
   PCI(0, hw); PCI(1, hh); PCI(2, kq_w); PCI(3, kq_h);
-  dispatch_k(cb, K_CROP, s_cropq, pc, 4,
+  dispatch_k(cb, K_CROP_H16, s_cropq, pc, 4,
              (uint32_t)AUP(kq_w, 16), (uint32_t)AUP(kq_h, 16), 1, "K_O32_7h crop_L_for_q");
   PCI(0, cq_w); PCI(1, cq_h); PCF(2, 1.5f);
   dispatch_k(cb, kid_up, s_k16_q2h, pc, 3,
@@ -785,7 +867,7 @@ int main(int argc, char **argv)
   dispatch_k(cb, K_SMOOTH, s_smooth, pc, 3,
              (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_8 smoothstep");
   PCI(0, hw); PCI(1, hh); PCF(2, 1.5f);
-  dispatch_k(cb, kid_up, s_k16_fin, pc, 3,
+  dispatch_k(cb, kid_up_final, s_k16_fin, pc, 3,
              (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_9 K16_final");
   PCI(0, W); PCI(1, H);
   dispatch_k(cb, K_INV, s_inv, pc, 2,
@@ -797,12 +879,12 @@ int main(int argc, char **argv)
     dump_buf(dump_dir, "p7_C1_loess_h", &Cl_h1, chsize);
     dump_buf(dump_dir, "p7_C1_q_up", &Cqup1, chsize);
     dump_buf(dump_dir, "p7_C1_e_up", &Ceup1, chsize);
-    dump_buf(dump_dir, "p8_C1_h_den", &Cden1, chsize);
-    dump_buf(dump_dir, "p9_C1_aligned", &Cal1, npix);
+    dump_buf_f16(dump_dir, "p8_C1_h_den", &Cden1, chsize);   /* [FP16 v1] */
+    dump_buf_f16(dump_dir, "p9_C1_aligned", &Cal1, npix);    /* [FP16 v1] */
   }
 
-download_phase:
   download(&raw, img, full_f, 0);
+write_phase:
   { FILE *f = fopen(out_path, "wb");
     if(!f) { fprintf(stderr, "cannot open %s\n", out_path); return 1; }
     fwrite(img, 4, npix, f); fclose(f); }
