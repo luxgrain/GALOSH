@@ -52,6 +52,28 @@ alpha/sigma to estimate. On Windows/MSYS2, run with `C:\msys64\ucrt64\bin` on
 `PATH` (the OpenMP runtime `libgomp-1.dll` lives there). Set `GALOSH_VERBOSE=1`
 for per-phase diagnostics (all exes are quiet by default).
 
+## V2.0 options (CPU FP32 exe) — independent, freely combinable
+
+All flags default to the canonical published pipeline (flags-off output is
+byte-identical to it — enforced by `tests/v2_identity.py`). Speed/quality
+below are MEASURED: speed on 12 MP RawNIND full frame + SIDD full frames
+(CPU), quality on the full campaign (RawNIND 1493 crops + SIDD Medium 80
+full frames, `benchmark/results_*/_metrics_v2.json`).
+
+| Flag | Default | Speed (CPU) | Quality (measured) | Use for |
+|---|---|---|---|---|
+| `--upsample=fast` | `jinc` | **−20%** | **neutral on both datasets** (ΔPSNR ≤ +0.02 dB, ΔLPIPS ≤ 0.0006); ring-free by construction | safe speed win, photos included |
+| `--wht=4` | `8` | −15% | high noise (SIDD): **−1.21 dB / +0.047 LPIPS**; low-ISO (RawNIND): neutral PSNR, LPIPS slightly better | video / speed-critical only |
+| both of the above | — | **−36%** (SIDD 10.3→6.5 s/frame) | = `--wht=4` quality | real-time-leaning pipelines |
+| `--noise=every:N` / `hold` / `ema:B` (+`--noise-state=F`) | `fit` (per-frame) | skips re-estimation on held frames (full payoff — LUT reuse — lands in the GPU context API) | held frames: byte-identical for a fixed model; `ema` tracks slow drift | video loops, fixed camera/ISO |
+| `--f16-storage` | off | none (oracle, slightly slower) | 77–83 dB vs FP32 = invisible | GPU-FP16 parity reference only |
+| `luma_str` / `chroma_str` (args 7/8) | 1.0 / 1.0 | — | user taste (grain vs. smoothness) | tuning |
+
+GPU note: on the OpenCL/Vulkan pipeline the upsample stage is ~1% of frame
+time (fast upsample buys nothing there), while the 8×8 luma stage is 42–58%
+(`--wht=4` buys the most there). The V2.0 flags are CPU-exe only until the
+Vulkan port (Phase B).
+
 ## Deprecated lineage (ablation only)
 
 `--variant=g,h,i,j,k,l,m,n` are the PREVIOUS perceptual-evolution lineage that O
