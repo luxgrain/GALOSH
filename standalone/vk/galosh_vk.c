@@ -341,23 +341,28 @@ static void dispatch_k_banded(int kid, VkDescriptorSet ds,
                               const PcW *pc, int npc,
                               uint32_t gx, uint32_t gy, const char *label)
 {
-  const uint32_t probe_rows = (gy + 7) / 8;
-  if(probe_rows >= gy)
-  { /* tiny grid: no banding needed */
-    band_piece(kid, ds, pc, npc, gx, 0, gy, 1, 1, label);
-    if(g_ts_n < 255) g_ts_n += 2;
-    return;
-  }
+  /* Probe = FIXED 2 workgroup rows (not a fraction of the image): bounded
+   * on any GPU speed x any resolution (an iGPU-8K-slow probe is still a
+   * few hundred ms, never near the ~2 s watchdog).  A fractional probe
+   * (1/8) could itself TDR in the extreme corner (measured iGPU pass12
+   * ~7.7 s at 4K => ~31 s at 8K => 1/8 probe ~3.9 s = dead).
+   * JP: プローブは固定 2 タイル行。極端ケースでもプローブ自体が
+   * 監視時間を踏み抜かないことを構成的に保証。 */
+  const uint32_t probe_rows = (gy > 2) ? 2u : gy;
   const clock_t t0 = clock();
-  band_piece(kid, ds, pc, npc, gx, 0, probe_rows, 1, 0, label);
+  band_piece(kid, ds, pc, npc, gx, 0, probe_rows, 1, probe_rows >= gy, label);
   const double probe_ms = 1000.0 * (double)(clock() - t0) / CLOCKS_PER_SEC;
+  if(probe_rows >= gy) { if(g_ts_n < 255) g_ts_n += 2; return; }
+
   const uint32_t rest_y0 = probe_rows, rest = gy - probe_rows;
-  /* pieces sized so each stays ~<= 1 s based on the measured probe rate */
+  const double per_row_ms = probe_ms / (double)probe_rows;
+  const double est_rest_ms = per_row_ms * (double)rest;
+  /* fast path: whole remainder comfortably under the watchdog -> 1 piece;
+   * else split so each piece targets ~800 ms (margin under ~2 s TDR). */
   uint32_t pieces = 1;
-  if(probe_ms > 150.0)
+  if(est_rest_ms > 800.0)
   {
-    const double est_rest_ms = probe_ms * (double)rest / (double)probe_rows;
-    pieces = (uint32_t)(est_rest_ms / 1000.0) + 1;
+    pieces = (uint32_t)(est_rest_ms / 800.0) + 1;
     if(pieces > rest) pieces = rest;
   }
   for(uint32_t p = 0; p < pieces; p++)
