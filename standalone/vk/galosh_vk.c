@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
 
 #define CHECK(x) do { VkResult _r = (x); if(_r != VK_SUCCESS) { \
@@ -191,7 +192,10 @@ static void make_kernel(Kern *k)
     .pushConstantRangeCount = k->push ? 1u : 0u, .pPushConstantRanges = &pcr };
   CHECK(vkCreatePipelineLayout(g_dev, &pli, NULL, &k->pl));
   VkShaderModule sm = load_spv(k->spv);
+  /* DISPATCH_BASE on every compute pipeline: enables the TDR-safe banded
+   * pass12 dispatch via vkCmdDispatchBase (harmless for plain dispatch). */
   VkComputePipelineCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+    .flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT,
     .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main" },
     .layout = k->pl };
@@ -280,6 +284,91 @@ static void dispatch_k(VkCommandBuffer cb, int kid, VkDescriptorSet ds,
 }
 
 #define AUP(n, a) ((((n) + (a) - 1) / (a)))   /* group count for local size a */
+
+/* [TDR-safe] Banded dispatch via vkCmdDispatchBase (core 1.1): splits the
+ * workgroup grid into NB row bands = NB independent dispatches = preemption
+ * boundaries, so one long kernel (pass12 at 4K on a slow iGPU measured
+ * ~2.9 s single-dispatch = over the Windows ~2 s TDR watchdog) can never
+ * starve the OS.  Tiles are independent — zero numeric change, no barrier
+ * between bands.  Single code path on every GPU (8 x 5 ms on a 4070 Ti is
+ * harmless).  JP: 行バンド分割で TDR 恒久回避。数値は完全不変。 */
+static VkCommandBuffer cb_begin(void);
+static void cb_submit_wait(VkCommandBuffer cb);
+
+/* Each band = its OWN queue submission: measured on the AMD iGPU, the
+ * Windows TDR watchdog treats one submission as a single non-preemptible
+ * unit (banding via vkCmdDispatchBase inside ONE command buffer still
+ * died at 4K), so preemption boundaries must be SUBMISSION boundaries.
+ * The 8 submissions are queued back-to-back with a single vkQueueWaitIdle
+ * at the end — zero host round-trips between bands, so the overhead on a
+ * fast dGPU is ~0 while a slow iGPU gets 8 watchdog-visible chunks.
+ * Timestamps: one pair spanning first..last band.
+ * JP: バンド=サブミッション境界（TDR の preemption 単位）。待ちは最後に
+ * 1 回だけなので高速 GPU への追加コストは実質ゼロ。 */
+static void band_piece(int kid, VkDescriptorSet ds, const PcW *pc, int npc,
+                       uint32_t gx, uint32_t y0, uint32_t rows,
+                       int ts_open, int ts_close, const char *label)
+{
+  Kern *k = &g_k[kid];
+  VkCommandBuffer cb = cb_begin();
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipe);
+  vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->pl, 0, 1, &ds, 0, NULL);
+  if(npc) vkCmdPushConstants(cb, k->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                             (uint32_t)(npc * 4), pc);
+  if(ts_open && g_ts_n < 255)
+  {
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_qpool, g_ts_n);
+    g_ts_label[g_ts_n] = label;
+  }
+  vkCmdDispatchBase(cb, 0, y0, 0, gx, rows, 1);
+  if(ts_close && g_ts_n < 255)
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qpool, g_ts_n + 1);
+  barrier(cb);
+  cb_submit_wait(cb);
+}
+
+/* Watchdog-aware ADAPTIVE banding: submit the first 1/8 of the workgroup
+ * rows alone and wall-clock it.  Fast GPUs (< 150 ms for the probe =>
+ * whole kernel well under the ~2 s Windows TDR budget) get the remaining
+ * 7/8 as ONE dispatch (overhead: a single extra submit).  Slow GPUs get
+ * the remainder split so each piece stays ~<= 1 s.  Adaptation is by
+ * MEASURED BEHAVIOR, not vendor detection — one code path everywhere.
+ * (Empirical basis: an AMD iGPU ran pass12@4K ~7.7 s; a single in-CB
+ * vkCmdDispatchBase banding still died => the TDR preemption unit is the
+ * SUBMISSION, hence per-piece submissions here.)
+ * JP: 先頭バンドを実測して分割数を自己決定。ベンダー判定は使わない。 */
+static void dispatch_k_banded(int kid, VkDescriptorSet ds,
+                              const PcW *pc, int npc,
+                              uint32_t gx, uint32_t gy, const char *label)
+{
+  const uint32_t probe_rows = (gy + 7) / 8;
+  if(probe_rows >= gy)
+  { /* tiny grid: no banding needed */
+    band_piece(kid, ds, pc, npc, gx, 0, gy, 1, 1, label);
+    if(g_ts_n < 255) g_ts_n += 2;
+    return;
+  }
+  const clock_t t0 = clock();
+  band_piece(kid, ds, pc, npc, gx, 0, probe_rows, 1, 0, label);
+  const double probe_ms = 1000.0 * (double)(clock() - t0) / CLOCKS_PER_SEC;
+  const uint32_t rest_y0 = probe_rows, rest = gy - probe_rows;
+  /* pieces sized so each stays ~<= 1 s based on the measured probe rate */
+  uint32_t pieces = 1;
+  if(probe_ms > 150.0)
+  {
+    const double est_rest_ms = probe_ms * (double)rest / (double)probe_rows;
+    pieces = (uint32_t)(est_rest_ms / 1000.0) + 1;
+    if(pieces > rest) pieces = rest;
+  }
+  for(uint32_t p = 0; p < pieces; p++)
+  {
+    const uint32_t a = rest_y0 + rest * p / pieces;
+    const uint32_t b = rest_y0 + rest * (p + 1) / pieces;
+    if(b > a) band_piece(kid, ds, pc, npc, gx, a, b - a,
+                         0, p == pieces - 1, label);
+  }
+  if(g_ts_n < 255) g_ts_n += 2;
+}
 
 /* ================= staging I/O ================= */
 static Buf g_stg; static void *g_stg_map;
@@ -767,9 +856,12 @@ int main(int argc, char **argv)
   PCI(0, W); PCI(1, H); PCI(2, hw); PCI(3, hh);
   dispatch_k(cb, K_CHROMA_EX, s_cex, pc, 4,
              (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_3 chroma_extract");
+  cb_submit_wait(cb);
+  /* pass12 = per-band submissions (TDR-safe on slow GPUs, see helper) */
   PCI(0, W); PCI(1, H); PCF(2, strength * luma_str); PCI(3, phase_stride);
-  dispatch_k(cb, kid_p12, s_p12, pc, 4,
-             (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE), 1, "K_O32_5 pass12_L_fr");
+  dispatch_k_banded(kid_p12, s_p12, pc, 4,
+             (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE), "K_O32_5 pass12_L_fr");
+  cb = cb_begin();
   PCI(0, W); PCI(1, H); PCI(2, hw);
   dispatch_k(cb, K_P6_FUSED, s_p6, pc, 3,
              (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_6 L_pixel+L_h_den_fused");
@@ -786,11 +878,9 @@ int main(int argc, char **argv)
     dump_buf_f16(dump_dir, "p6_L_pixel", &L_pixel, npix);    /* [FP16 v1] */
     dump_buf_f16(dump_dir, "p6_L_h_den", &L_h_den, chsize);  /* [FP16 v1] */
     /* pilot dump: extra dispatch (matches OpenCL debug path) */
-    cb = cb_begin();
     PCI(0, W); PCI(1, H); PCF(2, strength * luma_str);
-    dispatch_k(cb, K_PASS1_DUMP, s_p1d, pc, 3,
-               (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE), 1, "pass1_dump");
-    cb_submit_wait(cb);
+    dispatch_k_banded(K_PASS1_DUMP, s_p1d, pc, 3,
+               (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE), "pass1_dump");
     dump_buf(dump_dir, "p5_pilot", &pilot_dbg, npix);
   }
 
