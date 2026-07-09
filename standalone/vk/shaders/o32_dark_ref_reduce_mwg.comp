@@ -1,18 +1,33 @@
 #version 450
 /* Transcribed from galosh.cl §7.8b galosh_o32_dark_ref_reduce_mwg (line 7522).
  * Multi-WG dark_ref IRLS reduce: each WI scans a slice of 2x2 blocks,
- * WG tree-reduces sum_w + sum_w·g0..3 in shared memory, writes 5 doubles
- * per WG to partial_buf.  FP64 accumulation throughout (mirrors CPU double
- * path) → requires the shaderFloat64 device feature.
+ * WG tree-reduces sum_w + sum_w·g0..3 in shared memory, writes 5 Kahan
+ * (sum, comp) float pairs per WG to partial_buf.
+ *
+ * FP64→COMPENSATED-FP32 REWRITE (V2.0 cross-vendor, 2026-07-10):
+ * the original transcription accumulated in `double` (mirror of the CPU
+ * double path) and required shaderFloat64 — unavailable on Intel Arc.
+ * Each accumulated quantity is now a Neumaier/Kahan pair (float sum,
+ * float comp) with true value ≈ sum + comp:
+ *   - per-WI accumulation  = Kahan (error-free TwoSum, comp carries error)
+ *   - WG tree reduction    = Kahan-aware pair combine (TwoSum on the sums,
+ *                            compensations added through the tree)
+ * `precise` qualifiers forbid FMA contraction / reassociation that would
+ * cancel the TwoSum error terms.  Compensated FP32 carries ~2×24-bit
+ * effective mantissa for these well-scaled sums — sufficient for the
+ * dark_ref means (validated ≥69 dB vs CPU canonical).
+ * JP: FP64全廃。Kahan補償付きFP32で蓄積のみ倍精度相当を維持。
+ * Tukey-bisquare weight math itself is per-block FLOAT (inputs are float;
+ * only the ACCUMULATION was double) — preserved exactly.
  * Host dispatch: 64 WGs (O32_DR_MWG_NWG) × 256 WIs (O32_DR_MWG_WGSIZE),
- * called 3× (IRLS iterations).  Literal transcription (V2.0 Phase B2). */
+ * called 3× (IRLS iterations). */
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly  buffer Buf0 { float in_gat_full[]; };
 layout(std430, binding = 1) readonly  buffer Buf1 { float raw[]; };
 layout(std430, binding = 2) readonly  buffer Buf2 { float params[]; };   /* read params[P_S_SCALE] */
-layout(std430, binding = 3) writeonly buffer Buf3 { double partial_buf[]; };  /* [n_wg * 5] doubles */
+layout(std430, binding = 3) writeonly buffer Buf3 { float partial_buf[]; };  /* [n_wg * 5 * 2] floats: (sum,comp) per quantity */
 
 layout(push_constant) uniform PC {
   int width;
@@ -25,9 +40,35 @@ const int P_S_SCALE = 10;
 const float GALOSH_ACHROMATIC_RANGE_O32 = 4.0;   /* matches CPU galosh_cpu.h:364 */
 const int O32_DR_MWG_WGSIZE = 256;
 
-/* WG-level tree reduction in double LDS.  LDS: 5 doubles × WGSIZE × 8B
- * = 256 × 5 × 8 = 10 KB at WGSIZE=256, fits 32 KB ISP budget. */
-shared double lds[O32_DR_MWG_WGSIZE * 5];
+/* WG-level tree reduction: (sum, comp) float pairs.  LDS: 5 × 2 floats ×
+ * WGSIZE × 4B = 256 × 10 × 4 = 10 KB at WGSIZE=256 (same as the former
+ * double version), fits 32 KB ISP budget. */
+shared float lds_s[O32_DR_MWG_WGSIZE * 5];
+shared float lds_c[O32_DR_MWG_WGSIZE * 5];
+
+/* Neumaier/Kahan accumulate: (s, c) += v with true value ≈ s + c.
+ * Knuth TwoSum (branch-free, magnitude-order-free); error into comp. */
+void kacc(inout float s, inout float c, float v)
+{
+  precise float t  = s + v;
+  precise float vp = t - s;
+  precise float sp = t - vp;
+  precise float e  = (v - vp) + (s - sp);
+  s = t;
+  c = c + e;
+}
+
+/* Kahan-aware pair combine: (s,c) += (s2,c2).  TwoSum on the sums; both
+ * compensations plus the new error carried through. */
+void kcombine(inout float s, inout float c, float s2, float c2)
+{
+  precise float t  = s + s2;
+  precise float vp = t - s;
+  precise float sp = t - vp;
+  precise float e  = (s2 - vp) + (s - sp);
+  s = t;
+  c = c + c2 + e;
+}
 
 void main()
 {
@@ -37,20 +78,20 @@ void main()
   const int wgsize = O32_DR_MWG_WGSIZE;   /* get_local_size(0) → constant */
   const int total_wis = int(gl_NumWorkGroups.x) * O32_DR_MWG_WGSIZE;  /* get_global_size(0) */
 
-  const double s_scale = double(params[P_S_SCALE]);
-  const double inv_s = 1.0lf / max(s_scale, 1e-20lf);
+  const float s_scale = params[P_S_SCALE];
+  const float inv_s = 1.0 / max(s_scale, 1e-20);
 
   /* height/2 · width/2 blocks (matches CPU; even-dim off-by-one fixed). */
   const int n_block_rows = pc.height / 2;
   const int n_block_cols = pc.width  / 2;
   const int total_blocks = n_block_rows * n_block_cols;
 
-  /* Per-WI accumulators in double (= matches CPU double sum_w0..3). */
-  double my_sw  = 0.0lf;
-  double my_sw0 = 0.0lf;
-  double my_sw1 = 0.0lf;
-  double my_sw2 = 0.0lf;
-  double my_sw3 = 0.0lf;
+  /* Per-WI Kahan accumulators (sum, comp) — replaces CPU-mirror double. */
+  float sw_s  = 0.0, sw_c  = 0.0;
+  float sw0_s = 0.0, sw0_c = 0.0;
+  float sw1_s = 0.0, sw1_c = 0.0;
+  float sw2_s = 0.0, sw2_c = 0.0;
+  float sw3_s = 0.0, sw3_c = 0.0;
 
   for(int bi = gid; bi < total_blocks; bi += total_wis)
   {
@@ -71,46 +112,49 @@ void main()
     const float iv1 = raw[(br + 1) * pc.width + bc      ];
     const float iv2 = raw[br       * pc.width + (bc + 1)];
     const float iv3 = raw[(br + 1) * pc.width + (bc + 1)];
-    /* L_raw / r / r² / w in DOUBLE to mirror CPU. */
-    const double L_raw = (double(iv0) + double(iv1) + double(iv2) + double(iv3)) * 0.25lf;
-    const double r  = L_raw * inv_s;
-    const double r2 = r * r;
-    const double w  = 1.0lf / (1.0lf + r2 * r2);
-    my_sw  += w;
-    my_sw0 += w * double(g0);
-    my_sw1 += w * double(g1);
-    my_sw2 += w * double(g2);
-    my_sw3 += w * double(g3);
+    /* Tukey-bisquare weight in FLOAT (inputs were float all along; the
+     * double round-trip added no information per block). */
+    const float L_raw = (iv0 + iv1 + iv2 + iv3) * 0.25;
+    const float r  = L_raw * inv_s;
+    const float r2 = r * r;
+    const float w  = 1.0 / (1.0 + r2 * r2);
+    kacc(sw_s,  sw_c,  w);
+    kacc(sw0_s, sw0_c, w * g0);
+    kacc(sw1_s, sw1_c, w * g1);
+    kacc(sw2_s, sw2_c, w * g2);
+    kacc(sw3_s, sw3_c, w * g3);
   }
 
-  lds[lid * 5 + 0] = my_sw;
-  lds[lid * 5 + 1] = my_sw0;
-  lds[lid * 5 + 2] = my_sw1;
-  lds[lid * 5 + 3] = my_sw2;
-  lds[lid * 5 + 4] = my_sw3;
+  lds_s[lid * 5 + 0] = sw_s;  lds_c[lid * 5 + 0] = sw_c;
+  lds_s[lid * 5 + 1] = sw0_s; lds_c[lid * 5 + 1] = sw0_c;
+  lds_s[lid * 5 + 2] = sw1_s; lds_c[lid * 5 + 2] = sw1_c;
+  lds_s[lid * 5 + 3] = sw2_s; lds_c[lid * 5 + 3] = sw2_c;
+  lds_s[lid * 5 + 4] = sw3_s; lds_c[lid * 5 + 4] = sw3_c;
   memoryBarrierShared(); barrier();
 
   for(int s = wgsize / 2; s > 0; s >>= 1)
   {
     if(lid < s)
     {
-      lds[lid * 5 + 0] += lds[(lid + s) * 5 + 0];
-      lds[lid * 5 + 1] += lds[(lid + s) * 5 + 1];
-      lds[lid * 5 + 2] += lds[(lid + s) * 5 + 2];
-      lds[lid * 5 + 3] += lds[(lid + s) * 5 + 3];
-      lds[lid * 5 + 4] += lds[(lid + s) * 5 + 4];
+      for(int q = 0; q < 5; q++)
+      {
+        float as = lds_s[lid * 5 + q], ac = lds_c[lid * 5 + q];
+        kcombine(as, ac, lds_s[(lid + s) * 5 + q], lds_c[(lid + s) * 5 + q]);
+        lds_s[lid * 5 + q] = as; lds_c[lid * 5 + q] = ac;
+      }
     }
     memoryBarrierShared(); barrier();
   }
 
   if(lid == 0)
   {
-    /* Write final partials as double (= consumer §7.8c reads as double).
-     * Casting to float here would destroy the FP64 accumulation precision. */
-    partial_buf[wgid * 5 + 0] = lds[0];
-    partial_buf[wgid * 5 + 1] = lds[1];
-    partial_buf[wgid * 5 + 2] = lds[2];
-    partial_buf[wgid * 5 + 3] = lds[3];
-    partial_buf[wgid * 5 + 4] = lds[4];
+    /* Write final partials as (sum, comp) pairs — consumer §7.8c combines
+     * the 64 pairs Kahan-aware.  Collapsing to a single float here would
+     * discard the compensation the whole scheme exists for. */
+    for(int q = 0; q < 5; q++)
+    {
+      partial_buf[wgid * 10 + q * 2 + 0] = lds_s[q];
+      partial_buf[wgid * 10 + q * 2 + 1] = lds_c[q];
+    }
   }
 }

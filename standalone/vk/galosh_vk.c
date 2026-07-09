@@ -390,11 +390,10 @@ int main(int argc, char **argv)
   vkGetPhysicalDeviceProperties(g_pd, &g_props);
   fprintf(stderr, "[vk] device[%u] = %s\n", di, g_props.deviceName);
 
-  VkPhysicalDeviceFeatures feats; vkGetPhysicalDeviceFeatures(g_pd, &feats);
-  if(!feats.shaderFloat64)
-  { fprintf(stderr, "[vk] shaderFloat64 unsupported on this device — required by "
-                    "dark-ref/LUT kernels (Kahan-float fallback lands in B3)\n"); return 2; }
-  VkPhysicalDeviceFeatures en = { .shaderFloat64 = VK_TRUE };
+  /* No optional device features required: FP64 was removed from the
+   * shader set (dark-ref/LUT kernels now use compensated Kahan FP32),
+   * so ONE unmodified shader set runs on NVIDIA + AMD + Intel Arc
+   * (Arc lacks shaderFloat64). */
 
   uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &qn, NULL);
   VkQueueFamilyProperties qf[16]; if(qn > 16) qn = 16;
@@ -406,7 +405,7 @@ int main(int argc, char **argv)
   VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
     .queueFamilyIndex = g_qi, .queueCount = 1, .pQueuePriorities = &prio };
   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-    .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = &en };
+    .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = NULL };
   CHECK(vkCreateDevice(g_pd, &dci, NULL, &g_dev));
   vkGetDeviceQueue(g_dev, g_qi, 0, &g_q);
   VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -436,8 +435,8 @@ int main(int argc, char **argv)
   Buf params  = DEVBUF(PARAMS_SIZE * 4);
   Buf lut_d   = DEVBUF(GAT_LUT_SIZE * 4), lut_x = DEVBUF(GAT_LUT_SIZE * 4);
   Buf lut_p   = DEVBUF(8 * 4);
-  Buf part    = DEVBUF(N_REDUCE_WG * 5 * 8);          /* f64 */
-  Buf part_r  = DEVBUF(N_REDUCE_WG * 2 * 8);          /* f64 */
+  Buf part    = DEVBUF(N_REDUCE_WG * 5 * 2 * sizeof(float));  /* Kahan (sum,comp) f32 pairs */
+  Buf part_r  = DEVBUF(N_REDUCE_WG * 2 * 2 * sizeof(float));  /* Kahan (sum,comp) f32 pairs */
   Buf blk_m   = DEVBUF(ne_total * 4), blk_v = DEVBUF(ne_total * 4);
   Buf dt_hist = DEVBUF(4096 * 4), dl_hist = DEVBUF(4096 * 4);
   Buf in_gat  = DEVBUF(full_f);
