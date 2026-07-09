@@ -15,7 +15,7 @@ o32_box_downsample_2x_3p o32_loess_chroma_3p_tiled o32_crop_2d_topleft \
 o32_k16_jbu_3p o32_pad_2d_edge o32_smoothstep_blend_3p o32_inverse_wht_dark_gat"
 
 for k in $ACTIVE; do
-  glslc "shaders/$k.comp" -o "shaders/$k.spv"
+  glslc -O "shaders/$k.comp" -o "shaders/$k.spv"
 done
 echo "shaders: $(echo $ACTIVE | wc -w) compiled"
 
