@@ -98,6 +98,7 @@ enum {
   K_DR_REDUCE, K_DR_FIN, K_DR_RREDUCE, K_DR_RFIN, K_DARK_SUB,
   K_FWD_L, K_CHROMA_EX, K_PASS12, K_PASS1_DUMP, K_P6_FUSED,
   K_BOX2, K_BOX2_3P, K_LOESS_T, K_CROP, K_K16, K_PAD, K_SMOOTH, K_INV,
+  K_PASS12_W4, K_FASTUP,          /* [B6] fast-mode siblings */
   K_COUNT
 };
 static Kern g_k[K_COUNT] = {
@@ -131,6 +132,8 @@ static Kern g_k[K_COUNT] = {
   [K_PAD]       = { "o32_pad_2d_edge",            2, 16 },
   [K_SMOOTH]    = { "o32_smoothstep_blend_3p",   15, 12 },
   [K_INV]       = { "o32_inverse_wht_dark_gat",   9,  8 },
+  [K_PASS12_W4] = { "o32_pass12_wht4",            2, 16 },
+  [K_FASTUP]    = { "o32_fastup_3p",              7, 12 },
 };
 
 static char g_exe_dir[1024];
@@ -313,11 +316,17 @@ int main(int argc, char **argv)
    * JP: 動画償却。保持フレームは P0 と LUT 構築を丸ごとスキップ。 */
   const char *noise_mode = "fit";
   const char *noise_state_path = NULL;
+  int wht_block = 8;        /* [B6] --wht=4|8 (fast luma mode) */
+  int upsample_fast = 0;    /* [B6] --upsample=jinc|fast */
   char *pos[16]; int np = 0;
   for(int i = 1; i < argc && np < 16; i++)
   {
     if(strncmp(argv[i], "--noise=", 8) == 0)       { noise_mode = argv[i] + 8; }
     else if(strncmp(argv[i], "--noise-state=", 14) == 0) { noise_state_path = argv[i] + 14; }
+    else if(strncmp(argv[i], "--wht=", 6) == 0)
+    { wht_block = (atoi(argv[i] + 6) == 4) ? 4 : 8; }
+    else if(strncmp(argv[i], "--upsample=", 11) == 0)
+    { upsample_fast = (strcmp(argv[i] + 11, "fast") == 0); }
     else if(strncmp(argv[i], "--", 2) != 0) pos[np++] = argv[i];
   }
   if(np < 4)
@@ -484,7 +493,10 @@ int main(int argc, char **argv)
   VkDescriptorSet s_dsub     = SET(K_DARK_SUB, &in_gat, &ch0, &ch1, &ch2, &ch3, &params);
   VkDescriptorSet s_fwdl     = SET(K_FWD_L, &in_gat, &L_cs);
   VkDescriptorSet s_cex      = SET(K_CHROMA_EX, &in_gat, &C1_h, &C2_h, &C3_h);
-  VkDescriptorSet s_p12      = SET(K_PASS12, &L_cs, &L_cs_den);
+  /* [B6] fast-mode kernel selection (same buffer graph, swapped pipelines) */
+  const int kid_p12 = (wht_block == 4) ? K_PASS12_W4 : K_PASS12;
+  const int kid_up  = upsample_fast ? K_FASTUP : K_K16;
+  VkDescriptorSet s_p12      = SET(kid_p12, &L_cs, &L_cs_den);
   VkDescriptorSet s_p1d      = SET(K_PASS1_DUMP, &L_cs, &pilot_dbg);
   VkDescriptorSet s_p6       = SET(K_P6_FUSED, &L_cs_den, &L_pixel, &L_h_den);
   VkDescriptorSet s_Lq       = SET(K_BOX2, &L_h_den, &L_q);
@@ -495,20 +507,20 @@ int main(int argc, char **argv)
   VkDescriptorSet s_lo_q     = SET(K_LOESS_T, &L_q, &C_q1, &C_q2, &C_q3, &Cl_q1, &Cl_q2, &Cl_q3);
   VkDescriptorSet s_lo_e     = SET(K_LOESS_T, &L_e, &C_e1, &C_e2, &C_e3, &Cl_e1, &Cl_e2, &Cl_e3);
   VkDescriptorSet s_cropq    = SET(K_CROP, &L_h_den, &L_for_q);
-  VkDescriptorSet s_k16_q2h  = SET(K_K16, &Cl_q1, &Cl_q2, &Cl_q3, &L_for_q, &Cqup_r1, &Cqup_r2, &Cqup_r3);
+  VkDescriptorSet s_k16_q2h  = SET(kid_up, &Cl_q1, &Cl_q2, &Cl_q3, &L_for_q, &Cqup_r1, &Cqup_r2, &Cqup_r3);
   VkDescriptorSet s_pad_q[3] = {
     SET(K_PAD, &Cqup_r1, &Cqup1), SET(K_PAD, &Cqup_r2, &Cqup2), SET(K_PAD, &Cqup_r3, &Cqup3) };
   VkDescriptorSet s_crope    = SET(K_CROP, &L_q, &L_for_e);
-  VkDescriptorSet s_k16_e2q  = SET(K_K16, &Cl_e1, &Cl_e2, &Cl_e3, &L_for_e, &Ceq_r1, &Ceq_r2, &Ceq_r3);
+  VkDescriptorSet s_k16_e2q  = SET(kid_up, &Cl_e1, &Cl_e2, &Cl_e3, &L_for_e, &Ceq_r1, &Ceq_r2, &Ceq_r3);
   VkDescriptorSet s_pad_e[3] = {
     SET(K_PAD, &Ceq_r1, &Ceq1), SET(K_PAD, &Ceq_r2, &Ceq2), SET(K_PAD, &Ceq_r3, &Ceq3) };
-  VkDescriptorSet s_k16_eq2h = SET(K_K16, &Ceq1, &Ceq2, &Ceq3, &L_for_q, &Ceup_r1, &Ceup_r2, &Ceup_r3);
+  VkDescriptorSet s_k16_eq2h = SET(kid_up, &Ceq1, &Ceq2, &Ceq3, &L_for_q, &Ceup_r1, &Ceup_r2, &Ceup_r3);
   VkDescriptorSet s_pad_eu[3] = {
     SET(K_PAD, &Ceup_r1, &Ceup1), SET(K_PAD, &Ceup_r2, &Ceup2), SET(K_PAD, &Ceup_r3, &Ceup3) };
   VkDescriptorSet s_smooth   = SET(K_SMOOTH, &C1_h, &C2_h, &C3_h, &Cl_h1, &Cl_h2, &Cl_h3,
                                    &Cqup1, &Cqup2, &Cqup3, &Ceup1, &Ceup2, &Ceup3,
                                    &Cden1, &Cden2, &Cden3);
-  VkDescriptorSet s_k16_fin  = SET(K_K16, &Cden1, &Cden2, &Cden3, &L_pixel, &Cal1, &Cal2, &Cal3);
+  VkDescriptorSet s_k16_fin  = SET(kid_up, &Cden1, &Cden2, &Cden3, &L_pixel, &Cal1, &Cal2, &Cal3);
   VkDescriptorSet s_inv      = SET(K_INV, &L_pixel, &Cal1, &Cal2, &Cal3, &raw,
                                    &lut_d, &lut_x, &lut_p, &params);
 
@@ -677,7 +689,7 @@ int main(int argc, char **argv)
   dispatch_k(cb, K_CHROMA_EX, s_cex, pc, 4,
              (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_3 chroma_extract");
   PCI(0, W); PCI(1, H); PCF(2, strength * luma_str); PCI(3, phase_stride);
-  dispatch_k(cb, K_PASS12, s_p12, pc, 4,
+  dispatch_k(cb, kid_p12, s_p12, pc, 4,
              (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE), 1, "K_O32_5 pass12_L_fr");
   PCI(0, W); PCI(1, H); PCI(2, hw);
   dispatch_k(cb, K_P6_FUSED, s_p6, pc, 3,
@@ -741,7 +753,7 @@ int main(int argc, char **argv)
   dispatch_k(cb, K_CROP, s_cropq, pc, 4,
              (uint32_t)AUP(kq_w, 16), (uint32_t)AUP(kq_h, 16), 1, "K_O32_7h crop_L_for_q");
   PCI(0, cq_w); PCI(1, cq_h); PCF(2, 1.5f);
-  dispatch_k(cb, K_K16, s_k16_q2h, pc, 3,
+  dispatch_k(cb, kid_up, s_k16_q2h, pc, 3,
              (uint32_t)AUP(kq_w, 16), (uint32_t)AUP(kq_h, 16), 1, "K_O32_7i K16_q2h");
   for(int p = 0; p < 3; p++)
   {
@@ -753,7 +765,7 @@ int main(int argc, char **argv)
   dispatch_k(cb, K_CROP, s_crope, pc, 4,
              (uint32_t)AUP(ke_w, 16), (uint32_t)AUP(ke_h, 16), 1, "K_O32_7k crop_L_for_e");
   PCI(0, ce_w); PCI(1, ce_h); PCF(2, 1.5f);
-  dispatch_k(cb, K_K16, s_k16_e2q, pc, 3,
+  dispatch_k(cb, kid_up, s_k16_e2q, pc, 3,
              (uint32_t)AUP(ke_w, 16), (uint32_t)AUP(ke_h, 16), 1, "K_O32_7l K16_e2q");
   for(int p = 0; p < 3; p++)
   {
@@ -762,7 +774,7 @@ int main(int argc, char **argv)
                (uint32_t)AUP(cq_w, 16), (uint32_t)AUP(cq_h, 16), 1, "K_O32_7m pad_e_to_q");
   }
   PCI(0, cq_w); PCI(1, cq_h); PCF(2, 1.5f);
-  dispatch_k(cb, K_K16, s_k16_eq2h, pc, 3,
+  dispatch_k(cb, kid_up, s_k16_eq2h, pc, 3,
              (uint32_t)AUP(kq_w, 16), (uint32_t)AUP(kq_h, 16), 1, "K_O32_7n K16_q2h_e");
   for(int p = 0; p < 3; p++)
   {
@@ -774,7 +786,7 @@ int main(int argc, char **argv)
   dispatch_k(cb, K_SMOOTH, s_smooth, pc, 3,
              (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_8 smoothstep");
   PCI(0, hw); PCI(1, hh); PCF(2, 1.5f);
-  dispatch_k(cb, K_K16, s_k16_fin, pc, 3,
+  dispatch_k(cb, kid_up, s_k16_fin, pc, 3,
              (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_9 K16_final");
   PCI(0, W); PCI(1, H);
   dispatch_k(cb, K_INV, s_inv, pc, 2,

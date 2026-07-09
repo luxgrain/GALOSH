@@ -12,7 +12,8 @@ o32_dark_ref_finalize_mwg o32_dark_resid_reduce_mwg o32_dark_resid_finalize_mwg 
 o32_dark_sub_full o32_forward_l_stride1 o32_chroma_extract_halfres \
 o32_pass12 o32_pass1_dump o32_lpixel_lh_den_fused o32_box_downsample_2x \
 o32_box_downsample_2x_3p o32_loess_chroma_3p_tiled o32_crop_2d_topleft \
-o32_k16_jbu_3p o32_pad_2d_edge o32_smoothstep_blend_3p o32_inverse_wht_dark_gat"
+o32_k16_jbu_3p o32_pad_2d_edge o32_smoothstep_blend_3p o32_inverse_wht_dark_gat \
+o32_pass12_wht4 o32_fastup_3p"
 
 for k in $ACTIVE; do
   glslc -O "shaders/$k.comp" -o "shaders/$k.spv"
