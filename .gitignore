@@ -153,3 +153,6 @@ _backup/
 
 # distribution zips / staging (built artifacts, never commit)
 /dist/
+
+# Vulkan build artifacts
+*.spv
