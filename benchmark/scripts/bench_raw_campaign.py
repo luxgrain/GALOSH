@@ -107,12 +107,12 @@ def blind_pg(noisy, bs=16):
 
 
 # ---------- method runners: each (noisy_raw, gt_raw) -> (denoised_raw, dt) ----------
-def run_cpu_exe(exe, noisy, w, h, uid, alpha=0.0, sigma=0.0):
+def run_cpu_exe(exe, noisy, w, h, uid, alpha=0.0, sigma=0.0, extra=""):
     tmp = smb.OUTDIR
     uid = f"{uid}_{os.getpid()}"   # PID-unique temp: parallel processes must NOT share _tmp files
     ip, op = tmp / f"_tmp_{uid}_in.raw", tmp / f"_tmp_{uid}_out.raw"
     noisy.astype(np.float32).tofile(str(ip))
-    cmd = [BASH, "-c", f'"{exe}" "{ip}" "{op}" {w} {h} galosh 1.0 1.0 1.0 {alpha} {sigma}']
+    cmd = [BASH, "-c", f'"{exe}" "{ip}" "{op}" {w} {h} galosh 1.0 1.0 1.0 {alpha} {sigma} {extra}']
     import subprocess
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, timeout=600)
@@ -177,6 +177,14 @@ def make_runners():
     R["vst_galosh"]   = lambda nr, gr: (lambda a: smb.run_galosh_gpu(nr, nr.shape[1], nr.shape[0], "vstg", alpha=a[0], sigma_sq=a[1]))(blind_pg(nr))
     # [DEPRECATED, kept for reference] CPU-exe variant of the same ablation:
     # R["vst_galosh"] = lambda nr, gr: (lambda a: run_cpu_exe(CPU_FP32, nr, nr.shape[1], nr.shape[0], "vstg", alpha=a[0], sigma=a[1]))(blind_pg(nr))
+    # [V2.0 Phase-A gate] CPU FP32 fast-mode quality labeling.  v2base = the
+    # canonical CPU pipeline (identical math to galosh_fp32 GPU o32, run on
+    # CPU so the mode DELTAS are measured against the exact same binary);
+    # the three mode rows differ from v2base only by the V2.0 flags.
+    R["galosh_cpu_v2base"]     = lambda nr, gr: run_cpu_exe(CPU_FP32, nr, nr.shape[1], nr.shape[0], "v2b")
+    R["galosh_cpu_v2_wht4"]    = lambda nr, gr: run_cpu_exe(CPU_FP32, nr, nr.shape[1], nr.shape[0], "v2w", extra="--wht=4")
+    R["galosh_cpu_v2_upfast"]  = lambda nr, gr: run_cpu_exe(CPU_FP32, nr, nr.shape[1], nr.shape[0], "v2u", extra="--upsample=fast")
+    R["galosh_cpu_v2_fastfull"]= lambda nr, gr: run_cpu_exe(CPU_FP32, nr, nr.shape[1], nr.shape[0], "v2f", extra="--wht=4 --upsample=fast")
     try:
         from b2u import run_b2u
         R["b2u"] = lambda nr, gr: run_b2u(nr.astype(np.float32), tile=512, overlap=32)
