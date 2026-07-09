@@ -1,0 +1,200 @@
+#version 450
+/* Transcribed from galosh.cl §7.8 galosh_o32_dark_ref_irls (line 7310).
+ * Phase 2 (1/2): dark anchor 3-iter Tukey-bisquare IRLS, single WG of
+ * 32 WIs (O32_DR_WG), all 3 iterations in-kernel with LDS reductions.
+ * NOTE: the OpenCL host (galosh_raw_gpu.c) creates but NEVER dispatches
+ * this kernel — the production path is the §7.8b-e multi-WG pipeline.
+ * Local size 32 is fixed by the kernel's own LDS array sizing
+ * (lds_*[O32_DR_WG=32]); dispatch would be 1 workgroup.
+ * Literal transcription (V2.0 Phase B2). */
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Buf0 { float in_gat_full[]; };
+layout(std430, binding = 1) readonly buffer Buf1 { float raw[]; };
+layout(std430, binding = 2) buffer Buf2 { float params[]; };
+
+layout(push_constant) uniform PC {
+  int width;
+  int height;
+} pc;
+
+/* params[] slot indices (galosh.cl lines 6346-6367 + 7297-7302) */
+const int P_ALPHA     = 13;
+const int P_SIGMA_SQ  = 14;
+const int P_DARK_REF0 = 6;
+const int P_S_SCALE   = 10;
+
+const float GALOSH_ACHROMATIC_RANGE_O32 = 4.0;   /* matches CPU galosh_cpu.h:364 */
+const int O32_DR_WG = 32;
+
+/* Per-WI partial sums; reduced via LDS. */
+shared float lds_sw [O32_DR_WG];
+shared float lds_sw0[O32_DR_WG];
+shared float lds_sw1[O32_DR_WG];
+shared float lds_sw2[O32_DR_WG];
+shared float lds_sw3[O32_DR_WG];
+shared float lds_swr[O32_DR_WG];
+shared float lds_sww[O32_DR_WG];
+
+/* Final reduced values shared via LDS for all WIs to read after barrier. */
+shared float dr0_lds, dr1_lds, dr2_lds, dr3_lds;
+shared float s_scale_lds;
+
+void main()
+{
+  const int lid = int(gl_LocalInvocationID.x);
+  const int wg  = O32_DR_WG;   /* get_local_size(0) → constant 32 */
+
+  if(lid == 0)
+  {
+    const float a  = params[P_ALPHA];
+    const float sq = params[P_SIGMA_SQ];
+    const float s_init = sq / max(a, 1e-12);
+    s_scale_lds = s_init;
+    dr0_lds = dr1_lds = dr2_lds = dr3_lds = 0.0;
+  }
+  memoryBarrierShared(); barrier();
+
+  const float a = params[P_ALPHA];
+  const float sq = params[P_SIGMA_SQ];
+  const float s_init = sq / max(a, 1e-12);
+  const float s_min = 0.05 * s_init;
+  const float s_max = 50.0 * s_init;
+
+  /* Even rows of 2x2 blocks: br = 0, 2, 4, ..., height-2.
+   * (matches CPU "br < height-1" = height/2 block rows for even height) */
+  const int n_block_rows = pc.height / 2;
+
+  for(int iter = 0; iter <= 2; iter++)
+  {
+    const float inv_s = 1.0 / max(s_scale_lds, 1e-20);
+
+    /* Pass 1: weighted sums for dark_ref. */
+    float my_sw = 0.0, my_sw0 = 0.0, my_sw1 = 0.0, my_sw2 = 0.0, my_sw3 = 0.0;
+    for(int br_idx = lid; br_idx < n_block_rows; br_idx += wg)
+    {
+      const int br = 2 * br_idx;
+      for(int bc = 0; bc < pc.width - 1; bc += 2)
+      {
+        const float g0 = in_gat_full[br       * pc.width + bc      ];
+        const float g1 = in_gat_full[(br + 1) * pc.width + bc      ];
+        const float g2 = in_gat_full[br       * pc.width + (bc + 1)];
+        const float g3 = in_gat_full[(br + 1) * pc.width + (bc + 1)];
+        const float ch_max = max(max(g0, g1), max(g2, g3));
+        const float ch_min = min(min(g0, g1), min(g2, g3));
+        if(ch_max - ch_min > GALOSH_ACHROMATIC_RANGE_O32) continue;
+
+        const float iv0 = raw[br       * pc.width + bc      ];
+        const float iv1 = raw[(br + 1) * pc.width + bc      ];
+        const float iv2 = raw[br       * pc.width + (bc + 1)];
+        const float iv3 = raw[(br + 1) * pc.width + (bc + 1)];
+        const float L_raw = (iv0 + iv1 + iv2 + iv3) * 0.25;
+        const float r  = L_raw * inv_s;
+        const float r2 = r * r;
+        const float w  = 1.0 / (1.0 + r2 * r2);
+        my_sw  += w;
+        my_sw0 += w * g0;
+        my_sw1 += w * g1;
+        my_sw2 += w * g2;
+        my_sw3 += w * g3;
+      }
+    }
+    lds_sw [lid] = my_sw;
+    lds_sw0[lid] = my_sw0;
+    lds_sw1[lid] = my_sw1;
+    lds_sw2[lid] = my_sw2;
+    lds_sw3[lid] = my_sw3;
+    memoryBarrierShared(); barrier();
+
+    /* Tree reduction (32 -> 1). */
+    for(int s = wg / 2; s > 0; s >>= 1)
+    {
+      if(lid < s)
+      {
+        lds_sw [lid] += lds_sw [lid + s];
+        lds_sw0[lid] += lds_sw0[lid + s];
+        lds_sw1[lid] += lds_sw1[lid + s];
+        lds_sw2[lid] += lds_sw2[lid + s];
+        lds_sw3[lid] += lds_sw3[lid + s];
+      }
+      memoryBarrierShared(); barrier();
+    }
+
+    if(lid == 0)
+    {
+      const float inv_sw = 1.0 / max(lds_sw[0], 1e-20);
+      dr0_lds = lds_sw0[0] * inv_sw;
+      dr1_lds = lds_sw1[0] * inv_sw;
+      dr2_lds = lds_sw2[0] * inv_sw;
+      dr3_lds = lds_sw3[0] * inv_sw;
+    }
+    memoryBarrierShared(); barrier();
+
+    if(iter == 2) break;
+
+    /* Pass 2: weighted residual std for s_scale update. */
+    const float dr0 = dr0_lds, dr1 = dr1_lds, dr2 = dr2_lds, dr3 = dr3_lds;
+    float my_swr = 0.0, my_sww = 0.0;
+    for(int br_idx = lid; br_idx < n_block_rows; br_idx += wg)
+    {
+      const int br = 2 * br_idx;
+      for(int bc = 0; bc < pc.width - 1; bc += 2)
+      {
+        const float g0 = in_gat_full[br       * pc.width + bc      ];
+        const float g1 = in_gat_full[(br + 1) * pc.width + bc      ];
+        const float g2 = in_gat_full[br       * pc.width + (bc + 1)];
+        const float g3 = in_gat_full[(br + 1) * pc.width + (bc + 1)];
+        const float ch_max = max(max(g0, g1), max(g2, g3));
+        const float ch_min = min(min(g0, g1), min(g2, g3));
+        if(ch_max - ch_min > GALOSH_ACHROMATIC_RANGE_O32) continue;
+
+        const float iv0 = raw[br       * pc.width + bc      ];
+        const float iv1 = raw[(br + 1) * pc.width + bc      ];
+        const float iv2 = raw[br       * pc.width + (bc + 1)];
+        const float iv3 = raw[(br + 1) * pc.width + (bc + 1)];
+        const float L_raw = (iv0 + iv1 + iv2 + iv3) * 0.25;
+        const float r  = L_raw * inv_s;
+        const float r2 = r * r;
+        const float w  = 1.0 / (1.0 + r2 * r2);
+        const float d0 = g0 - dr0, d1 = g1 - dr1, d2 = g2 - dr2, d3 = g3 - dr3;
+        const float resid2 = d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+        my_sww += w;
+        my_swr += w * resid2 * 0.25;
+      }
+    }
+    lds_swr[lid] = my_swr;
+    lds_sww[lid] = my_sww;
+    memoryBarrierShared(); barrier();
+    for(int s = wg / 2; s > 0; s >>= 1)
+    {
+      if(lid < s)
+      {
+        lds_swr[lid] += lds_swr[lid + s];
+        lds_sww[lid] += lds_sww[lid + s];
+      }
+      memoryBarrierShared(); barrier();
+    }
+    if(lid == 0)
+    {
+      const float inv_sw2 = 1.0 / max(lds_sww[0], 1e-20);
+      const float measured_std = sqrt(max(lds_swr[0] * inv_sw2, 1e-20));
+      const float ratio = 1.0 / measured_std;
+      float new_s = s_scale_lds * sqrt(ratio);
+      if(new_s < s_min) new_s = s_min;
+      if(new_s > s_max) new_s = s_max;
+      s_scale_lds = new_s;
+    }
+    memoryBarrierShared(); barrier();
+  }
+
+  /* Final write to params (= WI 0 only). */
+  if(lid == 0)
+  {
+    params[P_DARK_REF0 + 0] = dr0_lds;
+    params[P_DARK_REF0 + 1] = dr1_lds;
+    params[P_DARK_REF0 + 2] = dr2_lds;
+    params[P_DARK_REF0 + 3] = dr3_lds;
+    params[P_S_SCALE]       = s_scale_lds;
+  }
+}

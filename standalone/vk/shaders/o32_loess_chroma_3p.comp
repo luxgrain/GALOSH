@@ -1,0 +1,122 @@
+#version 450
+/* o32_loess_chroma_3p.comp — [V2.0 Phase B2] literal transcription of
+ * galosh.cl §6.10 galosh_o32_loess_chroma_3p (OpenCL kernel, line 5727).
+ *
+ * Phase 7: 3-channel Y-guided bilateral-weighted local linear regression
+ * LOESS (FP32).  Mirrors CPU `galosh_loess_chroma_3ch_r` exactly.
+ *
+ *   Per output pixel (x, y):
+ *     window: (2R+1)×(2R+1) centred on (y, x) (= 225 taps for R=7)
+ *     w_i = exp(-(Y_i - Y_c)² / (2 BW²))
+ *     accumulate sumW, sumY, sumYY, sumC*, sumYC* in FP32
+ *     post-loop: var_Y, cov_YC, a = cov / (var + ε), b = mean_C - a·mean_Y
+ *     out = a · Y_c + b
+ *   Boundary: reflect (matches CPU reflect_idx).
+ *   eps_gat = strength_c² × τ⁻²  (τ⁻² = 1.0)
+ *
+ * NOTE (port): the OpenCL host (galosh_raw_gpu.c) creates this kernel
+ * (k_o32_loess_3p, line 482) but never dispatches it — the LDS-tiled
+ * variant (§6.10b) is used at all 3 pyramid scales.  Kept per the
+ * keep-deprecated-variants policy.  local_size 16×16 chosen to match
+ * the sibling 2D kernels (no host dispatch to copy; noted in manifest).
+ *
+ * (日) Phase 7 multi-scale LOESS の単段 naive 版。 ホストは tiled 版のみ
+ *   dispatch する (= 本カーネルは fallback/検証用)。 転写は逐語。 */
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly  buffer Buf0 { float y_guide[]; };
+layout(std430, binding = 1) readonly  buffer Buf1 { float c1_in[];   };
+layout(std430, binding = 2) readonly  buffer Buf2 { float c2_in[];   };
+layout(std430, binding = 3) readonly  buffer Buf3 { float c3_in[];   };
+layout(std430, binding = 4) writeonly buffer Buf4 { float c1_out[];  };
+layout(std430, binding = 5) writeonly buffer Buf5 { float c2_out[];  };
+layout(std430, binding = 6) writeonly buffer Buf6 { float c3_out[];  };
+
+layout(push_constant) uniform PC {
+  int   width;
+  int   height;
+  float strength_c;
+  int   R;
+  float BW;
+} pc;
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x);
+  const int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  const int cx = y * pc.width + x;
+  const float Y_c = y_guide[cx];
+  const float inv_2sigma_sq = 1.0f / (2.0f * pc.BW * pc.BW);
+
+  float sumW = 0.0f, sumY = 0.0f, sumYY = 0.0f;
+  float sumC1 = 0.0f, sumC2 = 0.0f, sumC3 = 0.0f;
+  float sumYC1 = 0.0f, sumYC2 = 0.0f, sumYC3 = 0.0f;
+
+  for(int dy = -pc.R; dy <= pc.R; dy++)
+  {
+    /* Reflect: matches CPU reflect_idx (= mirror-reflection at boundary). */
+    int yi = y + dy;
+    if(yi < 0)           yi = -yi;
+    if(yi >= pc.height)  yi = 2 * pc.height - yi - 2;
+    if(yi < 0)           yi = 0;
+    if(yi >= pc.height)  yi = pc.height - 1;
+    const uint row_off = uint(yi) * uint(pc.width);
+    for(int dx = -pc.R; dx <= pc.R; dx++)
+    {
+      int xi = x + dx;
+      if(xi < 0)          xi = -xi;
+      if(xi >= pc.width)  xi = 2 * pc.width - xi - 2;
+      if(xi < 0)          xi = 0;
+      if(xi >= pc.width)  xi = pc.width - 1;
+      const uint p = row_off + uint(xi);
+      const float Yi  = y_guide[p];
+      const float C1i = c1_in[p];
+      const float C2i = c2_in[p];
+      const float C3i = c3_in[p];
+      const float dY  = Yi - Y_c;
+      /* Use spec-compliant exp (3-4 ULP) instead of native_exp (= fast
+       * approximation, several percent error).  CPU
+       * galosh_loess_chroma_3ch_r uses libm expf which is IEEE-strict;
+       * native_exp diverges algorithmically across (2R+1)² bilateral
+       * samples (R=7 → 225 samples per output pixel). */
+      const float w   = exp(-dY * dY * inv_2sigma_sq);
+      sumW   += w;
+      sumY   += w * Yi;
+      sumYY  += w * Yi * Yi;
+      sumC1  += w * C1i;
+      sumC2  += w * C2i;
+      sumC3  += w * C3i;
+      sumYC1 += w * Yi * C1i;
+      sumYC2 += w * Yi * C2i;
+      sumYC3 += w * Yi * C3i;
+    }
+  }
+
+  const float invW    = 1.0f / max(sumW, 1e-10f);
+  const float meanY   = sumY  * invW;
+  const float meanYY  = sumYY * invW;
+  const float meanC1  = sumC1 * invW;
+  const float meanC2  = sumC2 * invW;
+  const float meanC3  = sumC3 * invW;
+  const float meanYC1 = sumYC1 * invW;
+  const float meanYC2 = sumYC2 * invW;
+  const float meanYC3 = sumYC3 * invW;
+
+  const float var_Y = max(meanYY - meanY * meanY, 0.0f);
+  const float eps   = pc.strength_c * pc.strength_c;   /* GALOSH_LOESS_TAU_SQ_INV = 1.0 */
+  const float denom = max(var_Y + eps, 1e-6f);
+  const float inv_denom = 1.0f / denom;
+
+  const float a_c1 = (meanYC1 - meanY * meanC1) * inv_denom;
+  const float a_c2 = (meanYC2 - meanY * meanC2) * inv_denom;
+  const float a_c3 = (meanYC3 - meanY * meanC3) * inv_denom;
+  const float b_c1 = meanC1 - a_c1 * meanY;
+  const float b_c2 = meanC2 - a_c2 * meanY;
+  const float b_c3 = meanC3 - a_c3 * meanY;
+
+  c1_out[cx] = a_c1 * Y_c + b_c1;
+  c2_out[cx] = a_c2 * Y_c + b_c2;
+  c3_out[cx] = a_c3 * Y_c + b_c3;
+}

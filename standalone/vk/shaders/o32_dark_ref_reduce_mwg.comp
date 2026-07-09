@@ -1,0 +1,116 @@
+#version 450
+/* Transcribed from galosh.cl §7.8b galosh_o32_dark_ref_reduce_mwg (line 7522).
+ * Multi-WG dark_ref IRLS reduce: each WI scans a slice of 2x2 blocks,
+ * WG tree-reduces sum_w + sum_w·g0..3 in shared memory, writes 5 doubles
+ * per WG to partial_buf.  FP64 accumulation throughout (mirrors CPU double
+ * path) → requires the shaderFloat64 device feature.
+ * Host dispatch: 64 WGs (O32_DR_MWG_NWG) × 256 WIs (O32_DR_MWG_WGSIZE),
+ * called 3× (IRLS iterations).  Literal transcription (V2.0 Phase B2). */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer Buf0 { float in_gat_full[]; };
+layout(std430, binding = 1) readonly  buffer Buf1 { float raw[]; };
+layout(std430, binding = 2) readonly  buffer Buf2 { float params[]; };   /* read params[P_S_SCALE] */
+layout(std430, binding = 3) writeonly buffer Buf3 { double partial_buf[]; };  /* [n_wg * 5] doubles */
+
+layout(push_constant) uniform PC {
+  int width;
+  int height;
+} pc;
+
+/* params[] slot indices (galosh.cl lines 6346-6367 + 7297-7302) */
+const int P_S_SCALE = 10;
+
+const float GALOSH_ACHROMATIC_RANGE_O32 = 4.0;   /* matches CPU galosh_cpu.h:364 */
+const int O32_DR_MWG_WGSIZE = 256;
+
+/* WG-level tree reduction in double LDS.  LDS: 5 doubles × WGSIZE × 8B
+ * = 256 × 5 × 8 = 10 KB at WGSIZE=256, fits 32 KB ISP budget. */
+shared double lds[O32_DR_MWG_WGSIZE * 5];
+
+void main()
+{
+  const int gid = int(gl_GlobalInvocationID.x);
+  const int lid = int(gl_LocalInvocationID.x);
+  const int wgid = int(gl_WorkGroupID.x);
+  const int wgsize = O32_DR_MWG_WGSIZE;   /* get_local_size(0) → constant */
+  const int total_wis = int(gl_NumWorkGroups.x) * O32_DR_MWG_WGSIZE;  /* get_global_size(0) */
+
+  const double s_scale = double(params[P_S_SCALE]);
+  const double inv_s = 1.0lf / max(s_scale, 1e-20lf);
+
+  /* height/2 · width/2 blocks (matches CPU; even-dim off-by-one fixed). */
+  const int n_block_rows = pc.height / 2;
+  const int n_block_cols = pc.width  / 2;
+  const int total_blocks = n_block_rows * n_block_cols;
+
+  /* Per-WI accumulators in double (= matches CPU double sum_w0..3). */
+  double my_sw  = 0.0lf;
+  double my_sw0 = 0.0lf;
+  double my_sw1 = 0.0lf;
+  double my_sw2 = 0.0lf;
+  double my_sw3 = 0.0lf;
+
+  for(int bi = gid; bi < total_blocks; bi += total_wis)
+  {
+    const int br_idx = bi / n_block_cols;
+    const int bc_idx = bi - br_idx * n_block_cols;
+    const int br = 2 * br_idx;
+    const int bc = 2 * bc_idx;
+
+    const float g0 = in_gat_full[br       * pc.width + bc      ];
+    const float g1 = in_gat_full[(br + 1) * pc.width + bc      ];
+    const float g2 = in_gat_full[br       * pc.width + (bc + 1)];
+    const float g3 = in_gat_full[(br + 1) * pc.width + (bc + 1)];
+    const float ch_max = max(max(g0, g1), max(g2, g3));
+    const float ch_min = min(min(g0, g1), min(g2, g3));
+    if(ch_max - ch_min > GALOSH_ACHROMATIC_RANGE_O32) continue;
+
+    const float iv0 = raw[br       * pc.width + bc      ];
+    const float iv1 = raw[(br + 1) * pc.width + bc      ];
+    const float iv2 = raw[br       * pc.width + (bc + 1)];
+    const float iv3 = raw[(br + 1) * pc.width + (bc + 1)];
+    /* L_raw / r / r² / w in DOUBLE to mirror CPU. */
+    const double L_raw = (double(iv0) + double(iv1) + double(iv2) + double(iv3)) * 0.25lf;
+    const double r  = L_raw * inv_s;
+    const double r2 = r * r;
+    const double w  = 1.0lf / (1.0lf + r2 * r2);
+    my_sw  += w;
+    my_sw0 += w * double(g0);
+    my_sw1 += w * double(g1);
+    my_sw2 += w * double(g2);
+    my_sw3 += w * double(g3);
+  }
+
+  lds[lid * 5 + 0] = my_sw;
+  lds[lid * 5 + 1] = my_sw0;
+  lds[lid * 5 + 2] = my_sw1;
+  lds[lid * 5 + 3] = my_sw2;
+  lds[lid * 5 + 4] = my_sw3;
+  memoryBarrierShared(); barrier();
+
+  for(int s = wgsize / 2; s > 0; s >>= 1)
+  {
+    if(lid < s)
+    {
+      lds[lid * 5 + 0] += lds[(lid + s) * 5 + 0];
+      lds[lid * 5 + 1] += lds[(lid + s) * 5 + 1];
+      lds[lid * 5 + 2] += lds[(lid + s) * 5 + 2];
+      lds[lid * 5 + 3] += lds[(lid + s) * 5 + 3];
+      lds[lid * 5 + 4] += lds[(lid + s) * 5 + 4];
+    }
+    memoryBarrierShared(); barrier();
+  }
+
+  if(lid == 0)
+  {
+    /* Write final partials as double (= consumer §7.8c reads as double).
+     * Casting to float here would destroy the FP64 accumulation precision. */
+    partial_buf[wgid * 5 + 0] = lds[0];
+    partial_buf[wgid * 5 + 1] = lds[1];
+    partial_buf[wgid * 5 + 2] = lds[2];
+    partial_buf[wgid * 5 + 3] = lds[3];
+    partial_buf[wgid * 5 + 4] = lds[4];
+  }
+}

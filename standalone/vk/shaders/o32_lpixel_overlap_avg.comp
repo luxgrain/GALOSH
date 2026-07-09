@@ -1,0 +1,43 @@
+#version 450
+/* Transcribed from galosh.cl kernel galosh_o32_lpixel_overlap_avg (§6.6,
+ * line 5493).  Literal port per PORT_CONVENTIONS.md.
+ * NOTE: no active host dispatch — legacy path, superseded by the fused
+ * kernel galosh_o32_lpixel_lh_den_fused (§6.6+7); kernel is created but
+ * never enqueued in galosh_raw_gpu.c.  Local size 16x16 chosen to match
+ * sibling o32 2D dispatches. */
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly  buffer Buf0 { float L_cs_den[]; };
+layout(std430, binding = 1) restrict writeonly buffer Buf1 { float L_pixel[]; };
+
+layout(push_constant) uniform PC {
+  int width;
+  int height;
+} pc;
+
+void main()
+{
+  const int fx = int(gl_GlobalInvocationID.x);
+  const int fy = int(gl_GlobalInvocationID.y);
+  if(fx >= pc.width || fy >= pc.height) return;
+
+  /* OpenCL used (size_t) 64-bit index; GLSL uses 32-bit int (no INT64). */
+  float sum = L_cs_den[fy * pc.width + fx];
+  int count = 1;
+  if(fy > 0)
+  {
+    sum += L_cs_den[(fy - 1) * pc.width + fx];
+    count++;
+  }
+  if(fx > 0)
+  {
+    sum += L_cs_den[fy * pc.width + (fx - 1)];
+    count++;
+  }
+  if(fy > 0 && fx > 0)
+  {
+    sum += L_cs_den[(fy - 1) * pc.width + (fx - 1)];
+    count++;
+  }
+  L_pixel[fy * pc.width + fx] = sum / float(count);
+}

@@ -1,0 +1,60 @@
+[
+  { "kernel": "galosh_o32_loess_chroma_3p", "comp": "o32_loess_chroma_3p.comp",
+    "bindings": [
+      {"b":0,"arg":"y_guide","dir":"r"},
+      {"b":1,"arg":"c1_in","dir":"r"},
+      {"b":2,"arg":"c2_in","dir":"r"},
+      {"b":3,"arg":"c3_in","dir":"r"},
+      {"b":4,"arg":"c1_out","dir":"w"},
+      {"b":5,"arg":"c2_out","dir":"w"},
+      {"b":6,"arg":"c3_out","dir":"w"}
+    ],
+    "push": [
+      {"n":"width","t":"int"},
+      {"n":"height","t":"int"},
+      {"n":"strength_c","t":"float"},
+      {"n":"R","t":"int"},
+      {"n":"BW","t":"float"}
+    ],
+    "local": [16,16],
+    "dispatch": "NO HOST DISPATCH: k_o32_loess_3p is created (galosh_raw_gpu.c:482) but never enqueued — the tiled variant is used at all 3 scales. If revived: 2D over (width, height), i.e. align_up(w,16) x align_up(h,16).",
+    "notes": "Naive fallback kept per keep-deprecated-variants policy. local 16x16 CHOSEN (not copied from a host dispatch — none exists); PORT_CONVENTIONS' NULL-local default of 256x1 was not used because the kernel is 2D like its siblings. Reflect boundary in-kernel; spec-compliant exp (not native_exp) is load-bearing vs CPU expf." },
+
+  { "kernel": "galosh_o32_loess_chroma_3p_tiled", "comp": "o32_loess_chroma_3p_tiled.comp",
+    "bindings": [
+      {"b":0,"arg":"y_guide","dir":"r"},
+      {"b":1,"arg":"c1_in","dir":"r"},
+      {"b":2,"arg":"c2_in","dir":"r"},
+      {"b":3,"arg":"c3_in","dir":"r"},
+      {"b":4,"arg":"c1_out","dir":"w"},
+      {"b":5,"arg":"c2_out","dir":"w"},
+      {"b":6,"arg":"c3_out","dir":"w"}
+    ],
+    "push": [
+      {"n":"width","t":"int"},
+      {"n":"height","t":"int"},
+      {"n":"strength_c","t":"float"}
+    ],
+    "local": [24,24],
+    "dispatch": "3 sites, all local (24,24) [galosh_raw_gpu.c]: (1) half K_O32_7e line 1490: global align_up(hw,24) x align_up(hh,24), args (L_h_den,C*_h)->C*_loess_h, w/h=hw/hh; (2) quarter K_O32_7f line 1503: align_up(cq_w,24) x align_up(cq_h,24), (L_q,C*_q)->C*_loess_q, w/h=cq_w/cq_h where cq_w=hw/2, cq_h=hh/2; (3) eighth K_O32_7g line 1516: align_up(ce_w,24) x align_up(ce_h,24), (L_e,C*_e)->C*_loess_e, w/h=ce_w/ce_h where ce_w=cq_w/2, ce_h=cq_h/2.",
+    "notes": "Shared memory: 4 x GALOSH_O_LOESS_TILE_PIX(=38^2=1444) floats = 23104 bytes (22.6 KB, fits 32KB). TILE_DIM=24/R=7/BW=3.0 fixed via macros (galosh.cl:4089-4094,4205-4212); the OpenCL sec-6.10b header comment '16x16 WG / 30^2 / 14.4KB' is STALE — host local size 24x24 confirms TILE_DIM=24. HOST STATE-CARRY QUIRK: strength_c (arg 9) is set ONLY at the half-res dispatch (=1.0f, line 1489) and NOT re-set for quarter/eighth — OpenCL retains kernel-arg state, so all 3 scales run with strength_c=1.0; the Vulkan port must push strength_c=1.0 at ALL 3 dispatches. Full-window chroma hull clamp (GALOSH_CHROMA_CLAMP mirror) transcribed verbatim. barrier: memoryBarrierShared()+barrier(). Threads may exit after the barrier (guard is post-load, as in source)." },
+
+  { "kernel": "galosh_o32_k16_joint_bilateral_upsample_3p", "comp": "o32_k16_jbu_3p.comp",
+    "bindings": [
+      {"b":0,"arg":"c1_in","dir":"r"},
+      {"b":1,"arg":"c2_in","dir":"r"},
+      {"b":2,"arg":"c3_in","dir":"r"},
+      {"b":3,"arg":"L_pixel","dir":"r"},
+      {"b":4,"arg":"c1_out","dir":"w"},
+      {"b":5,"arg":"c2_out","dir":"w"},
+      {"b":6,"arg":"c3_out","dir":"w"}
+    ],
+    "push": [
+      {"n":"in_w","t":"int"},
+      {"n":"in_h","t":"int"},
+      {"n":"bw","t":"float"}
+    ],
+    "local": [16,16],
+    "dispatch": "4 sites, all local (16,16), global = 2D over K16 output (2*in_w, 2*in_h) [galosh_raw_gpu.c]: (1) q->h K_O32_7i line 1543: align_up(kq_w,16) x align_up(kq_h,16) where kq_w=2*cq_w, kq_h=2*cq_h; in=(C*_loess_q, L_for_q), in_w/in_h=cq_w/cq_h, out=C*_q_up_raw; (2) e->q K_O32_7l line 1585: align_up(ke_w,16) x align_up(ke_h,16) where ke_w=2*ce_w, ke_h=2*ce_h; in=(C*_loess_e, L_for_e), in_w/in_h=ce_w/ce_h, out=C*_e_to_q_raw; (3) q->h again K_O32_7n line 1616: align_up(kq_w,16) x align_up(kq_h,16); in=(C*_e_to_q, L_for_q), in_w/in_h=cq_w/cq_h, out=C*_e_up_raw; (4) final half->full K_O32_9 line 1673: align_up(width,16) x align_up(height,16); in=(C*_h_den, L_pixel), in_w/in_h=hw/hh, out=C*_aligned (width=2*hw exactly). bw=k16_BW=1.5f at all 4 sites.",
+    "notes": "Jinc weights = compile-time const table galosh_o32_k16_jbu_w[100] (galosh.cl:2483, offline-computed jinc(r)*jinc(r/3); includes NEGATIVE side-lobes) transcribed verbatim into the .comp — no runtime jinc() helper exists for this kernel. CRITICAL semantics preserved verbatim: (a) nearest-2x2 source-sample hull collected BEFORE the w_jinc==0 skip; (b) anti-ringing clamp of output to that hull; (c) SIGN-PRESERVING |sum_w| floor (+/-1e-6, NOT fmax) — both fixed real magenta artifacts. OpenCL int-as-bool '(sub_y&&dy==1)' rendered as '(sub_y != 0 && dy == 1)' (GLSL requires bool operands). L guide MUST be allocated at exactly (2*in_w x 2*in_h) — host uses crop_2d_topleft to make L_for_q/L_for_e strides exact." }
+]

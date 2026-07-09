@@ -1,0 +1,40 @@
+#version 450
+/* Transcribed from galosh.cl §7.8e galosh_o32_dark_resid_finalize_mwg (line 7740).
+ * Aggregates §7.8d double residual partials, updates params[P_S_SCALE]
+ * (clamped to [s_min, s_max]).  Single WI, FP64 throughout (requires
+ * shaderFloat64).  Host dispatches global=1 with NULL local size; per
+ * conventions local_size_x = 256 — the get_global_id(0)!=0 guard makes the
+ * extra invocations no-ops (vkCmdDispatch(1,1,1)).
+ * Literal transcription (V2.0 Phase B2). */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Buf0 { double partial_resid_buf[]; };
+layout(std430, binding = 1) buffer Buf1 { float params[]; };
+
+layout(push_constant) uniform PC {
+  int n_wg;
+  float s_min;
+  float s_max;
+} pc;
+
+/* params[] slot indices (galosh.cl lines 7297-7302) */
+const int P_S_SCALE = 10;
+
+void main()
+{
+  if(gl_GlobalInvocationID.x != 0u) return;
+  double swr = 0.0lf, sww = 0.0lf;
+  for(int i = 0; i < pc.n_wg; i++)
+  {
+    swr += partial_resid_buf[i * 2 + 0];
+    sww += partial_resid_buf[i * 2 + 1];
+  }
+  const double inv_sw2 = 1.0lf / max(sww, 1e-20lf);
+  const double measured_std = sqrt(max(swr * inv_sw2, 1e-20lf));
+  const double ratio = 1.0lf / measured_std;
+  double new_s = double(params[P_S_SCALE]) * sqrt(ratio);
+  if(new_s < double(pc.s_min)) new_s = double(pc.s_min);
+  if(new_s > double(pc.s_max)) new_s = double(pc.s_max);
+  params[P_S_SCALE] = float(new_s);
+}

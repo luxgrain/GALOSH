@@ -1,0 +1,132 @@
+[
+  { "kernel": "galosh_o32_assemble_fullres_gat", "comp": "o32_assemble_fullres_gat.comp",
+    "bindings": [
+      {"b":0,"arg":"ch0","dir":"r"},
+      {"b":1,"arg":"ch1","dir":"r"},
+      {"b":2,"arg":"ch2","dir":"r"},
+      {"b":3,"arg":"ch3","dir":"r"},
+      {"b":4,"arg":"params","dir":"r"},
+      {"b":5,"arg":"in_gat_full","dir":"w"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}],
+    "local": [16,16],
+    "dispatch": "NO ACTIVE DISPATCH: '§6.1 assemble_fullres SKIPPED for o32: in_gat_full is now produced directly by §7.4 (gat_forward) + §7.7 (normalize) + §7.9 (dark_sub). Kept in galosh.cl as a dead path' (galosh_raw_gpu.c:1339-1342). Would be 2D over (width, height).",
+    "notes": "Legacy/dead path (created+released only, never enqueued). Local 16x16 chosen to match sibling o32 2D dispatches. (size_t) 64-bit index -> 32-bit int." },
+
+  { "kernel": "galosh_o32_forward_l_stride1", "comp": "o32_forward_l_stride1.comp",
+    "bindings": [
+      {"b":0,"arg":"in_gat_full","dir":"r"},
+      {"b":1,"arg":"L_cs","dir":"w"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}],
+    "local": [16,16],
+    "dispatch": "dispatch_2d_named(queue, k_o32_forward_l_stride1, align_up(width, 16), align_up(height, 16), 16, 16, \"K_O32_2 fwd_L_cs\") (galosh_raw_gpu.c:1349-1351)",
+    "notes": "(size_t) 64-bit index -> 32-bit int." },
+
+  { "kernel": "galosh_o32_chroma_extract_halfres", "comp": "o32_chroma_extract_halfres.comp",
+    "bindings": [
+      {"b":0,"arg":"in_gat_full","dir":"r"},
+      {"b":1,"arg":"C1_h","dir":"w"},
+      {"b":2,"arg":"C2_h","dir":"w"},
+      {"b":3,"arg":"C3_h","dir":"w"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}, {"n":"halfwidth","t":"int"}, {"n":"halfheight","t":"int"}],
+    "local": [16,16],
+    "dispatch": "dispatch_2d_named(queue, k_o32_chroma_extract, align_up(hw, 16), align_up(hh, 16), 16, 16, \"K_O32_3 chroma_extract\") (galosh_raw_gpu.c:1362-1364)",
+    "notes": "(size_t) 64-bit index -> 32-bit int." },
+
+  { "kernel": "galosh_o32_lpixel_overlap_avg", "comp": "o32_lpixel_overlap_avg.comp",
+    "bindings": [
+      {"b":0,"arg":"L_cs_den","dir":"r"},
+      {"b":1,"arg":"L_pixel","dir":"w"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}],
+    "local": [16,16],
+    "dispatch": "NO ACTIVE DISPATCH: legacy §6.6, superseded by fused galosh_o32_lpixel_lh_den_fused (created+released only in galosh_raw_gpu.c). Would be 2D over (width, height).",
+    "notes": "Legacy path. Local 16x16 chosen to match sibling o32 2D dispatches. (size_t) 64-bit index -> 32-bit int." },
+
+  { "kernel": "galosh_o32_l_h_den_subsample", "comp": "o32_l_h_den_subsample.comp",
+    "bindings": [
+      {"b":0,"arg":"L_cs_den","dir":"r"},
+      {"b":1,"arg":"L_h_den","dir":"w"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}, {"n":"halfwidth","t":"int"}, {"n":"halfheight","t":"int"}],
+    "local": [16,16],
+    "dispatch": "NO ACTIVE DISPATCH: legacy §6.7, superseded by fused galosh_o32_lpixel_lh_den_fused (created+released only in galosh_raw_gpu.c). Would be 2D over (halfwidth, halfheight).",
+    "notes": "Legacy path. Local 16x16 chosen to match sibling o32 2D dispatches. (size_t) 64-bit index -> 32-bit int." },
+
+  { "kernel": "galosh_o32_lpixel_lh_den_fused", "comp": "o32_lpixel_lh_den_fused.comp",
+    "bindings": [
+      {"b":0,"arg":"L_cs_den","dir":"r"},
+      {"b":1,"arg":"L_pixel","dir":"w"},
+      {"b":2,"arg":"L_h_den","dir":"w"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}, {"n":"halfwidth","t":"int"}],
+    "local": [16,16],
+    "dispatch": "dispatch_2d_named(queue, k_o32_lpixel_lh_den_fused, align_up(width, 16), align_up(height, 16), 16, 16, \"K_O32_6 L_pixel+L_h_den_fused\") (galosh_raw_gpu.c:1406-1408)",
+    "notes": "Conditional L_h_den write only when (fy&1)==0 && (fx&1)==0. (size_t) 64-bit index -> 32-bit int." },
+
+  { "kernel": "galosh_o32_box_downsample_2x", "comp": "o32_box_downsample_2x.comp",
+    "bindings": [
+      {"b":0,"arg":"src","dir":"r"},
+      {"b":1,"arg":"dst","dir":"w"}
+    ],
+    "push": [{"n":"sw","t":"int"}, {"n":"sh","t":"int"}],
+    "local": [16,16],
+    "dispatch": "2 call sites: dispatch_2d_named(..., align_up(cq_w, 16), align_up(cq_h, 16), 16, 16, \"K_O32_7a L_q\") (galosh_raw_gpu.c:1440-1442) and dispatch_2d_named(..., align_up(ce_w, 16), align_up(ce_h, 16), 16, 16, \"K_O32_7b L_e\") (1447-1449); i.e. global = align_up(sw>>1,16) x align_up(sh>>1,16)",
+    "notes": "(size_t) 64-bit index -> 32-bit int." },
+
+  { "kernel": "galosh_o32_box_downsample_2x_3p", "comp": "o32_box_downsample_2x_3p.comp",
+    "bindings": [
+      {"b":0,"arg":"src1","dir":"r"},
+      {"b":1,"arg":"src2","dir":"r"},
+      {"b":2,"arg":"src3","dir":"r"},
+      {"b":3,"arg":"dst1","dir":"w"},
+      {"b":4,"arg":"dst2","dir":"w"},
+      {"b":5,"arg":"dst3","dir":"w"}
+    ],
+    "push": [{"n":"sw","t":"int"}, {"n":"sh","t":"int"}],
+    "local": [16,16],
+    "dispatch": "2 call sites: dispatch_2d_named(..., align_up(cq_w, 16), align_up(cq_h, 16), 16, 16, \"K_O32_7c C_q\") (galosh_raw_gpu.c:1460-1462) and dispatch_2d_named(..., align_up(ce_w, 16), align_up(ce_h, 16), 16, 16, \"K_O32_7d C_e\") (1471-1473); i.e. global = align_up(sw>>1,16) x align_up(sh>>1,16)",
+    "notes": "(size_t) 64-bit indices -> 32-bit int." },
+
+  { "kernel": "galosh_o32_smoothstep_blend_3p", "comp": "o32_smoothstep_blend_3p.comp",
+    "bindings": [
+      {"b":0,"arg":"c1_h","dir":"r"},
+      {"b":1,"arg":"c2_h","dir":"r"},
+      {"b":2,"arg":"c3_h","dir":"r"},
+      {"b":3,"arg":"c1_loess_h","dir":"r"},
+      {"b":4,"arg":"c2_loess_h","dir":"r"},
+      {"b":5,"arg":"c3_loess_h","dir":"r"},
+      {"b":6,"arg":"c1_q_up","dir":"r"},
+      {"b":7,"arg":"c2_q_up","dir":"r"},
+      {"b":8,"arg":"c3_q_up","dir":"r"},
+      {"b":9,"arg":"c1_e_up","dir":"r"},
+      {"b":10,"arg":"c2_e_up","dir":"r"},
+      {"b":11,"arg":"c3_e_up","dir":"r"},
+      {"b":12,"arg":"c1_out","dir":"w"},
+      {"b":13,"arg":"c2_out","dir":"w"},
+      {"b":14,"arg":"c3_out","dir":"w"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}, {"n":"slider","t":"float"}],
+    "local": [16,16],
+    "dispatch": "dispatch_2d_named(queue, k_o32_smoothstep_3p, align_up(hw, 16), align_up(hh, 16), 16, 16, \"K_O32_8 smoothstep\") (galosh_raw_gpu.c:1657-1659); host binds width=hw, height=hh (half-res)",
+    "notes": "15 storage buffers — check maxPerStageDescriptorStorageBuffers >= 15 on target device (desktop GPUs OK)." },
+
+  { "kernel": "galosh_o32_inverse_wht_dark_gat", "comp": "o32_inverse_wht_dark_gat.comp",
+    "bindings": [
+      {"b":0,"arg":"L_pixel","dir":"r"},
+      {"b":1,"arg":"C1_aligned","dir":"r"},
+      {"b":2,"arg":"C2_aligned","dir":"r"},
+      {"b":3,"arg":"C3_aligned","dir":"r"},
+      {"b":4,"arg":"output","dir":"w"},
+      {"b":5,"arg":"lut_d","dir":"r"},
+      {"b":6,"arg":"lut_x","dir":"r"},
+      {"b":7,"arg":"lut_params","dir":"r"},
+      {"b":8,"arg":"params","dir":"r"}
+    ],
+    "push": [{"n":"width","t":"int"}, {"n":"height","t":"int"}],
+    "local": [16,16],
+    "dispatch": "dispatch_2d_named(queue, k_o32_inverse_wht_dark, align_up(width, 16), align_up(height, 16), 16, 16, \"K_O32_10 inverse_final\") (galosh_raw_gpu.c:1690-1692); host binds output=raw_buf",
+    "notes": "Helpers transcribed: gat_inv_lut (galosh.cl:2300, LUT bisection with GAT_LUT_SIZE=4096) + __constant galosh_chromaup_signs[12] (galosh.cl:2466) -> const array. GLSL fns cannot take SSBO pointers: gat_inv_lut's lut_d/lut_x pointer params dropped, accessed as globals (bindings 5/6); other params kept in order (alpha/sigma_sq unused in OpenCL body too). RENAME: arg 'output' -> SSBO member 'output_' ('output' is a GLSL reserved word). (size_t) 64-bit index -> 32-bit int." }
+]

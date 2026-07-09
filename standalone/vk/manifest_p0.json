@@ -1,0 +1,282 @@
+[
+  {
+    "kernel": "galosh_o32_ne_block_stats",
+    "comp": "o32_ne_block_stats.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "raw",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "blk_mean",
+        "dir": "w"
+      },
+      {
+        "b": 2,
+        "arg": "blk_var",
+        "dir": "w"
+      }
+    ],
+    "push": [
+      {
+        "n": "width",
+        "t": "int"
+      },
+      {
+        "n": "height",
+        "t": "int"
+      },
+      {
+        "n": "n_bx",
+        "t": "int"
+      },
+      {
+        "n": "n_by",
+        "t": "int"
+      },
+      {
+        "n": "n_blocks_per_ch",
+        "t": "int"
+      }
+    ],
+    "local": [
+      64,
+      1
+    ],
+    "dispatch": "dispatch_1d_named(queue, k_o32_ne_block_stats, align_up(o32_ne_total, 64), 64, ...) with o32_ne_total = 4 * o32_ne_per_ch = 4 * (hw/8) * (hh/8), hw = width/2, hh = height/2 (galosh_raw_gpu.c:795-809)",
+    "notes": "1 WI = 1 block. Private float laps[96] + partial-selection median (helper transcribed as fixed-size inout float[96] -- GLSL has no pointers; nl is always 96). push fields height/n_by unused in kernel body (kept for OpenCL arg-order parity). No atomics, no shared mem."
+  },
+  {
+    "kernel": "galosh_o32_ne_finalize",
+    "comp": "o32_ne_finalize.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "blk_mean",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "blk_var",
+        "dir": "r"
+      },
+      {
+        "b": 2,
+        "arg": "raw",
+        "dir": "r"
+      },
+      {
+        "b": 3,
+        "arg": "params",
+        "dir": "w"
+      }
+    ],
+    "push": [
+      {
+        "n": "width",
+        "t": "int"
+      },
+      {
+        "n": "height",
+        "t": "int"
+      },
+      {
+        "n": "total_blocks",
+        "t": "int"
+      }
+    ],
+    "local": [
+      256,
+      1
+    ],
+    "dispatch": "dispatch_1d_named(queue, k_o32_ne_finalize, 256, 256, ...) -- SINGLE workgroup, 8 threads/bin x 32 bins (galosh_raw_gpu.c:820); Vulkan: vkCmdDispatch(1,1,1)",
+    "notes": "Shared mem ~21516 bytes total (16 KB lds_var_hist[32*128] int + 4 KB r_cnt/r_a/r_b/r_c[256] + per-bin arrays) -- requires maxComputeSharedMemorySize >= 22 KB (exceeds Vulkan 16 KB minimum; fine on desktop). SHARED-int atomics: OpenCL atomic_inc(volatile local int*) -> atomicAdd(lds_var_hist[...], 1) with the pointer base folded into the index. NO float atomics. binding 2 'raw' and push width/height are declared but unused (dark refine moved to 7.2c-f); kept for arg parity. Early-return branches before later barriers are workgroup-uniform (driven by shared global_min/global_max), so barrier uniformity holds. WLS Huber runs sequentially on lid==0."
+  },
+  {
+    "kernel": "galosh_o32_ne_dark_thresh_hist",
+    "comp": "o32_ne_dark_thresh_hist.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "raw",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "dark_thresh_hist",
+        "dir": "rw"
+      }
+    ],
+    "push": [
+      {
+        "n": "width",
+        "t": "int"
+      },
+      {
+        "n": "height",
+        "t": "int"
+      }
+    ],
+    "local": [
+      16,
+      16
+    ],
+    "dispatch": "dispatch_2d_named(queue, k_o32_ne_dark_thresh_hist, align_up(hw_3, 16), align_up(hh_3, 16), 16, 16, ...) with hw_3 = (((width+1)/2)+2)/3, hh_3 = (((height+1)/2)+2)/3 (galosh_raw_gpu.c:830-841)",
+    "notes": "GLOBAL-int atomics: atomic_inc -> atomicAdd(dark_thresh_hist[bin], 1); buffer must NOT be readonly. NO float atomics. Host zero-fills the 4096-int histogram (clEnqueueFillBuffer, galosh_raw_gpu.c:827) before dispatch -- Vulkan host must vkCmdFillBuffer equivalently. 4096 bins, range [0,1)."
+  },
+  {
+    "kernel": "galosh_o32_ne_dark_thresh_finalize",
+    "comp": "o32_ne_dark_thresh_finalize.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "dark_thresh_hist",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "params",
+        "dir": "w"
+      }
+    ],
+    "push": [
+      {
+        "n": "dark_thresh_slot",
+        "t": "int"
+      }
+    ],
+    "local": [
+      256,
+      1
+    ],
+    "dispatch": "dispatch_1d_named(queue, k_o32_ne_dark_thresh_finalize, 1, 0 /* NULL local */, ...) (galosh_raw_gpu.c:847); Vulkan: vkCmdDispatch(1,1,1) -- host passed NULL local size, so 256x1 chosen per PORT_CONVENTIONS; gid!=0 guard idles the 255 extra invocations",
+    "notes": "Single-WI cumsum scan. Host passes dark_thresh_slot = 15 (P_O32_DARK_THRESH temp slot, galosh_raw_gpu.c:825). No atomics, no shared mem."
+  },
+  {
+    "kernel": "galosh_o32_ne_dark_lap_hist",
+    "comp": "o32_ne_dark_lap_hist.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "raw",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "params",
+        "dir": "r"
+      },
+      {
+        "b": 2,
+        "arg": "dark_lap_hist",
+        "dir": "rw"
+      }
+    ],
+    "push": [
+      {
+        "n": "width",
+        "t": "int"
+      },
+      {
+        "n": "height",
+        "t": "int"
+      },
+      {
+        "n": "dark_thresh_slot",
+        "t": "int"
+      }
+    ],
+    "local": [
+      16,
+      16
+    ],
+    "dispatch": "dispatch_2d_named(queue, k_o32_ne_dark_lap_hist, align_up(hw_a, 16), align_up(hh_a, 16), 16, 16, ...) with hw_a = (width+1)/2, hh_a = (height+1)/2 (galosh_raw_gpu.c:849-860)",
+    "notes": "GLOBAL-int atomics: atomic_inc -> atomicAdd(dark_lap_hist[bin], 1). NO float atomics. Host zero-fills the 4096-int histogram (galosh_raw_gpu.c:850) before dispatch. Reads dark_thresh from params[dark_thresh_slot] written by dark_thresh_finalize -- needs a buffer barrier between the two dispatches. 4096 bins, range [0, O32_DARK_LAP_MAX=0.1]."
+  },
+  {
+    "kernel": "galosh_o32_ne_dark_finalize",
+    "comp": "o32_ne_dark_finalize.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "dark_lap_hist",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "params",
+        "dir": "rw"
+      }
+    ],
+    "push": [
+      {
+        "n": "dark_thresh_slot",
+        "t": "int"
+      }
+    ],
+    "local": [
+      256,
+      1
+    ],
+    "dispatch": "dispatch_1d_named(queue, k_o32_ne_dark_finalize, 1, 0 /* NULL local */, ...) (galosh_raw_gpu.c:866); Vulkan: vkCmdDispatch(1,1,1) -- 256x1 chosen per PORT_CONVENTIONS (NULL local), gid!=0 guard",
+    "notes": "Single-WI. params is read (P_ALPHA=13, params[dark_thresh_slot]) AND written (P_SIGMA_SQ=14) -- binding must be read-write. Early 'return' when total < 100 keeps sigma_sq_est = 0 placeholder written by ne_finalize."
+  },
+  {
+    "kernel": "galosh_o32_build_inv_lut",
+    "comp": "o32_build_inv_lut.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "params",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "lut_d",
+        "dir": "w"
+      },
+      {
+        "b": 2,
+        "arg": "lut_x",
+        "dir": "w"
+      },
+      {
+        "b": 3,
+        "arg": "lut_params",
+        "dir": "w"
+      }
+    ],
+    "push": [],
+    "local": [
+      256,
+      1
+    ],
+    "dispatch": "dispatch_1d_named(queue, k_o32_build_inv_lut, 4096, 256, ...) -- GAT_LUT_SIZE = 4096 WIs, one per LUT entry (galosh_raw_gpu.c:1047); Vulkan: vkCmdDispatch(16,1,1)",
+    "notes": "FP64 KERNEL: OpenCL computed in cl_khr_fp64 double throughout (required for CPU bit-near parity, galosh.cl:6934-6938) -> shader uses GLSL double, device must expose shaderFloat64 (SPIR-V OpCapability Float64 verified in output). GLSL has NO double-precision exp()/log() builtins, so exp_d()/log_d() are hand-rolled (frexp/atanh-series for log, ldexp/Taylor for exp); validated vs libm: log_d <= 2 ulp, exp_d <= 1 ulp over the kernel's domains, and log(0) = -inf -> exp(-inf) = 0 (LUT entry i=0, lambda=0) reproduced exactly. OpenCL guarantees only <= 3 ulp for double exp/log, so this is within-family but NOT guaranteed bit-identical to the OpenCL driver or CPU libm -- confirm at P0 parity readback. exp_d returns exact 0 for args < -690 (e^-690 ~ 1e-300, far below the kernel's 1e-15 prob cutoff -- unobservable). double->float stores (lut_d[i], lut_params[2..6]) use explicit float() casts (OpenCL narrowed implicitly, same round-to-nearest). No scalar args -> no push constants. No atomics, no shared mem."
+  },
+  {
+    "kernel": "galosh_o32_lut_finalize",
+    "comp": "o32_lut_finalize.comp",
+    "bindings": [
+      {
+        "b": 0,
+        "arg": "lut_d",
+        "dir": "r"
+      },
+      {
+        "b": 1,
+        "arg": "lut_params",
+        "dir": "w"
+      }
+    ],
+    "push": [],
+    "local": [
+      256,
+      1
+    ],
+    "dispatch": "dispatch_1d_named(queue, k_o32_lut_finalize, 1, 0 /* NULL local */, ...) (galosh_raw_gpu.c:1063); Vulkan: vkCmdDispatch(1,1,1) -- 256x1 chosen per PORT_CONVENTIONS (NULL local), gid!=0 guard",
+    "notes": "Trivial 1-WI: lut_params[0] = lut_d[0] (d_min), lut_params[1] = lut_d[4095] (d_max) -- carries the 2026-05-09 d_max bugfix. Must run after build_inv_lut fills lut_d (buffer barrier)."
+  }
+]

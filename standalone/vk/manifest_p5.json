@@ -1,0 +1,54 @@
+{
+  "group": "P5",
+  "description": "Phase 5 tiled two-pass WHT luma shrinkage (fused pass1 BayesShrink + pass2 Wiener, shared-memory overlap-add) + debug pass1 pilot dump",
+  "kernels": [
+    {
+      "kernel": "galosh_pass12_o32",
+      "comp": "o32_pass12.comp",
+      "bindings": [
+        { "b": 0, "arg": "input", "dir": "r", "host_buffer": "o32_L_cs" },
+        { "b": 1, "arg": "output", "dir": "w", "host_buffer": "o32_L_cs_den" }
+      ],
+      "push": [
+        { "n": "width", "t": "int" },
+        { "n": "height", "t": "int" },
+        { "n": "sigma_strength", "t": "float", "host_value": "luma_strength_o32 = strength * luma_str" },
+        { "n": "phase_stride", "t": "int", "host_value": "env GALOSH_O32_PHASE_STRIDE, default 1, clamped >= 1" }
+      ],
+      "local": [8, 8],
+      "dispatch": "galosh_raw_gpu.c:1386-1394 — const int o32_tile_size = 28; const int wgd = g_tile_wg_dim; /* 8 */ const size_t tiles_x = (width + o32_tile_size - 1) / o32_tile_size; const size_t tiles_y = (height + o32_tile_size - 1) / o32_tile_size; const size_t global2[2] = { tiles_x * wgd, tiles_y * wgd }; const size_t local2[2] = { wgd, wgd }; clEnqueueNDRangeKernel(queue, k_o32_pass12, 2, NULL, global2, local2, ...)",
+      "clSetKernelArg_order": [
+        "0: cl_mem o32_L_cs (input)",
+        "1: cl_mem o32_L_cs_den (output)",
+        "2: int width",
+        "3: int height",
+        "4: float luma_strength_o32",
+        "5: int o32_phase_stride"
+      ],
+      "notes": "Shared mem = tile_in+numer+denom+pilot = 4 x 1600 floats x 4 B = 25600 B (25.0 KiB, <= 48 KB). No float atomics (phase-disjoint block tiling + per-phase barrier makes numer/denom accumulation race-free). Workgroup dim 8x8 = TILE_WG_DIM default in galosh_gpu.h:336 (host uses g_tile_wg_dim; if TILE_WG_DIM is overridden at build the shader local_size and the two hardcoded 8s in lid/wg_size must follow). Mechanical transcription deltas (bit-identical values): (a) wht8_f(block + r*8) pointer-offset row transform -> row copy-in/copy-out (GLSL has no pointer arithmetic; column path was already copy-based in OpenCL); (b) (size_t) global-index casts dropped -> int indexing (npix < 2^31); (c) OpenCL int-as-bool `(px % phase_stride) || (py % phase_stride)` -> explicit `!= 0` comparisons; (d) barrier(CLK_LOCAL_MEM_FENCE) -> memoryBarrierShared(); barrier(). No mad/fma in source; none introduced."
+    },
+    {
+      "kernel": "galosh_pass1_o32_dump",
+      "comp": "o32_pass1_dump.comp",
+      "bindings": [
+        { "b": 0, "arg": "input", "dir": "r", "host_buffer": "o32_L_cs" },
+        { "b": 1, "arg": "pilot_global", "dir": "w", "host_buffer": "o32_pilot_debug (temp, npix floats)" }
+      ],
+      "push": [
+        { "n": "width", "t": "int" },
+        { "n": "height", "t": "int" },
+        { "n": "sigma_strength", "t": "float", "host_value": "luma_strength_o32 = strength * luma_str" }
+      ],
+      "local": [8, 8],
+      "dispatch": "galosh_raw_gpu.c:1732-1738 — const int o32_tile_size_dbg = 28; const int wgd_dbg = g_tile_wg_dim; const size_t tx_dbg = (width + o32_tile_size_dbg - 1) / o32_tile_size_dbg; const size_t ty_dbg = (height + o32_tile_size_dbg - 1) / o32_tile_size_dbg; const size_t g2[2] = { tx_dbg * wgd_dbg, ty_dbg * wgd_dbg }; const size_t l2[2] = { wgd_dbg, wgd_dbg }; clEnqueueNDRangeKernel(queue, k_o32_pass1_dump, 2, NULL, g2, l2, ...)",
+      "clSetKernelArg_order": [
+        "0: cl_mem o32_L_cs (input)",
+        "1: cl_mem o32_pilot_debug (pilot_global)",
+        "2: int width",
+        "3: int height",
+        "4: float luma_strength_o32"
+      ],
+      "notes": "DEBUG-ONLY: host dispatches only when GALOSH_DUMP_DIR is set (verify_o32_phases.py harness); zero production cost. Shared mem = tile_in+numer+denom = 3 x 1600 floats x 4 B = 19200 B (18.75 KiB, <= 48 KB). No phase_stride arg (always full 16 phases). Source has NO barrier between the tile-load loop and the accumulator-zero loop (disjoint arrays, single barrier after both) — preserved as-is. Same mechanical transcription deltas as galosh_pass12_o32. No float atomics."
+    }
+  ]
+}
