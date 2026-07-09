@@ -304,10 +304,22 @@ int main(int argc, char **argv)
   g_verbose = getenv("GALOSH_VERBOSE") != NULL;
   const char *dump_dir = getenv("GALOSH_DUMP_DIR");
 
-  /* --- CLI (ignore unknown --flags for harness compat) --- */
+  /* --- CLI (unknown --flags ignored for harness compat) --- */
+  /* [B5] --noise=fit|hold|every:N|ema:B + --noise-state=FILE — same
+   * semantics as the CPU exe (A1 reference).  The state file carries
+   * "alpha sigma_sq frames_since_fit"; a sidecar "<state>.lut" caches the
+   * GAT inverse LUT (lut_d 4096f + lut_x 4096f + lut_params 8f = 32 KB)
+   * so held frames skip BOTH Phase 0 and the 11 ms LUT rebuild.
+   * JP: 動画償却。保持フレームは P0 と LUT 構築を丸ごとスキップ。 */
+  const char *noise_mode = "fit";
+  const char *noise_state_path = NULL;
   char *pos[16]; int np = 0;
   for(int i = 1; i < argc && np < 16; i++)
-    if(strncmp(argv[i], "--", 2) != 0) pos[np++] = argv[i];
+  {
+    if(strncmp(argv[i], "--noise=", 8) == 0)       { noise_mode = argv[i] + 8; }
+    else if(strncmp(argv[i], "--noise-state=", 14) == 0) { noise_state_path = argv[i] + 14; }
+    else if(strncmp(argv[i], "--", 2) != 0) pos[np++] = argv[i];
+  }
   if(np < 4)
   {
     fprintf(stderr, "Usage: galosh_vk in.bin out.bin W H [galosh] "
@@ -504,8 +516,40 @@ int main(int argc, char **argv)
 #define PCI(k, v) pc[k].i = (v)
 #define PCF(k, v) pc[k].f = (v)
 
+  /* [B5] stateful noise modes: load state + decide whether P0/LUT run. */
+  float st_a = 0.0f, st_s = 0.0f; int st_n = -1;
+  if(noise_state_path)
+  {
+    FILE *sf = fopen(noise_state_path, "r");
+    if(sf) { if(fscanf(sf, "%f %f %d", &st_a, &st_s, &st_n) != 3) st_n = -1; fclose(sf); }
+  }
+  const int have_state = (st_n >= 0 && st_a > 0.0f);
+  int hold_frame = 0;   /* 1 = use stored model, skip P0 (+ LUT if cached) */
+  float ema_beta = 0.0f;
+  if(strcmp(noise_mode, "hold") == 0)
+  {
+    if(!have_state) { fprintf(stderr, "--noise=hold needs a valid --noise-state\n"); return 1; }
+    hold_frame = 1;
+  }
+  else if(strncmp(noise_mode, "every:", 6) == 0)
+  {
+    const int N = atoi(noise_mode + 6);
+    hold_frame = (have_state && st_n + 1 < (N > 0 ? N : 1));
+  }
+  else if(strncmp(noise_mode, "ema:", 4) == 0)
+  {
+    const float b = (float)atof(noise_mode + 4);
+    ema_beta = (b > 0.0f && b <= 1.0f) ? b : 1.0f;
+  }
+  char lut_cache[1300] = { 0 };
+  if(noise_state_path)
+    snprintf(lut_cache, sizeof(lut_cache), "%s.lut", noise_state_path);
+
   /* ================= SEG A: Phase 0 ================= */
-  VkCommandBuffer cb = cb_begin();
+  VkCommandBuffer cb;
+  if(!hold_frame)
+  {
+  cb = cb_begin();
   PCI(0, W); PCI(1, H); PCI(2, ne_n_bx); PCI(3, ne_n_by); PCI(4, ne_per_ch);
   dispatch_k(cb, K_NE_STATS, s_ne_stats, pc, 5,
              (uint32_t)AUP(ne_total, 64), 1, 1, "K_O32_P0a block_stats");
@@ -524,30 +568,74 @@ int main(int argc, char **argv)
   PCI(0, P_DARK_THRESH);
   dispatch_k(cb, K_NE_D_FIN, s_d_fin, pc, 1, 1, 1, 1, "K_O32_P0h dark_finalize");
   cb_submit_wait(cb);
+  }  /* !hold_frame */
 
-  /* HOST SYNC #1: read params, ext-model override */
-  float est[PARAMS_SIZE];
-  download(&params, est, PARAMS_SIZE * 4, 0);
-  float alpha = est[P_ALPHA], sigma_sq = est[P_SIGMA_SQ];
-  if(ext_model)
+  /* HOST SYNC #1: decide (alpha, sigma_sq) — fit / ext CLI / state / ema */
+  float alpha, sigma_sq;
+  int   new_frames_since_fit = 0;
+  if(hold_frame)
   {
-    alpha = alpha_ext; sigma_sq = sig_ext;
+    alpha = st_a; sigma_sq = st_s;
+    new_frames_since_fit = st_n + 1;
     float trio[3] = { alpha, sigma_sq, sigma_sq / fmaxf(alpha, 1e-12f) };
     upload(&params, &trio[0], 4, P_ALPHA * 4);
     upload(&params, &trio[1], 4, P_SIGMA_SQ * 4);
     upload(&params, &trio[2], 4, P_S_SCALE * 4);
-    fprintf(stderr, "[vk] noise_est OVERRIDE alpha=%.8f sigma_sq=%.10f\n", alpha, sigma_sq);
+    fprintf(stderr, "[vk] noise HOLD (frames_since_fit=%d): alpha=%.8f sigma_sq=%.10f\n",
+            new_frames_since_fit, alpha, sigma_sq);
   }
   else
-    fprintf(stderr, "[vk] Phase 0 noise est: alpha=%.6f sigma_sq=%.8f\n", alpha, sigma_sq);
+  {
+    float est[PARAMS_SIZE];
+    download(&params, est, PARAMS_SIZE * 4, 0);
+    alpha = est[P_ALPHA]; sigma_sq = est[P_SIGMA_SQ];
+    if(ext_model) { alpha = alpha_ext; sigma_sq = sig_ext; }
+    if(ema_beta > 0.0f && have_state)
+    {
+      alpha    = ema_beta * alpha    + (1.0f - ema_beta) * st_a;
+      sigma_sq = ema_beta * sigma_sq + (1.0f - ema_beta) * st_s;
+    }
+    if(ext_model || ema_beta > 0.0f)
+    {
+      float trio[3] = { alpha, sigma_sq, sigma_sq / fmaxf(alpha, 1e-12f) };
+      upload(&params, &trio[0], 4, P_ALPHA * 4);
+      upload(&params, &trio[1], 4, P_SIGMA_SQ * 4);
+      upload(&params, &trio[2], 4, P_S_SCALE * 4);
+    }
+    fprintf(stderr, "[vk] Phase 0 noise est%s: alpha=%.6f sigma_sq=%.8f\n",
+            ext_model ? " OVERRIDE" : (ema_beta > 0.0f ? " EMA" : ""), alpha, sigma_sq);
+  }
+
+  /* [B5] LUT: on hold frames try the disk cache (32 KB sidecar) before
+   * paying the ~11 ms GPU rebuild.  Cache is (lut_d, lut_x, lut_params). */
+  int lut_from_cache = 0;
+  if(hold_frame && lut_cache[0])
+  {
+    FILE *cf = fopen(lut_cache, "rb");
+    if(cf)
+    {
+      float *tmp = malloc((GAT_LUT_SIZE * 2 + 8) * 4);
+      if(fread(tmp, 4, GAT_LUT_SIZE * 2 + 8, cf) == (size_t)(GAT_LUT_SIZE * 2 + 8))
+      {
+        upload(&lut_d, tmp, GAT_LUT_SIZE * 4, 0);
+        upload(&lut_x, tmp + GAT_LUT_SIZE, GAT_LUT_SIZE * 4, 0);
+        upload(&lut_p, tmp + 2 * GAT_LUT_SIZE, 8 * 4, 0);
+        lut_from_cache = 1;
+      }
+      free(tmp); fclose(cf);
+    }
+  }
 
   /* ================= SEG B: Phase 1 + LUT ================= */
   cb = cb_begin();
   PCI(0, W); PCI(1, H);
   dispatch_k(cb, K_GAT_FWD, s_gat, pc, 2,
              (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_P1a gat_full");
-  dispatch_k(cb, K_LUT_BUILD, s_lut, NULL, 0, GAT_LUT_SIZE / 256, 1, 1, "K_O32_P0c build_inv_lut");
-  dispatch_k(cb, K_LUT_FIN, s_lut_fin, NULL, 0, 1, 1, 1, "K_O32_P0d lut_finalize");
+  if(!lut_from_cache)
+  {
+    dispatch_k(cb, K_LUT_BUILD, s_lut, NULL, 0, GAT_LUT_SIZE / 256, 1, 1, "K_O32_P0c build_inv_lut");
+    dispatch_k(cb, K_LUT_FIN, s_lut_fin, NULL, 0, 1, 1, 1, "K_O32_P0d lut_finalize");
+  }
   PCI(0, W); PCI(1, H);
   dispatch_k(cb, K_SIGMA_CFA, s_sigma, pc, 2, 4, 1, 1, "K_O32_P1b sigma_cfa");
   dispatch_k(cb, K_UNIFIED, s_unified, NULL, 0, 1, 1, 1, "K_O32_P1c unified");
@@ -707,6 +795,23 @@ download_phase:
   { FILE *f = fopen(out_path, "wb");
     if(!f) { fprintf(stderr, "cannot open %s\n", out_path); return 1; }
     fwrite(img, 4, npix, f); fclose(f); }
+
+  /* [B5] persist state + LUT cache for the next frame in the loop */
+  if(noise_state_path && strcmp(noise_mode, "fit") != 0)
+  {
+    FILE *sf = fopen(noise_state_path, "w");
+    if(sf) { fprintf(sf, "%.9g %.9g %d\n", alpha, sigma_sq, new_frames_since_fit); fclose(sf); }
+    if(!lut_from_cache && lut_cache[0])
+    {
+      float *tmp = malloc((GAT_LUT_SIZE * 2 + 8) * 4);
+      download(&lut_d, tmp, GAT_LUT_SIZE * 4, 0);
+      download(&lut_x, tmp + GAT_LUT_SIZE, GAT_LUT_SIZE * 4, 0);
+      download(&lut_p, tmp + 2 * GAT_LUT_SIZE, 8 * 4, 0);
+      FILE *cf = fopen(lut_cache, "wb");
+      if(cf) { fwrite(tmp, 4, GAT_LUT_SIZE * 2 + 8, cf); fclose(cf); }
+      free(tmp);
+    }
+  }
 
   /* profiling report */
   if(g_verbose && g_ts_n)
