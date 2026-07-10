@@ -1,7 +1,16 @@
 #version 450
 /* Transcribed from galosh.cl §7.4 galosh_o32_gat_forward_full (line 7040).
- * Phase 1 (1/4): GAT forward transform on the full CFA frame + per-CFA
- * half-res views ch0..3.  Literal transcription (V2.0 Phase B2). */
+ * Phase 1 (1/4): GAT forward transform on the full CFA frame.
+ * Literal transcription (V2.0 Phase B2).
+ *
+ * [deviation vs galosh.cl, V2.0 B7f] dead ch0..3 stores removed: on the
+ * o32 path NOTHING reads the per-CFA half-res views (HOST_BLUEPRINT.md
+ * trap #7 — they existed for the K7-K10 dark-anchor compat of older
+ * variants).  Dropping the stores saves one full-frame write here (and
+ * one RMW each in normalize/dark_sub) = ~20 B/px of pure bandwidth,
+ * outputs bit-identical.  Bindings kept so the host layout is unchanged.
+ * (日) ch0..3 は o32 経路で読み手ゼロの死に書き込み → 除去。出力は
+ * ビット同一、バインディングはホスト不変のため温存。 */
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -53,18 +62,4 @@ void main()
   }
 
   in_gat_full[fy * pc.width + fx] = T;
-
-  /* Per-CFA half-res view (= for K7-K10 dark anchor compat).
-   * Slot encoding matches CPU offsets {{0,0},{0,1},{1,0},{1,1}}:
-   *   slot = (fy & 1) * 2 + (fx & 1)  =>  {0:RR, 1:RC, 2:CR, 3:CC}
-   * Half-res index: hp = (fy/2) * (width/2) + (fx/2). */
-  const int slot_r = fy & 1;
-  const int slot_c = fx & 1;
-  const int slot   = slot_r | (slot_c << 1);   /* matches §6.1 + G convention */
-  const int hw     = pc.width >> 1;
-  const int hp     = (fy >> 1) * hw + (fx >> 1);
-  if(slot == 0)      ch0[hp] = T;
-  else if(slot == 1) ch1[hp] = T;
-  else if(slot == 2) ch2[hp] = T;
-  else               ch3[hp] = T;
 }

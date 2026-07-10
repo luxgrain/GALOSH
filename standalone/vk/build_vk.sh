@@ -18,7 +18,8 @@ o32_box_downsample_2x_3p o32_loess_chroma_3p_tiled o32_crop_2d_topleft \
 o32_k16_jbu_3p o32_pad_2d_edge o32_smoothstep_blend_3p o32_inverse_wht_dark_gat \
 o32_pass12_wht4 o32_fastup_3p o32_sigma_hist_mwg o32_sigma_fin_mwg \
 o32_box_downsample_2x_h16 o32_crop_2d_topleft_h16 o32_loess_chroma_3p_tiled_g16 \
-o32_k16_jbu_3p_f16 o32_fastup_3p_f16"
+o32_k16_jbu_3p_f16 o32_fastup_3p_f16 \
+o32_pad_2d_edge_3p o32_k16_inverse_fused o32_fastup_inverse_fused"
 
 for k in $ACTIVE; do
   glslc -O --target-env=vulkan1.2 "shaders/$k.comp" -o "shaders/$k.spv"

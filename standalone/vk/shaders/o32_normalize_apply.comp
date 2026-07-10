@@ -1,7 +1,10 @@
 #version 450
 /* Transcribed from galosh.cl §7.7 galosh_o32_normalize_apply (line 7237).
- * Phase 1 (4/4): in-place multiply of in_gat_full + ch0..3 by
- * params[P_INV_SG].  Literal transcription (V2.0 Phase B2). */
+ * Phase 1 (4/4): in-place multiply of in_gat_full by params[P_INV_SG].
+ * Literal transcription (V2.0 Phase B2).
+ * [deviation vs galosh.cl, V2.0 B7f] dead ch0..3 RMWs removed (never
+ * read on the o32 path — blueprint trap #7); outputs bit-identical,
+ * bindings kept.  (日) 死に RMW 除去、出力ビット同一。 */
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -29,15 +32,4 @@ void main()
   const float inv_sg = params[P_INV_SG];
   const int p = fy * pc.width + fx;
   in_gat_full[p] *= inv_sg;
-
-  /* Per-CFA half-res view (write only when (fy, fx) is the slot's TL). */
-  const int slot_r = fy & 1;
-  const int slot_c = fx & 1;
-  const int slot   = slot_r | (slot_c << 1);
-  const int hw     = pc.width >> 1;
-  const int hp     = (fy >> 1) * hw + (fx >> 1);
-  if(slot == 0)      ch0[hp] *= inv_sg;
-  else if(slot == 1) ch1[hp] *= inv_sg;
-  else if(slot == 2) ch2[hp] *= inv_sg;
-  else               ch3[hp] *= inv_sg;
 }

@@ -115,6 +115,11 @@ enum {
    * per-GPU. */
   K_BOX2_H16, K_CROP_H16, K_LOESS_T_G16, K_K16_F16, K_FASTUP_F16,
   K_SIGMA_HIST, K_SIGMA_FIN,   /* [iGPU-opt] two-stage sigma_per_cfa */
+  /* [B7f fusion pack] 3-plane pad (9 dispatches -> 3) + final upsample x
+   * inverse fusion (Cal1..3 full-res planes never materialized on the
+   * common path; ~100 MB traffic saved at 4K).  K_PAD / K_K16_F16 /
+   * K_FASTUP_F16 / K_INV stay compiled for the GALOSH_DUMP_DIR path. */
+  K_PAD3, K_K16_INV_F, K_FASTUP_INV_F,
   K_COUNT
 };
 static Kern g_k[K_COUNT] = {
@@ -158,6 +163,10 @@ static Kern g_k[K_COUNT] = {
   [K_FASTUP_F16] = { "o32_fastup_3p_f16",             7, 12 },
   [K_SIGMA_HIST] = { "o32_sigma_hist_mwg",            2, 12 },
   [K_SIGMA_FIN]  = { "o32_sigma_fin_mwg",             2,  0 },
+  /* [B7f fusion pack] */
+  [K_PAD3]        = { "o32_pad_2d_edge_3p",       6, 16 },
+  [K_K16_INV_F]   = { "o32_k16_inverse_fused",    9, 12 },
+  [K_FASTUP_INV_F]= { "o32_fastup_inverse_fused", 9, 12 },
 };
 
 static char g_exe_dir[1024];
@@ -763,21 +772,25 @@ int main(int argc, char **argv)
   VkDescriptorSet s_lo_e     = SET(K_LOESS_T, &L_e, &C_e1, &C_e2, &C_e3, &Cl_e1, &Cl_e2, &Cl_e3);
   VkDescriptorSet s_cropq    = SET(K_CROP_H16, &L_h_den, &L_for_q);   /* [FP16 v1] 7h: f16 in */
   VkDescriptorSet s_k16_q2h  = SET(kid_up, &Cl_q1, &Cl_q2, &Cl_q3, &L_for_q, &Cqup_r1, &Cqup_r2, &Cqup_r3);
-  VkDescriptorSet s_pad_q[3] = {
-    SET(K_PAD, &Cqup_r1, &Cqup1), SET(K_PAD, &Cqup_r2, &Cqup2), SET(K_PAD, &Cqup_r3, &Cqup3) };
+  /* [B7f] 3-plane pads: one set per site instead of three (K_PAD stays
+   * compiled but unused — deprecated single-plane original). */
+  VkDescriptorSet s_pad_q3  = SET(K_PAD3, &Cqup_r1, &Cqup_r2, &Cqup_r3, &Cqup1, &Cqup2, &Cqup3);
   VkDescriptorSet s_crope    = SET(K_CROP, &L_q, &L_for_e);
   VkDescriptorSet s_k16_e2q  = SET(kid_up, &Cl_e1, &Cl_e2, &Cl_e3, &L_for_e, &Ceq_r1, &Ceq_r2, &Ceq_r3);
-  VkDescriptorSet s_pad_e[3] = {
-    SET(K_PAD, &Ceq_r1, &Ceq1), SET(K_PAD, &Ceq_r2, &Ceq2), SET(K_PAD, &Ceq_r3, &Ceq3) };
+  VkDescriptorSet s_pad_e3  = SET(K_PAD3, &Ceq_r1, &Ceq_r2, &Ceq_r3, &Ceq1, &Ceq2, &Ceq3);
   VkDescriptorSet s_k16_eq2h = SET(kid_up, &Ceq1, &Ceq2, &Ceq3, &L_for_q, &Ceup_r1, &Ceup_r2, &Ceup_r3);
-  VkDescriptorSet s_pad_eu[3] = {
-    SET(K_PAD, &Ceup_r1, &Ceup1), SET(K_PAD, &Ceup_r2, &Ceup2), SET(K_PAD, &Ceup_r3, &Ceup3) };
+  VkDescriptorSet s_pad_eu3 = SET(K_PAD3, &Ceup_r1, &Ceup_r2, &Ceup_r3, &Ceup1, &Ceup2, &Ceup3);
   VkDescriptorSet s_smooth   = SET(K_SMOOTH, &C1_h, &C2_h, &C3_h, &Cl_h1, &Cl_h2, &Cl_h3,
                                    &Cqup1, &Cqup2, &Cqup3, &Ceup1, &Ceup2, &Ceup3,
                                    &Cden1, &Cden2, &Cden3);
   VkDescriptorSet s_k16_fin  = SET(kid_up_final, &Cden1, &Cden2, &Cden3, &L_pixel, &Cal1, &Cal2, &Cal3);  /* [FP16 v1] */
   VkDescriptorSet s_inv      = SET(K_INV, &L_pixel, &Cal1, &Cal2, &Cal3, &raw,
                                    &lut_d, &lut_x, &lut_p, &params);
+  /* [B7f] fused final (common path; the unfused pair above serves the
+   * GALOSH_DUMP_DIR path which must materialize p9_C1_aligned). */
+  const int kid_fin_fused = upsample_fast ? K_FASTUP_INV_F : K_K16_INV_F;
+  VkDescriptorSet s_fin_fused = SET(kid_fin_fused, &Cden1, &Cden2, &Cden3,
+                                    &L_pixel, &raw, &lut_d, &lut_x, &lut_p, &params);
 
   PcW pc[8];
 #define PCI(k, v) pc[k].i = (v)
@@ -1059,42 +1072,44 @@ int main(int argc, char **argv)
   PCI(0, cq_w); PCI(1, cq_h); PCF(2, 1.5f);
   dispatch_k(cb, kid_up, s_k16_q2h, pc, 3,
              (uint32_t)AUP(kq_w, 16), (uint32_t)AUP(kq_h, 16), 1, "K_O32_7i K16_q2h");
-  for(int p = 0; p < 3; p++)
-  {
-    PCI(0, kq_w); PCI(1, kq_h); PCI(2, hw); PCI(3, hh);
-    dispatch_k(cb, K_PAD, s_pad_q[p], pc, 4,
-               (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_7j pad_q_up");
-  }
+  PCI(0, kq_w); PCI(1, kq_h); PCI(2, hw); PCI(3, hh);
+  dispatch_k(cb, K_PAD3, s_pad_q3, pc, 4,
+             (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_7j pad_q_up_3p");
   PCI(0, cq_w); PCI(1, cq_h); PCI(2, ke_w); PCI(3, ke_h);
   dispatch_k(cb, K_CROP, s_crope, pc, 4,
              (uint32_t)AUP(ke_w, 16), (uint32_t)AUP(ke_h, 16), 1, "K_O32_7k crop_L_for_e");
   PCI(0, ce_w); PCI(1, ce_h); PCF(2, 1.5f);
   dispatch_k(cb, kid_up, s_k16_e2q, pc, 3,
              (uint32_t)AUP(ke_w, 16), (uint32_t)AUP(ke_h, 16), 1, "K_O32_7l K16_e2q");
-  for(int p = 0; p < 3; p++)
-  {
-    PCI(0, ke_w); PCI(1, ke_h); PCI(2, cq_w); PCI(3, cq_h);
-    dispatch_k(cb, K_PAD, s_pad_e[p], pc, 4,
-               (uint32_t)AUP(cq_w, 16), (uint32_t)AUP(cq_h, 16), 1, "K_O32_7m pad_e_to_q");
-  }
+  PCI(0, ke_w); PCI(1, ke_h); PCI(2, cq_w); PCI(3, cq_h);
+  dispatch_k(cb, K_PAD3, s_pad_e3, pc, 4,
+             (uint32_t)AUP(cq_w, 16), (uint32_t)AUP(cq_h, 16), 1, "K_O32_7m pad_e_to_q_3p");
   PCI(0, cq_w); PCI(1, cq_h); PCF(2, 1.5f);
   dispatch_k(cb, kid_up, s_k16_eq2h, pc, 3,
              (uint32_t)AUP(kq_w, 16), (uint32_t)AUP(kq_h, 16), 1, "K_O32_7n K16_q2h_e");
-  for(int p = 0; p < 3; p++)
-  {
-    PCI(0, kq_w); PCI(1, kq_h); PCI(2, hw); PCI(3, hh);
-    dispatch_k(cb, K_PAD, s_pad_eu[p], pc, 4,
-               (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_7o pad_e_up");
-  }
+  PCI(0, kq_w); PCI(1, kq_h); PCI(2, hw); PCI(3, hh);
+  dispatch_k(cb, K_PAD3, s_pad_eu3, pc, 4,
+             (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_7o pad_e_up_3p");
   PCI(0, hw); PCI(1, hh); PCF(2, strength * chroma_str);
   dispatch_k(cb, K_SMOOTH, s_smooth, pc, 3,
              (uint32_t)AUP(hw, 16), (uint32_t)AUP(hh, 16), 1, "K_O32_8 smoothstep");
-  PCI(0, hw); PCI(1, hh); PCF(2, 1.5f);
-  dispatch_k(cb, kid_up_final, s_k16_fin, pc, 3,
-             (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_9 K16_final");
-  PCI(0, W); PCI(1, H);
-  dispatch_k(cb, K_INV, s_inv, pc, 2,
-             (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_10 inverse_final");
+  if(dump_dir)
+  {
+    /* unfused pair: materializes Cal1..3 for the p9 dump */
+    PCI(0, hw); PCI(1, hh); PCF(2, 1.5f);
+    dispatch_k(cb, kid_up_final, s_k16_fin, pc, 3,
+               (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_9 K16_final");
+    PCI(0, W); PCI(1, H);
+    dispatch_k(cb, K_INV, s_inv, pc, 2,
+               (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_10 inverse_final");
+  }
+  else
+  {
+    /* [B7f] fused final: f16 contract round in-register, bit-identical */
+    PCI(0, hw); PCI(1, hh); PCF(2, 1.5f);
+    dispatch_k(cb, kid_fin_fused, s_fin_fused, pc, 3,
+               (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_9+10 fused_final");
+  }
   cb_submit_wait(cb);
 
   if(dump_dir)
