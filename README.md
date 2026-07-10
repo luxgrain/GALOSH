@@ -89,6 +89,50 @@ classical baselines get a noise-aware VST front-end, GALOSH is fully blind):
 
 ![sRGB qualitative, RawNIND](docs/assets/qualitative_srgb_rawnind.jpg)
 
+## GPU speed — Vulkan compute (raw pipeline, V2)
+
+`standalone/vk/` is a Vulkan-compute port of the raw pipeline: one
+vendor-agnostic shader set (no per-GPU branching), FP16 inter-phase storage
+with FP32 compute, watchdog-safe banded submissions, and a video mode that
+amortizes the blind noise fit across frames (`--noise=hold|every:N|ema:B`).
+Numeric gate: ≥69 dB PSNR against the CPU FP32 reference on every device
+below (measured 69.7–70.6 dB on all three).
+
+Measured full-pipeline GPU times, ms (fps), synthetic Bayer frames.
+**hold** columns = video steady state (noise model + inverse-GAT LUT reused);
+**per-frame fit** = fully blind on every frame. `quality` = 8×8 WHT + jinc
+upsampling (the paper configuration); `fast` = `--wht=4 --upsample=fast`
+(video mode; `--upsample=fast` alone is quality-neutral on the full
+benchmark, `--wht=4` trades PSNR on high noise — see
+`standalone/README.md` for the per-flag quality labels).
+
+| GPU | Res | quality (hold) | wht8+fast | wht4+jinc | fast (hold) | quality (per-frame fit) | OpenCL quality fit | VK/CL |
+|---|---|---|---|---|---|---|---|---|
+| NVIDIA RTX 4070 Ti | 1080p | 2.81 (356) | 2.73 (367) | 1.39 (722) | 1.33 (752) | 4.17 (240) | 11.8 (85) | 2.8× |
+| | 4K | 10.9 (91.7) | 10.6 (94.0) | 4.91 (204) | 4.63 (216) | 14.9 (67.0) | 39.3 (25) | 2.6× |
+| | 8K | 44.4 (22.5) | 41.6 (24.0) | 19.7 (50.9) | 18.7 (53.4) | 59.4 (16.8) | 150 (6.7) | 2.5× |
+| Intel Arc A310 | 1080p | 34.3 (29.2) | 33.9 (29.5) | 12.5 (80.1) | 12.1 (82.5) | 39.4 (25.4) | 748 (1.3) | 19× |
+| | 4K | 142 (7.0) | 141 (7.1) | 51.7 (19.3) | 50.3 (19.9) | 158 (6.3) | 2858 (0.3) | 18× |
+| | 8K | 585 (1.7) | 579 (1.7) | 221 (4.5) | 214 (4.7) | 654 (1.5) | —⁴ | — |
+| AMD Radeon iGPU (gfx1036) | 1080p | 110 (9.1) | 105 (9.5) | 45.7 (21.9) | 41.0 (24.4) | 121 (8.3) | 256 (3.9) | 2.1× |
+| | 4K | 446 (2.2) | 429 (2.3) | 187 (5.3) | 170 (5.9) | 487 (2.1) | 1029 (1.0) | 2.1× |
+| | 8K | 1821 (0.5) | 1750 (0.6) | 797 (1.3) | 716 (1.4) | 1982 (0.5) | —⁴ | — |
+
+The quality configuration runs 4K at 91.7 fps on the 4070 Ti — fully blind
+per-frame fitting still clears 60 fps at 4K (67.0). The key kernel-level win
+is a subgroup-cooperative rewrite of the 8×8 WHT shrinkage (one block per
+subgroup, coefficients register-resident by construction), which removes the
+local-memory spill that SPIR-V compilers otherwise generate — that spill is
+also why the Intel OpenCL column trails Vulkan by ~19× while mature
+register-promoting OpenCL compilers (NVIDIA/AMD) trail by only ~2–3×.
+
+The OpenCL host (`galosh_raw_gpu.exe`) is kept as the portable reference
+(single source, same 70.55 dB parity on all three GPUs — useful as a
+darktable-style integration base); it is quality-mode, fit-every-frame, FP32
+storage only. ⁴OpenCL 8K on the two slower GPUs is not run: a single kernel
+there exceeds the ~2 s Windows GPU watchdog, and the banded-submission
+mitigation is a Vulkan-host feature.
+
 ## Algorithm summary
 
 **GALOSH core** (shared by both domains)
@@ -124,6 +168,7 @@ regression at full resolution; output clamped to [0,1]. Input = sRGB float32
 | Path | Role |
 |---|---|
 | `standalone/` | **Canonical reference implementation** (CLI / exe) — the basis for the paper and all benchmarks |
+| `standalone/vk/` | Vulkan-compute port of the raw pipeline (GLSL shaders + host; see the GPU-speed section) |
 | `standalone/tests/` | Smoke tests + dataset-free micro-benchmark |
 | `benchmark/scripts/` | Full benchmark harness (SIDD / RawNIND, raw + sRGB) |
 | `benchmark/results_*/` | Benchmark outputs — a few small timing-source JSONs are tracked; bulky regenerable artifacts (metrics JSONs, PNGs) are git-ignored |
@@ -158,6 +203,15 @@ make test         # smoke tests (constant/random/odd/small/high-noise/near-black
 make bench-small  # seeded synthetic micro-benchmark -> tests/bench_small_results.csv
 make check-no-int64
 # make is optional: ./build.sh {all|gpu|test|bench-small|check-no-int64} does the same
+```
+
+The Vulkan port builds separately (needs `glslc` + Vulkan headers/loader;
+on MSYS2: `pacman -S mingw-w64-ucrt-x86_64-shaderc
+mingw-w64-ucrt-x86_64-vulkan-headers mingw-w64-ucrt-x86_64-vulkan-loader`):
+
+```sh
+cd standalone/vk
+bash build_vk.sh   # 43 SPIR-V shaders + galosh_vk.exe (CPU-exe-compatible CLI)
 ```
 
 **Windows (MSYS2), exact commands.** A plain `bash` from PowerShell/cmd may
