@@ -96,10 +96,14 @@ typedef struct {
   const char     *spv;      /* shaders/<spv>.spv */
   int             nbind;    /* SSBO bindings */
   int             push;     /* push-constant bytes */
+  int             sg32;     /* [B7g] pin subgroup size 32 (needs g_sg_ok) */
   VkDescriptorSetLayout dsl;
   VkPipelineLayout      pl;
   VkPipeline            pipe;
 } Kern;
+
+/* [B7g] VK_EXT_subgroup_size_control usable on this device (probed). */
+static int g_sg_ok = 0;
 
 /* Active kernels (dead ones excluded per blueprint). Order = KID enum. */
 enum {
@@ -120,6 +124,10 @@ enum {
    * common path; ~100 MB traffic saved at 4K).  K_PAD / K_K16_F16 /
    * K_FASTUP_F16 / K_INV stay compiled for the GALOSH_DUMP_DIR path. */
   K_PAD3, K_K16_INV_F, K_FASTUP_INV_F,
+  /* [B7g] subgroup-cooperative pass12 (quality 8x8; spill-free rewrite).
+   * Created ONLY when g_sg_ok; classic o32_pass12 stays the fallback and
+   * the GALOSH_SG=0 A/B reference. */
+  K_PASS12_SG,
   K_COUNT
 };
 static Kern g_k[K_COUNT] = {
@@ -167,6 +175,8 @@ static Kern g_k[K_COUNT] = {
   [K_PAD3]        = { "o32_pad_2d_edge_3p",       6, 16 },
   [K_K16_INV_F]   = { "o32_k16_inverse_fused",    9, 12 },
   [K_FASTUP_INV_F]= { "o32_fastup_inverse_fused", 9, 12 },
+  /* [B7g] same bindings/push as o32_pass12; local size 512, sg32 pinned */
+  [K_PASS12_SG]   = { "o32_pass12_sg",            2, 16, .sg32 = 1 },
 };
 
 static char g_exe_dir[1024];
@@ -212,6 +222,19 @@ static void make_kernel(Kern *k)
     .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main" },
     .layout = k->pl };
+  /* [B7g] pin the subgroup size to 32 + require full subgroups: the
+   * lane<->coefficient mapping of o32_pass12_sg is exact only at S=32.
+   * One code path — every probed GPU (NVIDIA native-32, AMD wave32,
+   * Arc 8/16/32) accepts requiredSubgroupSize=32.  Caller guarantees
+   * g_sg_ok when k->sg32 is set. */
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+    .requiredSubgroupSize = 32 };
+  if(k->sg32)
+  {
+    cpi.stage.pNext = &rss;
+    cpi.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+  }
   CHECK(vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &cpi, NULL, &k->pipe));
   vkDestroyShaderModule(g_dev, sm, NULL);
 }
@@ -635,6 +658,40 @@ int main(int argc, char **argv)
   vkGetPhysicalDeviceProperties(g_pd, &g_props);
   fprintf(stderr, "[vk] device[%u] = %s\n", di, g_props.deviceName);
 
+  /* [B7g] probe VK_EXT_subgroup_size_control: the subgroup-cooperative
+   * pass12 needs subgroup size PINNED to 32 (its lane<->coefficient map).
+   * Capability-gated, not vendor-gated — all three probe GPUs support it
+   * (NVIDIA native-32, AMD wave32-capable RDNA, Arc min8/max32). */
+  {
+    uint32_t nx = 0;
+    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &nx, NULL);
+    VkExtensionProperties *xp = malloc(nx * sizeof *xp);
+    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &nx, xp);
+    int has = 0;
+    for(uint32_t i = 0; i < nx; i++)
+      if(strcmp(xp[i].extensionName, "VK_EXT_subgroup_size_control") == 0) has = 1;
+    free(xp);
+    if(has)
+    {
+      VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
+      VkPhysicalDeviceFeatures2 f2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &sf };
+      vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+      VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT };
+      VkPhysicalDeviceProperties2 p2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sp };
+      vkGetPhysicalDeviceProperties2(g_pd, &p2);
+      g_sg_ok = (sf.subgroupSizeControl && sf.computeFullSubgroups &&
+                 sp.minSubgroupSize <= 32 && 32 <= sp.maxSubgroupSize &&
+                 (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) ? 1 : 0;
+    }
+    if(g_verbose)
+      fprintf(stderr, "[vk] subgroup-size-control: %s\n",
+              g_sg_ok ? "OK (pass12_sg eligible)" : "absent (classic pass12)");
+  }
+
   /* FP64 stays out of the shader set (Arc lacks shaderFloat64).
    * [FP16 v1] Two features are required for the FP16 storage contract —
    * probe confirmed ALL 3 GPUs (NVIDIA/AMD/Arc) support both, so this
@@ -659,8 +716,17 @@ int main(int argc, char **argv)
   VkPhysicalDeviceShaderFloat16Int8Features f16arith = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
     .pNext = &f16stor, .shaderFloat16 = VK_TRUE };
+  /* [B7g] chain subgroup-size-control features + enable the extension
+   * (only when the probe passed; zero effect otherwise). */
+  VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcf = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+    .subgroupSizeControl = VK_TRUE, .computeFullSubgroups = VK_TRUE };
+  if(g_sg_ok) f16stor.pNext = &sgcf;
+  const char *dev_exts[1] = { "VK_EXT_subgroup_size_control" };
   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
     .pNext = &f16arith,
+    .enabledExtensionCount = g_sg_ok ? 1u : 0u,
+    .ppEnabledExtensionNames = dev_exts,
     .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = NULL };
   CHECK(vkCreateDevice(g_pd, &dci, NULL, &g_dev));
   vkGetDeviceQueue(g_dev, g_qi, 0, &g_q);
@@ -678,7 +744,11 @@ int main(int argc, char **argv)
     .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 256 };
   CHECK(vkCreateQueryPool(g_dev, &qpci, NULL, &g_qpool));
 
-  for(int i = 0; i < K_COUNT; i++) make_kernel(&g_k[i]);
+  for(int i = 0; i < K_COUNT; i++)
+  {
+    if(g_k[i].sg32 && !g_sg_ok) continue;   /* [B7g] sg kernel needs the ext */
+    make_kernel(&g_k[i]);
+  }
 
   /* --- buffers (blueprint §1a) --- */
   g_stg = mkbuf(full_f > 1024 ? full_f : 1024,
@@ -753,8 +823,14 @@ int main(int argc, char **argv)
   VkDescriptorSet s_dsub     = SET(K_DARK_SUB, &in_gat, &ch0, &ch1, &ch2, &ch3, &params);
   VkDescriptorSet s_fwdl     = SET(K_FWD_L, &in_gat, &L_cs);
   VkDescriptorSet s_cex      = SET(K_CHROMA_EX, &in_gat, &C1_h, &C2_h, &C3_h);
-  /* [B6] fast-mode kernel selection (same buffer graph, swapped pipelines) */
-  const int kid_p12 = (wht_block == 4) ? K_PASS12_W4 : K_PASS12;
+  /* [B6] fast-mode kernel selection (same buffer graph, swapped pipelines).
+   * [B7g] quality 8x8 defaults to the subgroup-cooperative kernel when the
+   * device can pin subgroup size 32; GALOSH_SG=0 forces the classic
+   * transcription (A/B + belt-and-braces opt-out). */
+  const char *sg_env = getenv("GALOSH_SG");
+  const int use_sg = g_sg_ok && !(sg_env && sg_env[0] == '0');
+  const int kid_p12 = (wht_block == 4) ? K_PASS12_W4
+                                       : (use_sg ? K_PASS12_SG : K_PASS12);
   const int kid_up  = upsample_fast ? K_FASTUP : K_K16;
   /* [FP16 v1] the FINAL upsample site (K_O32_9) touches contract buffers
    * (Cden f16 in, L_pixel f16 guide, Cal f16 out) → needs the _f16 variant
