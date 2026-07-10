@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.3.0 — V2 engine: Vulkan compute + video modes + cross-vendor GPU (2026-07-11)
+
+### Vulkan compute port (`standalone/vk/`, new)
+- Full raw pipeline as one vendor-agnostic GLSL shader set (43 SPIR-V
+  kernels + `galosh_vk.exe`, CPU-exe-compatible CLI). Verified on NVIDIA
+  RTX 4070 Ti, Intel Arc A310 and an AMD Radeon iGPU at 69.7–70.6 dB
+  against the CPU FP32 reference — one code path, no per-GPU branching.
+- FP16 inter-phase storage contract (compute stays FP32; explicit IEEE
+  RNE stores — fixes AMD's round-toward-zero f16 conversion), FP64
+  eliminated via Neumaier–Kahan compensated FP32 (unlocks Arc).
+- Subgroup-cooperative 8×8 WHT shrinkage (one block per subgroup,
+  coefficients register-resident): quality mode 4–18× faster than the
+  literal transcription; **4K 91.7 fps / 8K 22.5 fps quality, 4K 216 fps
+  fast on the 4070 Ti** (see the README speed table for all three GPUs).
+- Windows-watchdog-safe execution at any resolution: adaptive banded
+  per-submission dispatch with a bounded probe (8K completes even on the
+  slowest iGPU; TDR root cause documented in-source).
+- Video amortization: `--noise=hold|every:N|ema:B` + state file + 32 KB
+  inverse-GAT LUT cache — held frames are bit-identical to fit frames.
+
+### CPU reference — V2 flags (flags-off output byte-identical, enforced
+### by the new identity harness `standalone/tests/v2_identity.py`)
+- `--noise=fit|hold|every:N|ema:B --noise-state=FILE` — formalized
+  noise-model injection (video semantics oracle).
+- `--wht=4` fast luma mode (−15% CPU; quality label: video-grade — trades
+  PSNR on high noise) and `--upsample=fast` guided bilinear (−20% CPU;
+  measured quality-neutral on the full benchmark). Per-flag speed/quality
+  labels in `standalone/README.md`; both exposed in the dist wrapper.
+- `--f16-storage` FP16-storage oracle (77–83 dB vs FP32 = near-lossless)
+  and `docs/dataflow_spec.md`, the precision/dataflow porting reference.
+
+### OpenCL cross-vendor fix (`galosh.cl` + hosts)
+- FP64 removed (compensated FP32, same scheme as Vulkan): the kernel
+  program now builds and runs on Intel Arc.
+- Fixed a silent AMD failure: the tiled LOESS workgroup (24×24 = 576)
+  exceeded AMD's max workgroup size 256, the dispatch failed with -54 and
+  the pipeline continued on garbage. Tile is now 16×16 (NVIDIA output
+  byte-identical); dispatch errors are fatal now instead of ignored.
+- All three GPUs at 70.55 dB parity vs the CPU reference; NVIDIA quality
+  fit 17.6 → 11.8 ms. OpenCL stays the portable reference (quality mode,
+  fit-every-frame); Vulkan is the performance path (2–19× like-for-like).
+
+### Distribution
+- `GALOSH_RAW_win64.zip` rebuilt with the fixed OpenCL engine (`--gpu`
+  now works on NVIDIA / Intel Arc / AMD) and the `--wht/--upsample`
+  wrapper flags; `GALOSH_YUV_win64.zip` unchanged (CPU engine).
+
 ## v0.2.0 — distributable Windows builds (2026-07-09)
 
 End-user distribution ZIPs (attached to the GitHub release):
