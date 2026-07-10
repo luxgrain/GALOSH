@@ -297,8 +297,9 @@ static int dispatch_2d(cl_command_queue q, cl_kernel k,
                                         (lx > 0) ? local : NULL,
                                         0, NULL, &ev);
     if(err != CL_SUCCESS) {
-        fprintf(stderr, "[CL] 2D dispatch failed: %d\n", err);
-        return -1;
+        /* FAIL FAST (2026-07-11) — see dispatch_2d_named. */
+        fprintf(stderr, "[CL] 2D dispatch failed: %d — aborting\n", err);
+        exit(1);
     }
     prof_add(ev, NULL);
     return 0;
@@ -316,8 +317,15 @@ static int dispatch_2d_named(cl_command_queue q, cl_kernel k,
                                         (lx > 0) ? local : NULL,
                                         0, NULL, &ev);
     if(err != CL_SUCCESS) {
-        fprintf(stderr, "[CL] 2D dispatch failed: %d\n", err);
-        return -1;
+        /* FAIL FAST (2026-07-11): callers ignored the -1, so a failed
+         * dispatch (e.g. CL_INVALID_WORK_GROUP_SIZE -54 on drivers with
+         * max WG 256) let the pipeline continue on garbage buffers and
+         * masked the LOESS-never-ran bug on AMD for two months.  A
+         * reference implementation must die loudly, like the Vulkan
+         * host's CHECK().  (日) 黙殺が根本原因を2ヶ月隠した→即死化。 */
+        fprintf(stderr, "[CL] 2D dispatch '%s' failed: %d — aborting\n",
+                name ? name : "?", err);
+        exit(1);
     }
     prof_add(ev, name);
     return 0;

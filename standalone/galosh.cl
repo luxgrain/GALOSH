@@ -10,16 +10,55 @@
  * Build: loaded as a single-source program by rawdenoise_gpu.c
  * (no runtime concatenation).  See README / paper for derivations.
  *
- * 2026-05-09: cl_khr_fp64 enabled to allow §7.8b/c/d/e dark anchor
- * IRLS to mirror CPU's `double` precision (CPU galosh_raw_cpu.c lines
- * 4684-4775).  Used ONLY in dark IRLS to match CPU's FP64 sum + per-
- * block r/w computation; rest of o32 pipeline stays FP32 (= ISP target
- * spec).  o16 (FP16 production for ISP target) does not use FP64 in
- * its dark IRLS — FP32 there is acceptable since o16 is the
- * streaming-faithful approximation, NOT the CPU faithful mirror.
+ * 2026-05-09: cl_khr_fp64 was enabled for the §7.8b/c/d/e dark-anchor
+ * IRLS + the two build_inv_lut kernels (mirror of CPU double).
+ * 2026-07-11 [V2 cross-vendor]: FP64 ELIMINATED AGAIN — Intel Arc has
+ * no fp64, and OpenCL compiles this file as ONE program, so a single
+ * `double` anywhere kills the whole build there.  The former double
+ * math is now Neumaier/Kahan-compensated FP32 (helpers below),
+ * back-ported verbatim from the proven Vulkan V2.0 shaders
+ * (standalone/vk/shaders/o32_{build_inv_lut,dark_*_mwg}.comp — 3-GPU
+ * parity >= 69 dB vs CPU canonical, NVIDIA/AMD/Arc all pass).  ONE
+ * source, no vendor branching.  Remaining Arc/iGPU caveat is Windows
+ * TDR only (banded submissions exist in the Vulkan host, not here).
+ * (日) FP64 全廃（Arc 解禁）。補償付き FP32、Vulkan 版の逆移植。
  * ================================================================
  */
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+
+/* Neumaier/Kahan compensated-FP32 helpers ([V2 cross-vendor], see the
+ * Vulkan twins for the full derivation).  True value ≈ sum + comp.
+ * FP_CONTRACT OFF here: FMA contraction would cancel the TwoSum error
+ * terms the whole scheme depends on (GLSL used `precise` for this). */
+#pragma OPENCL FP_CONTRACT OFF
+void galosh_kacc(float *s, float *c, const float v)
+{
+  const float t  = *s + v;
+  const float vp = t - *s;
+  const float sp = t - vp;
+  const float e  = (v - vp) + (*s - sp);
+  *s = t;
+  *c = *c + e;
+}
+void galosh_kcombine(float *s, float *c, const float s2, const float c2)
+{
+  const float t  = *s + s2;
+  const float vp = t - *s;
+  const float sp = t - vp;
+  const float e  = (s2 - vp) + (*s - sp);
+  *s = t;
+  *c = *c + c2 + e;
+}
+#pragma OPENCL FP_CONTRACT DEFAULT
+
+/* log with the x<=0 → "-inf" edge replaced by a finite sentinel, and exp
+ * with explicit underflow-to-zero below -87 (float exp underflows at
+ * ≈ -87.3; the double path's -690 guard at float scale — anything in
+ * between was 23 orders below the 1e-15 Poisson series cutoff). */
+#define GALOSH_LOG_ZERO_SENTINEL (-1e30f)
+float galosh_log_s(const float x)
+{ return (x <= 0.0f) ? GALOSH_LOG_ZERO_SENTINEL : log(x); }
+float galosh_exp_s(const float x)
+{ return (x < -87.0f) ? 0.0f : exp(x); }
 
 /* ================================================================
  * §1 + §2. Core (noise, GAT, WHT/LOSH, helpers) + RAW-mode kernels
@@ -1731,54 +1770,54 @@ kernel void galosh_build_inv_lut(
   const int i = get_global_id(0);
   if(i >= GAT_LUT_SIZE) return;
 
-  /* 2026-05-10: FP64 (cl_khr_fp64) computation throughout to mirror CPU
-   * `gat_build_inverse_table` (galosh_cpu.h line 1180+) exactly.  Previously
-   * float-only computation gave d_max = 39.5332 vs CPU's 39.5346 (= 0.0014
-   * diff) due to: (1) Poisson break threshold 1e-12f vs CPU 1e-15;
-   * (2) sqrt(2) constant precision (1.4142135624 vs 1.4142135623730951);
-   * (3) 1/sqrt(pi) precision (0.5641895835 vs 0.5641895835477563);
-   * (4) all FP arithmetic in float vs CPU's double.  Effect: dark-image
-   * Phase 10 inverse-GAT LUT lookup gave systematic ~0.025 mean|d| pixel
-   * shift.  Cost: LUT = 4096 entries built ONCE per image, negligible. */
-  const double a = (double)alpha;
-  const double sq = (double)sigma_sq;
-  const double sig = sqrt(fmax(sq, 1e-20));
-  const double y_break = -0.375 * a;
-  const double t_break = 2.0 * sig / a;
-  const double x_val = (double)i / (double)(GAT_LUT_SIZE - 1);
-  const double lambda = x_val / a;
+  /* 2026-05-10: FP64 to mirror CPU `gat_build_inverse_table`.
+   * 2026-07-11 [V2 cross-vendor]: FP64→compensated FP32 (Arc has no
+   * fp64; one `double` kills the whole program build there).  Native
+   * float log()/exp() + Kahan-compensated running sums (log_prob
+   * recurrence, Gauss-Hermite inner sum, expected_gat outer sum) —
+   * back-port of the validated Vulkan o32_build_inv_lut.comp (see its
+   * header for the i=0 / lambda=0 edge-case analysis: finite sentinel
+   * replaces the double path's log(0)=-inf → exp(-inf)=0 chain). */
+  const float a = alpha;
+  const float sq = sigma_sq;
+  const float sig = sqrt(fmax(sq, 1e-20f));
+  const float y_break = -0.375f * a;
+  const float t_break = 2.0f * sig / a;
+  const float x_val = (float)i / (float)(GAT_LUT_SIZE - 1);
+  const float lambda = x_val / a;
 
-  double expected_gat = 0.0;
-  const int k_max = (int)(lambda + 8.0 * sqrt(fmax(lambda, 1.0))) + 20;
-  double log_prob = -lambda;
+  float exg_s = 0.0f, exg_c = 0.0f;          /* expected_gat (Kahan) */
+  const int k_max = (int)(lambda + 8.0f * sqrt(fmax(lambda, 1.0f))) + 20;
+  float lp_s = -lambda, lp_c = 0.0f;         /* log_prob (Kahan) */
+  const float log_lambda = galosh_log_s(lambda);   /* loop-invariant */
 
   for(int k = 0; k <= k_max; k++)
   {
-    if(k > 0) log_prob += log(lambda) - log((double)k);
-    const double prob = exp(log_prob);
-    if(prob < 1e-15 && k > (int)lambda + 1) break;
+    if(k > 0) galosh_kacc(&lp_s, &lp_c, log_lambda - log((float)k));
+    const float prob = galosh_exp_s(lp_s + lp_c);
+    if(prob < 1e-15f && k > (int)lambda + 1) break;
 
-    double eg = 0.0;
+    float eg_s = 0.0f, eg_c = 0.0f;
     for(int g = 0; g < 10; g++)
     {
-      const double z = 1.4142135623730951 * sig * (double)gh_nodes[g];
-      const double noisy_y = (double)k * a + z;
-      double T;
+      const float z = 1.4142135623730951f * sig * gh_nodes[g];
+      const float noisy_y = (float)k * a + z;
+      float T;
       if(noisy_y >= y_break)
       {
-        const double arg = a * noisy_y + 0.375 * a * a + sq;
-        T = (2.0 / a) * sqrt(fmax(arg, 0.0));
+        const float arg = a * noisy_y + 0.375f * a * a + sq;
+        T = (2.0f / a) * sqrt(fmax(arg, 0.0f));
       }
       else
         T = t_break + (noisy_y - y_break) / sig;
-      eg += (double)gh_wts[g] * T;
+      galosh_kacc(&eg_s, &eg_c, gh_wts[g] * T);
     }
-    eg *= 0.5641895835477563;  /* 1/sqrt(pi), full double precision */
-    expected_gat += prob * eg;
+    const float eg = (eg_s + eg_c) * 0.5641895835477563f;  /* 1/sqrt(pi) */
+    galosh_kacc(&exg_s, &exg_c, prob * eg);
   }
 
-  lut_x[i] = (float)x_val;
-  lut_d[i] = (float)expected_gat;
+  lut_x[i] = x_val;
+  lut_d[i] = exg_s + exg_c;
 }
 
 
@@ -4207,7 +4246,16 @@ kernel void galosh_o_box_downsample_2x_3p(
  *   Halo ratio: (38² - 24²) / 38² = 60% halo (vs 72% halo for TILE_DIM=16)
  *   Tile count savings: 4MP / 24² vs 4MP / 16² = 56% fewer tiles
  *   WG size: 24² = 576 WIs (NVIDIA SM hosts 1-2 WGs/SM at 1024 thread/SM) */
-#define GALOSH_O_LOESS_TILE_DIM   24
+/* TILE_DIM 24→16 (2026-07-11): 24×24 = 576 WIs exceeded the AMD OpenCL
+ * driver's max workgroup size (256) → clEnqueueNDRangeKernel failed with
+ * CL_INVALID_WORK_GROUP_SIZE (-54) and the LOESS kernels silently never
+ * ran on AMD (first divergent phase p7, final output 26 dB).  16×16 =
+ * 256 WIs is within every driver's limit (NVIDIA byte-identical output —
+ * the per-pixel regression is tile-organization-independent).  Also
+ * re-aligns with the YUV host, which dispatches the fp16 tiled variant
+ * at 16×16 (a latent stride mismatch while this was 24).
+ * (日) AMD の max WG 256 超過で LOESS が無実行だった根本修正。 */
+#define GALOSH_O_LOESS_TILE_DIM   16
 #define GALOSH_O_LOESS_TILE_W     (GALOSH_O_LOESS_TILE_DIM + 2 * GALOSH_O_LOESS_R)
 #define GALOSH_O_LOESS_TILE_PIX   (GALOSH_O_LOESS_TILE_W * GALOSH_O_LOESS_TILE_W)
 
@@ -6931,55 +6979,57 @@ kernel void galosh_o32_build_inv_lut(
   const int i = get_global_id(0);
   if(i >= GAT_LUT_SIZE) return;
 
-  /* 2026-05-10: FP64 (cl_khr_fp64) computation throughout to mirror CPU
-   * `gat_build_inverse_table` (galosh_cpu.h line 1180+) exactly.  Cost: LUT
-   * = 4096 entries built ONCE per image, FP64 overhead negligible (= ~ms).
-   * Required for inverse-GAT lookup to match CPU bit-near in dark-image
-   * Phase 10 reconstruction (= dominated final-output divergence). */
-  const double a   = (double)params[P_ALPHA];
-  const double sq  = (double)params[P_SIGMA_SQ];
-  const double sig = sqrt(fmax(sq, 1e-20));
-  const double y_break = -0.375 * a;
-  const double t_break = 2.0 * sig / a;
+  /* 2026-05-10: FP64 to mirror CPU `gat_build_inverse_table`.
+   * 2026-07-11 [V2 cross-vendor]: FP64→compensated FP32, verbatim
+   * back-port of the validated Vulkan o32_build_inv_lut.comp (3-GPU
+   * parity >= 69 dB; lut_d is the designated parity watch point).
+   * Native float log()/exp(); every RUNNING SUM Kahan-compensated;
+   * lambda=0 edge via finite sentinel instead of log(0)=-inf. */
+  const float a   = params[P_ALPHA];
+  const float sq  = params[P_SIGMA_SQ];
+  const float sig = sqrt(fmax(sq, 1e-20f));
+  const float y_break = -0.375f * a;
+  const float t_break = 2.0f * sig / a;
 
-  const double x_val  = (double)i / (double)(GAT_LUT_SIZE - 1);
-  const double lambda = x_val / a;
+  const float x_val  = (float)i / (float)(GAT_LUT_SIZE - 1);
+  const float lambda = x_val / a;
 
   /* Poisson summation: log_prob recurrence avoids underflow. */
-  double expected_gat = 0.0;
-  const int k_max = (int)(lambda + 8.0 * sqrt(fmax(lambda, 1.0))) + 20;
-  double log_prob = -lambda;
+  float exg_s = 0.0f, exg_c = 0.0f;          /* expected_gat (Kahan) */
+  const int k_max = (int)(lambda + 8.0f * sqrt(fmax(lambda, 1.0f))) + 20;
+  float lp_s = -lambda, lp_c = 0.0f;         /* log_prob (Kahan) */
+  const float log_lambda = galosh_log_s(lambda);   /* loop-invariant */
 
   for(int k = 0; k <= k_max; k++)
   {
-    if(k > 0) log_prob += log(lambda) - log((double)k);
-    const double prob = exp(log_prob);
-    if(prob < 1e-15 && k > (int)lambda + 1) break;
+    if(k > 0) galosh_kacc(&lp_s, &lp_c, log_lambda - log((float)k));
+    const float prob = galosh_exp_s(lp_s + lp_c);
+    if(prob < 1e-15f && k > (int)lambda + 1) break;
 
     /* 10-point Gauss-Hermite quadrature over Gaussian noise. */
-    double eg = 0.0;
+    float eg_s = 0.0f, eg_c = 0.0f;
     for(int g = 0; g < 10; g++)
     {
-      const double z = 1.4142135623730951 * sig * (double)gh_nodes_o32[g];
-      const double noisy_y = (double)k * a + z;
-      double T;
+      const float z = 1.4142135623730951f * sig * gh_nodes_o32[g];
+      const float noisy_y = (float)k * a + z;
+      float T;
       if(noisy_y >= y_break)
       {
-        const double arg = a * noisy_y + 0.375 * a * a + sq;
-        T = (2.0 / a) * sqrt(fmax(arg, 0.0));
+        const float arg = a * noisy_y + 0.375f * a * a + sq;
+        T = (2.0f / a) * sqrt(fmax(arg, 0.0f));
       }
       else
       {
         T = t_break + (noisy_y - y_break) / sig;
       }
-      eg += (double)gh_weights_o32[g] * T;
+      galosh_kacc(&eg_s, &eg_c, gh_weights_o32[g] * T);
     }
-    eg *= 0.5641895835477563;  /* 1 / sqrt(pi), full double precision */
-    expected_gat += prob * eg;
+    const float eg = (eg_s + eg_c) * 0.5641895835477563f;  /* 1 / sqrt(pi) */
+    galosh_kacc(&exg_s, &exg_c, prob * eg);
   }
 
-  lut_d[i] = (float)expected_gat;
-  lut_x[i] = (float)x_val;
+  lut_d[i] = exg_s + exg_c;
+  lut_x[i] = x_val;
 
   /* WI 0: write lut_params (= matches §1 K_LUT_FINALIZE layout):
    *   [0]=d_min (deferred to §7.3b), [1]=d_max (deferred to §7.3b),
@@ -7514,18 +7564,21 @@ kernel void galosh_o32_dark_ref_irls(
  * write 5 floats per WG to partial_buf. */
 /* §7.8b dark_ref reduce — multi-WG partial sums.
  *
- * 2026-05-09: FP64 (cl_khr_fp64) accumulation throughout to mirror CPU's
- * `double` per-block w/r computation + sum accumulation (galosh_raw_cpu.c
- * lines 4697+).  LDS: 5 accumulators × 8B = 10 KB at WGSIZE=256, same
- * budget as prior FP32-Kahan path (= 5 × 2 × 4B).  Partial_buf written
- * as float (= consumer §7.8c re-aggregates in double internally). */
+ * 2026-05-09: FP64 accumulation to mirror CPU's `double` sums.
+ * 2026-07-11 [V2 cross-vendor]: FP64→Kahan-compensated FP32, verbatim
+ * back-port of the validated Vulkan o32_dark_ref_reduce_mwg.comp (Arc
+ * has no fp64).  Every accumulated quantity is a (sum, comp) float
+ * pair; per-WI accumulation = TwoSum, WG tree = Kahan-aware combine.
+ * partial_buf layout: [n_wg * 5 * 2] floats — SAME BYTE SIZE as the
+ * former [n_wg * 5] doubles (host allocation unchanged).
+ * Tukey weight math per block is plain float (inputs are float). */
 kernel void galosh_o32_dark_ref_reduce_mwg(
     global const float *restrict in_gat_full,
     global const float *restrict raw,
     const int width,
     const int height,
     global const float *restrict params,    /* read params[P_S_SCALE] */
-    global       double *restrict partial_buf)  /* [n_wg * 5] doubles */
+    global       float *restrict partial_buf)  /* [n_wg * 5 * 2] (sum,comp) */
 {
   const int gid = get_global_id(0);
   const int lid = get_local_id(0);
@@ -7533,8 +7586,8 @@ kernel void galosh_o32_dark_ref_reduce_mwg(
   const int wgsize = get_local_size(0);
   const int total_wis = get_global_size(0);
 
-  const double s_scale = (double)params[P_S_SCALE];
-  const double inv_s = 1.0 / fmax(s_scale, 1e-20);
+  const float s_scale = params[P_S_SCALE];
+  const float inv_s = 1.0f / fmax(s_scale, 1e-20f);
 
   /* BUG FIX 2026-05-09: was `(height-1)/2` / `(width-1)/2` which
    * undercounts by 1 row/col for even dims. */
@@ -7542,12 +7595,12 @@ kernel void galosh_o32_dark_ref_reduce_mwg(
   const int n_block_cols = width  / 2;
   const int total_blocks = n_block_rows * n_block_cols;
 
-  /* Per-WI accumulators in double (= matches CPU double sum_w0..3). */
-  double my_sw  = 0.0;
-  double my_sw0 = 0.0;
-  double my_sw1 = 0.0;
-  double my_sw2 = 0.0;
-  double my_sw3 = 0.0;
+  /* Per-WI Kahan accumulators (sum, comp). */
+  float sw_s  = 0.0f, sw_c  = 0.0f;
+  float sw0_s = 0.0f, sw0_c = 0.0f;
+  float sw1_s = 0.0f, sw1_c = 0.0f;
+  float sw2_s = 0.0f, sw2_c = 0.0f;
+  float sw3_s = 0.0f, sw3_c = 0.0f;
 
   for(int bi = gid; bi < total_blocks; bi += total_wis)
   {
@@ -7568,91 +7621,104 @@ kernel void galosh_o32_dark_ref_reduce_mwg(
     const float iv1 = raw[(size_t)(br + 1) * width + bc      ];
     const float iv2 = raw[(size_t)br       * width + (bc + 1)];
     const float iv3 = raw[(size_t)(br + 1) * width + (bc + 1)];
-    /* L_raw / r / r² / w in DOUBLE to mirror CPU. */
-    const double L_raw = ((double)iv0 + (double)iv1 + (double)iv2 + (double)iv3) * 0.25;
-    const double r  = L_raw * inv_s;
-    const double r2 = r * r;
-    const double w  = 1.0 / (1.0 + r2 * r2);
-    my_sw  += w;
-    my_sw0 += w * (double)g0;
-    my_sw1 += w * (double)g1;
-    my_sw2 += w * (double)g2;
-    my_sw3 += w * (double)g3;
+    /* Tukey-bisquare weight in FLOAT (only the ACCUMULATION was double). */
+    const float L_raw = (iv0 + iv1 + iv2 + iv3) * 0.25f;
+    const float r  = L_raw * inv_s;
+    const float r2 = r * r;
+    const float w  = 1.0f / (1.0f + r2 * r2);
+    galosh_kacc(&sw_s,  &sw_c,  w);
+    galosh_kacc(&sw0_s, &sw0_c, w * g0);
+    galosh_kacc(&sw1_s, &sw1_c, w * g1);
+    galosh_kacc(&sw2_s, &sw2_c, w * g2);
+    galosh_kacc(&sw3_s, &sw3_c, w * g3);
   }
 
-  /* WG-level tree reduction in double LDS.  LDS: 5 doubles × WGSIZE × 8B
-   * = 256 × 5 × 8 = 10 KB at WGSIZE=256, fits 32 KB ISP budget. */
-  local double lds[O32_DR_MWG_WGSIZE * 5];
-  lds[lid * 5 + 0] = my_sw;
-  lds[lid * 5 + 1] = my_sw0;
-  lds[lid * 5 + 2] = my_sw1;
-  lds[lid * 5 + 3] = my_sw2;
-  lds[lid * 5 + 4] = my_sw3;
+  /* WG-level tree reduction: (sum, comp) float pairs.  LDS: 5 × 2 floats
+   * × WGSIZE × 4B = 10 KB at WGSIZE=256 (same as the double version). */
+  local float lds_s[O32_DR_MWG_WGSIZE * 5];
+  local float lds_c[O32_DR_MWG_WGSIZE * 5];
+  lds_s[lid * 5 + 0] = sw_s;  lds_c[lid * 5 + 0] = sw_c;
+  lds_s[lid * 5 + 1] = sw0_s; lds_c[lid * 5 + 1] = sw0_c;
+  lds_s[lid * 5 + 2] = sw1_s; lds_c[lid * 5 + 2] = sw1_c;
+  lds_s[lid * 5 + 3] = sw2_s; lds_c[lid * 5 + 3] = sw2_c;
+  lds_s[lid * 5 + 4] = sw3_s; lds_c[lid * 5 + 4] = sw3_c;
   barrier(CLK_LOCAL_MEM_FENCE);
 
   for(int s = wgsize / 2; s > 0; s >>= 1)
   {
     if(lid < s)
     {
-      lds[lid * 5 + 0] += lds[(lid + s) * 5 + 0];
-      lds[lid * 5 + 1] += lds[(lid + s) * 5 + 1];
-      lds[lid * 5 + 2] += lds[(lid + s) * 5 + 2];
-      lds[lid * 5 + 3] += lds[(lid + s) * 5 + 3];
-      lds[lid * 5 + 4] += lds[(lid + s) * 5 + 4];
+      for(int q = 0; q < 5; q++)
+      {
+        float as = lds_s[lid * 5 + q], ac = lds_c[lid * 5 + q];
+        galosh_kcombine(&as, &ac, lds_s[(lid + s) * 5 + q], lds_c[(lid + s) * 5 + q]);
+        lds_s[lid * 5 + q] = as; lds_c[lid * 5 + q] = ac;
+      }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
 
   if(lid == 0)
   {
-    /* Write final partials as double (= consumer §7.8c reads as double).
-     * Casting to float here would destroy the FP64 accumulation precision. */
-    partial_buf[wgid * 5 + 0] = lds[0];
-    partial_buf[wgid * 5 + 1] = lds[1];
-    partial_buf[wgid * 5 + 2] = lds[2];
-    partial_buf[wgid * 5 + 3] = lds[3];
-    partial_buf[wgid * 5 + 4] = lds[4];
+    /* Write final partials as (sum, comp) pairs — consumer §7.8c combines
+     * the pairs Kahan-aware.  Collapsing to a single float here would
+     * discard the compensation the whole scheme exists for. */
+    for(int q = 0; q < 5; q++)
+    {
+      partial_buf[wgid * 10 + q * 2 + 0] = lds_s[q];
+      partial_buf[wgid * 10 + q * 2 + 1] = lds_c[q];
+    }
   }
 }
 
 
-/* §7.8c: aggregate partials → dark_ref[0..3].  Single WI, FP64 throughout.
- * Reads partial_buf as double (= preserves §7.8b's FP64 accumulation),
- * sums in double, divides in double, casts final dark_ref to float for
- * params (consumed by §6.1 + §6.15 as float, which is fine since the
- * critical precision is in the IRLS sum/divide path). */
+/* §7.8c: aggregate partials → dark_ref[0..3].  Single WI.
+ * 2026-07-11 [V2 cross-vendor]: reads the §7.8b Kahan (sum, comp) float
+ * pairs, combines them Kahan-aware, collapses each quantity to
+ * sum + comp only at the end (back-port of the Vulkan twin). */
 kernel void galosh_o32_dark_ref_finalize_mwg(
-    global const double *restrict partial_buf,
+    global const float *restrict partial_buf,   /* [n_wg * 5 * 2] (sum,comp) */
     const int n_wg,
     global       float *restrict params)
 {
   if(get_global_id(0) != 0) return;
-  double sw = 0.0, sw0 = 0.0, sw1 = 0.0, sw2 = 0.0, sw3 = 0.0;
+  float sw_s  = 0.0f, sw_c  = 0.0f;
+  float sw0_s = 0.0f, sw0_c = 0.0f;
+  float sw1_s = 0.0f, sw1_c = 0.0f;
+  float sw2_s = 0.0f, sw2_c = 0.0f;
+  float sw3_s = 0.0f, sw3_c = 0.0f;
   for(int i = 0; i < n_wg; i++)
   {
-    sw  += partial_buf[i * 5 + 0];
-    sw0 += partial_buf[i * 5 + 1];
-    sw1 += partial_buf[i * 5 + 2];
-    sw2 += partial_buf[i * 5 + 3];
-    sw3 += partial_buf[i * 5 + 4];
+    galosh_kcombine(&sw_s,  &sw_c,  partial_buf[i * 10 + 0], partial_buf[i * 10 + 1]);
+    galosh_kcombine(&sw0_s, &sw0_c, partial_buf[i * 10 + 2], partial_buf[i * 10 + 3]);
+    galosh_kcombine(&sw1_s, &sw1_c, partial_buf[i * 10 + 4], partial_buf[i * 10 + 5]);
+    galosh_kcombine(&sw2_s, &sw2_c, partial_buf[i * 10 + 6], partial_buf[i * 10 + 7]);
+    galosh_kcombine(&sw3_s, &sw3_c, partial_buf[i * 10 + 8], partial_buf[i * 10 + 9]);
   }
-  const double inv_sw = 1.0 / fmax(sw, 1e-20);
-  params[P_DARK_REF0 + 0] = (float)(sw0 * inv_sw);
-  params[P_DARK_REF0 + 1] = (float)(sw1 * inv_sw);
-  params[P_DARK_REF0 + 2] = (float)(sw2 * inv_sw);
-  params[P_DARK_REF0 + 3] = (float)(sw3 * inv_sw);
+  const float sw  = sw_s  + sw_c;
+  const float sw0 = sw0_s + sw0_c;
+  const float sw1 = sw1_s + sw1_c;
+  const float sw2 = sw2_s + sw2_c;
+  const float sw3 = sw3_s + sw3_c;
+  const float inv_sw = 1.0f / fmax(sw, 1e-20f);
+  params[P_DARK_REF0 + 0] = sw0 * inv_sw;
+  params[P_DARK_REF0 + 1] = sw1 * inv_sw;
+  params[P_DARK_REF0 + 2] = sw2 * inv_sw;
+  params[P_DARK_REF0 + 3] = sw3 * inv_sw;
 }
 
 
 /* §7.8d: per-WI scan blocks for residual std, WG reduce, write partials.
- * FP64 throughout to mirror CPU + preserve precision through to §7.8e. */
+ * 2026-07-11 [V2 cross-vendor]: FP64→Kahan-compensated FP32, back-port
+ * of the Vulkan o32_dark_resid_reduce_mwg.comp.  partial_resid_buf
+ * layout: [n_wg * 2 * 2] floats — same bytes as [n_wg * 2] doubles. */
 kernel void galosh_o32_dark_resid_reduce_mwg(
     global const float *restrict in_gat_full,
     global const float *restrict raw,
     const int width,
     const int height,
     global const float *restrict params,
-    global       double *restrict partial_resid_buf)  /* [n_wg * 2] doubles */
+    global       float *restrict partial_resid_buf)  /* [n_wg * 2 * 2] (sum,comp) */
 {
   const int gid = get_global_id(0);
   const int lid = get_local_id(0);
@@ -7660,15 +7726,12 @@ kernel void galosh_o32_dark_resid_reduce_mwg(
   const int wgsize = get_local_size(0);
   const int total_wis = get_global_size(0);
 
-  /* s_scale and inv_s in double (= mirror CPU galosh_raw_cpu.c line 4696
-   * `const double inv_s = 1.0 / fmax(s_scale, 1e-20);`).
-   * dr* read as float, cast to double for residual computation. */
-  const double s_scale = (double)params[P_S_SCALE];
-  const double inv_s = 1.0 / fmax(s_scale, 1e-20);
-  const double dr0_d = (double)params[P_DARK_REF0 + 0];
-  const double dr1_d = (double)params[P_DARK_REF0 + 1];
-  const double dr2_d = (double)params[P_DARK_REF0 + 2];
-  const double dr3_d = (double)params[P_DARK_REF0 + 3];
+  const float s_scale = params[P_S_SCALE];
+  const float inv_s = 1.0f / fmax(s_scale, 1e-20f);
+  const float dr0 = params[P_DARK_REF0 + 0];
+  const float dr1 = params[P_DARK_REF0 + 1];
+  const float dr2 = params[P_DARK_REF0 + 2];
+  const float dr3 = params[P_DARK_REF0 + 3];
 
   /* BUG FIX 2026-05-09: was `(height-1)/2` / `(width-1)/2` which
    * undercounts by 1 row/col for even dims; same fix as §7.8b. */
@@ -7676,9 +7739,9 @@ kernel void galosh_o32_dark_resid_reduce_mwg(
   const int n_block_cols = width  / 2;
   const int total_blocks = n_block_rows * n_block_cols;
 
-  /* Per-WI accumulators in double (= mirror CPU). */
-  double my_swr = 0.0;
-  double my_sww = 0.0;
+  /* Per-WI Kahan accumulators (sum, comp). */
+  float swr_s = 0.0f, swr_c = 0.0f;
+  float sww_s = 0.0f, sww_c = 0.0f;
 
   for(int bi = gid; bi < total_blocks; bi += total_wis)
   {
@@ -7699,65 +7762,74 @@ kernel void galosh_o32_dark_resid_reduce_mwg(
     const float iv1 = raw[(size_t)(br + 1) * width + bc      ];
     const float iv2 = raw[(size_t)br       * width + (bc + 1)];
     const float iv3 = raw[(size_t)(br + 1) * width + (bc + 1)];
-    const double L_raw = ((double)iv0 + (double)iv1 + (double)iv2 + (double)iv3) * 0.25;
-    const double r  = L_raw * inv_s;
-    const double r2 = r * r;
-    const double w  = 1.0 / (1.0 + r2 * r2);
-    const double d0 = (double)g0 - dr0_d, d1 = (double)g1 - dr1_d;
-    const double d2 = (double)g2 - dr2_d, d3 = (double)g3 - dr3_d;
-    const double resid2 = d0*d0 + d1*d1 + d2*d2 + d3*d3;
-    my_sww += w;
-    my_swr += w * resid2 * 0.25;
+    const float L_raw = (iv0 + iv1 + iv2 + iv3) * 0.25f;
+    const float r  = L_raw * inv_s;
+    const float r2 = r * r;
+    const float w  = 1.0f / (1.0f + r2 * r2);
+    const float d0 = g0 - dr0, d1 = g1 - dr1;
+    const float d2 = g2 - dr2, d3 = g3 - dr3;
+    const float resid2 = d0*d0 + d1*d1 + d2*d2 + d3*d3;
+    galosh_kacc(&sww_s, &sww_c, w);
+    galosh_kacc(&swr_s, &swr_c, w * resid2 * 0.25f);
   }
 
-  /* WG-level tree reduction in double LDS.  LDS: 2 doubles × WGSIZE × 8B
-   * = 256 × 2 × 8 = 4 KB at WGSIZE=256, well under 32 KB ISP budget. */
-  local double lds[O32_DR_MWG_WGSIZE * 2];
-  lds[lid * 2 + 0] = my_swr;
-  lds[lid * 2 + 1] = my_sww;
+  /* WG-level tree reduction: (sum, comp) float pairs. */
+  local float lds_s[O32_DR_MWG_WGSIZE * 2];
+  local float lds_c[O32_DR_MWG_WGSIZE * 2];
+  lds_s[lid * 2 + 0] = swr_s; lds_c[lid * 2 + 0] = swr_c;
+  lds_s[lid * 2 + 1] = sww_s; lds_c[lid * 2 + 1] = sww_c;
   barrier(CLK_LOCAL_MEM_FENCE);
   for(int s = wgsize / 2; s > 0; s >>= 1)
   {
     if(lid < s)
     {
-      lds[lid * 2 + 0] += lds[(lid + s) * 2 + 0];
-      lds[lid * 2 + 1] += lds[(lid + s) * 2 + 1];
+      for(int q = 0; q < 2; q++)
+      {
+        float as = lds_s[lid * 2 + q], ac = lds_c[lid * 2 + q];
+        galosh_kcombine(&as, &ac, lds_s[(lid + s) * 2 + q], lds_c[(lid + s) * 2 + q]);
+        lds_s[lid * 2 + q] = as; lds_c[lid * 2 + q] = ac;
+      }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
   if(lid == 0)
   {
-    /* Write as double to preserve FP64 precision through to §7.8e finalize. */
-    partial_resid_buf[wgid * 2 + 0] = lds[0];
-    partial_resid_buf[wgid * 2 + 1] = lds[1];
+    /* Write (sum, comp) pairs so §7.8e can finish the compensated sum. */
+    partial_resid_buf[wgid * 4 + 0] = lds_s[0];
+    partial_resid_buf[wgid * 4 + 1] = lds_c[0];
+    partial_resid_buf[wgid * 4 + 2] = lds_s[1];
+    partial_resid_buf[wgid * 4 + 3] = lds_c[1];
   }
 }
 
 
-/* §7.8e: aggregate residual partials, update s_scale.  Single WI, FP64 throughout.
- * Mirrors CPU galosh_raw_cpu.c lines 4769-4774 (= double measured_std,
- * double ratio, double s_scale update). */
+/* §7.8e: aggregate residual partials, update s_scale.  Single WI.
+ * 2026-07-11 [V2 cross-vendor]: Kahan pair aggregation + float finish
+ * (back-port of the Vulkan o32_dark_resid_finalize_mwg.comp). */
 kernel void galosh_o32_dark_resid_finalize_mwg(
-    global const double *restrict partial_resid_buf,
+    global const float *restrict partial_resid_buf,  /* [n_wg * 2 * 2] (sum,comp) */
     const int n_wg,
     const float s_min,
     const float s_max,
     global       float *restrict params)
 {
   if(get_global_id(0) != 0) return;
-  double swr = 0.0, sww = 0.0;
+  float swr_s = 0.0f, swr_c = 0.0f;
+  float sww_s = 0.0f, sww_c = 0.0f;
   for(int i = 0; i < n_wg; i++)
   {
-    swr += partial_resid_buf[i * 2 + 0];
-    sww += partial_resid_buf[i * 2 + 1];
+    galosh_kcombine(&swr_s, &swr_c, partial_resid_buf[i * 4 + 0], partial_resid_buf[i * 4 + 1]);
+    galosh_kcombine(&sww_s, &sww_c, partial_resid_buf[i * 4 + 2], partial_resid_buf[i * 4 + 3]);
   }
-  const double inv_sw2 = 1.0 / fmax(sww, 1e-20);
-  const double measured_std = sqrt(fmax(swr * inv_sw2, 1e-20));
-  const double ratio = 1.0 / measured_std;
-  double new_s = (double)params[P_S_SCALE] * sqrt(ratio);
-  if(new_s < (double)s_min) new_s = (double)s_min;
-  if(new_s > (double)s_max) new_s = (double)s_max;
-  params[P_S_SCALE] = (float)new_s;
+  const float swr = swr_s + swr_c;
+  const float sww = sww_s + sww_c;
+  const float inv_sw2 = 1.0f / fmax(sww, 1e-20f);
+  const float measured_std = sqrt(fmax(swr * inv_sw2, 1e-20f));
+  const float ratio = 1.0f / measured_std;
+  float new_s = params[P_S_SCALE] * sqrt(ratio);
+  if(new_s < s_min) new_s = s_min;
+  if(new_s > s_max) new_s = s_max;
+  params[P_S_SCALE] = new_s;
 }
 
 

@@ -1487,8 +1487,10 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         clSetKernelArg(k_o32_loess_3p_tiled, 7, sizeof(int), &hw);
         clSetKernelArg(k_o32_loess_3p_tiled, 8, sizeof(int), &hh);
         clSetKernelArg(k_o32_loess_3p_tiled, 9, sizeof(float), &loess_strength);
+        /* local 16×16 = 256 WIs: must equal GALOSH_O_LOESS_TILE_DIM² (24×24
+         * = 576 exceeded AMD CL max WG 256 → silent -54, kernel never ran) */
         dispatch_2d_named(queue, k_o32_loess_3p_tiled,
-                          align_up(hw, 24), align_up(hh, 24), 24, 24,
+                          align_up(hw, 16), align_up(hh, 16), 16, 16,
                           "K_O32_7e LOESS_h_t");
         /* LOESS quarter-res: (L_q, C_q) -> C_loess_q */
         clSetKernelArg(k_o32_loess_3p_tiled, 0, sizeof(cl_mem), &o32_L_q);
@@ -1501,7 +1503,7 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         clSetKernelArg(k_o32_loess_3p_tiled, 7, sizeof(int), &cq_w);
         clSetKernelArg(k_o32_loess_3p_tiled, 8, sizeof(int), &cq_h);
         dispatch_2d_named(queue, k_o32_loess_3p_tiled,
-                          align_up(cq_w, 24), align_up(cq_h, 24), 24, 24,
+                          align_up(cq_w, 16), align_up(cq_h, 16), 16, 16,
                           "K_O32_7f LOESS_q_t");
         /* LOESS eighth-res: (L_e, C_e) -> C_loess_e */
         clSetKernelArg(k_o32_loess_3p_tiled, 0, sizeof(cl_mem), &o32_L_e);
@@ -1514,7 +1516,7 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         clSetKernelArg(k_o32_loess_3p_tiled, 7, sizeof(int), &ce_w);
         clSetKernelArg(k_o32_loess_3p_tiled, 8, sizeof(int), &ce_h);
         dispatch_2d_named(queue, k_o32_loess_3p_tiled,
-                          align_up(ce_w, 24), align_up(ce_h, 24), 24, 24,
+                          align_up(ce_w, 16), align_up(ce_h, 16), 16, 16,
                           "K_O32_7g LOESS_e_t");
 
         /* §6.13 crop L_h_den (chsize) -> L_for_q (kq stride) for q→h K16. */
