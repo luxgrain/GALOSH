@@ -58,6 +58,7 @@ static VkDescriptorPool g_dpool;
 static VkQueryPool      g_qpool;
 static uint32_t         g_ts_n = 0;
 static const char      *g_ts_label[256];
+static float            g_band_rate_ms = 0.0f;  /* learned pass12 ms/WG-row */
 
 typedef struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize size; } Buf;
 
@@ -113,6 +114,7 @@ enum {
    * the pyramid-internal sites.  ONE shader set, site-selected — never
    * per-GPU. */
   K_BOX2_H16, K_CROP_H16, K_LOESS_T_G16, K_K16_F16, K_FASTUP_F16,
+  K_SIGMA_HIST, K_SIGMA_FIN,   /* [iGPU-opt] two-stage sigma_per_cfa */
   K_COUNT
 };
 static Kern g_k[K_COUNT] = {
@@ -154,6 +156,8 @@ static Kern g_k[K_COUNT] = {
   [K_LOESS_T_G16]= { "o32_loess_chroma_3p_tiled_g16", 7, 12 },
   [K_K16_F16]    = { "o32_k16_jbu_3p_f16",            7, 12 },
   [K_FASTUP_F16] = { "o32_fastup_3p_f16",             7, 12 },
+  [K_SIGMA_HIST] = { "o32_sigma_hist_mwg",            2, 12 },
+  [K_SIGMA_FIN]  = { "o32_sigma_fin_mwg",             2,  0 },
 };
 
 static char g_exe_dir[1024];
@@ -305,7 +309,10 @@ static void cb_submit_wait(VkCommandBuffer cb);
  * Timestamps: one pair spanning first..last band.
  * JP: バンド=サブミッション境界（TDR の preemption 単位）。待ちは最後に
  * 1 回だけなので高速 GPU への追加コストは実質ゼロ。 */
-static void band_piece(int kid, VkDescriptorSet ds, const PcW *pc, int npc,
+/* Queue one band piece as its OWN submission (= TDR preemption unit)
+ * WITHOUT waiting — caller decides when to vkQueueWaitIdle.  Returns the
+ * command buffer for later freeing. */
+static VkCommandBuffer band_piece(int kid, VkDescriptorSet ds, const PcW *pc, int npc,
                        uint32_t gx, uint32_t y0, uint32_t rows,
                        int ts_open, int ts_close, const char *label)
 {
@@ -324,7 +331,11 @@ static void band_piece(int kid, VkDescriptorSet ds, const PcW *pc, int npc,
   if(ts_close && g_ts_n < 255)
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qpool, g_ts_n + 1);
   barrier(cb);
-  cb_submit_wait(cb);
+  CHECK(vkEndCommandBuffer(cb));
+  VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                      .commandBufferCount = 1, .pCommandBuffers = &cb };
+  CHECK(vkQueueSubmit(g_q, 1, &si, VK_NULL_HANDLE));
+  return cb;
 }
 
 /* Watchdog-aware ADAPTIVE banding: submit the first 1/8 of the workgroup
@@ -349,29 +360,58 @@ static void dispatch_k_banded(int kid, VkDescriptorSet ds,
    * JP: プローブは固定 2 タイル行。極端ケースでもプローブ自体が
    * 監視時間を踏み抜かないことを構成的に保証。 */
   const uint32_t probe_rows = (gy > 2) ? 2u : gy;
-  const clock_t t0 = clock();
-  band_piece(kid, ds, pc, npc, gx, 0, probe_rows, 1, probe_rows >= gy, label);
-  const double probe_ms = 1000.0 * (double)(clock() - t0) / CLOCKS_PER_SEC;
-  if(probe_rows >= gy) { if(g_ts_n < 255) g_ts_n += 2; return; }
+  VkCommandBuffer cbs[64];
+  uint32_t ncb = 0;
+  const clock_t t_all = clock();
+  double per_row_ms;
 
-  const uint32_t rest_y0 = probe_rows, rest = gy - probe_rows;
-  const double per_row_ms = probe_ms / (double)probe_rows;
-  const double est_rest_ms = per_row_ms * (double)rest;
-  /* fast path: whole remainder comfortably under the watchdog -> 1 piece;
-   * else split so each piece targets ~800 ms (margin under ~2 s TDR). */
-  uint32_t pieces = 1;
-  if(est_rest_ms > 800.0)
+  if(g_band_rate_ms > 0.0f)
   {
-    pieces = (uint32_t)(est_rest_ms / 800.0) + 1;
-    if(pieces > rest) pieces = rest;
+    /* [iGPU-opt] rate learned from a previous frame (video state): no
+     * probe round-trip at all — every piece queued back-to-back, ONE
+     * wait at the end.  レート既知ならプローブ往復ゼロ。 */
+    per_row_ms = (double)g_band_rate_ms;
+    const double est_ms = per_row_ms * (double)gy;
+    uint32_t pieces = (est_ms > 800.0) ? (uint32_t)(est_ms / 800.0) + 1 : 1;
+    if(pieces > gy) pieces = gy;
+    if(pieces > 64) pieces = 64;
+    for(uint32_t p = 0; p < pieces; p++)
+    {
+      const uint32_t a = gy * p / pieces, b = gy * (p + 1) / pieces;
+      if(b > a) cbs[ncb++] = band_piece(kid, ds, pc, npc, gx, a, b - a,
+                                        p == 0, p == pieces - 1, label);
+    }
+    CHECK(vkQueueWaitIdle(g_q));
   }
-  for(uint32_t p = 0; p < pieces; p++)
+  else
   {
-    const uint32_t a = rest_y0 + rest * p / pieces;
-    const uint32_t b = rest_y0 + rest * (p + 1) / pieces;
-    if(b > a) band_piece(kid, ds, pc, npc, gx, a, b - a,
-                         0, p == pieces - 1, label);
+    /* unknown rate: bounded 2-row probe (sync), then queue the rest */
+    cbs[ncb++] = band_piece(kid, ds, pc, npc, gx, 0, probe_rows, 1,
+                            probe_rows >= gy, label);
+    CHECK(vkQueueWaitIdle(g_q));
+    const double probe_ms = 1000.0 * (double)(clock() - t_all) / CLOCKS_PER_SEC;
+    if(probe_rows < gy)
+    {
+      const uint32_t rest_y0 = probe_rows, rest = gy - probe_rows;
+      per_row_ms = probe_ms / (double)probe_rows;
+      const double est_rest_ms = per_row_ms * (double)rest;
+      uint32_t pieces = (est_rest_ms > 800.0) ? (uint32_t)(est_rest_ms / 800.0) + 1 : 1;
+      if(pieces > rest) pieces = rest;
+      if(pieces > 63) pieces = 63;
+      for(uint32_t p = 0; p < pieces; p++)
+      {
+        const uint32_t a = rest_y0 + rest * p / pieces;
+        const uint32_t b = rest_y0 + rest * (p + 1) / pieces;
+        if(b > a) cbs[ncb++] = band_piece(kid, ds, pc, npc, gx, a, b - a,
+                                          0, p == pieces - 1, label);
+      }
+      CHECK(vkQueueWaitIdle(g_q));
+    }
   }
+  vkFreeCommandBuffers(g_dev, g_pool, ncb, cbs);
+  /* learn/refresh the rate for the next frame (written to the state file) */
+  const double total_ms = 1000.0 * (double)(clock() - t_all) / CLOCKS_PER_SEC;
+  g_band_rate_ms = (float)(total_ms / (double)gy);
   if(g_ts_n < 255) g_ts_n += 2;
 }
 
@@ -536,13 +576,51 @@ int main(int argc, char **argv)
   uint32_t nd = 0; vkEnumeratePhysicalDevices(g_inst, &nd, NULL);
   VkPhysicalDevice pds[8]; if(nd > 8) nd = 8;
   vkEnumeratePhysicalDevices(g_inst, &nd, pds);
-  int want = -1; { const char *e = getenv("GALOSH_VK_DEVICE"); if(e) want = atoi(e); }
-  uint32_t di = 0;
+  /* vkEnumeratePhysicalDevices ORDER IS NOT STABLE (observed: the list
+   * reordered after a TDR device reset).  Build a DETERMINISTIC order:
+   * discrete GPUs first, then integrated, then the rest; ties by name.
+   * GALOSH_VK_DEVICE accepts an index into THIS sorted order, or a
+   * case-insensitive name substring ("NVIDIA" / "Radeon" / "Arc").
+   * JP: 列挙順は無保証（TDR リセットで実際に入れ替わった）→ 決定的
+   * ソート＋名前マッチ選択。 */
+  VkPhysicalDeviceProperties pp[8];
+  uint32_t order[8];
   for(uint32_t i = 0; i < nd; i++)
-  {
-    VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pds[i], &p);
-    if(want >= 0) { if((int)i == want) { di = i; break; } }
-    else if(p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { di = i; break; }
+  { vkGetPhysicalDeviceProperties(pds[i], &pp[i]); order[i] = i; }
+  for(uint32_t a = 0; a + 1 < nd; a++)
+    for(uint32_t b = a + 1; b < nd; b++)
+    {
+      #define TYPE_RANK(t) ((t) == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 0 : \
+                            (t) == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 2)
+      const int ra = TYPE_RANK(pp[order[a]].deviceType);
+      const int rb = TYPE_RANK(pp[order[b]].deviceType);
+      if(rb < ra || (rb == ra &&
+         strcmp(pp[order[b]].deviceName, pp[order[a]].deviceName) < 0))
+      { uint32_t t = order[a]; order[a] = order[b]; order[b] = t; }
+    }
+  uint32_t di = order[0];
+  { const char *e = getenv("GALOSH_VK_DEVICE");
+    if(e && e[0])
+    {
+      if(e[0] >= '0' && e[0] <= '9')
+      { uint32_t w = (uint32_t)atoi(e); if(w < nd) di = order[w]; }
+      else
+      {
+        for(uint32_t i = 0; i < nd; i++)
+        {
+          /* case-insensitive substring match on the device name */
+          const char *hay = pp[i].deviceName;
+          for(const char *h = hay; *h; h++)
+          {
+            const char *n = e, *q = h;
+            while(*n && *q &&
+                  ((*n | 32) == (*q | 32))) { n++; q++; }
+            if(!*n) { di = i; goto dev_found; }
+          }
+        }
+        dev_found: ;
+      }
+    }
   }
   g_pd = pds[di];
   vkGetPhysicalDeviceProperties(g_pd, &g_props);
@@ -608,6 +686,7 @@ int main(int argc, char **argv)
   Buf part_r  = DEVBUF(N_REDUCE_WG * 2 * 2 * sizeof(float));  /* Kahan (sum,comp) f32 pairs */
   Buf blk_m   = DEVBUF(ne_total * 4), blk_v = DEVBUF(ne_total * 4);
   Buf dt_hist = DEVBUF(4096 * 4), dl_hist = DEVBUF(4096 * 4);
+  Buf sigma_hist = DEVBUF(4 * 4096 * 4);   /* [iGPU-opt] two-stage sigma */
   Buf in_gat  = DEVBUF(full_f);
   /* [FP16 v1] contract buffers = f16 storage (half size); C*_h stay f32. */
   Buf L_cs    = DEVBUF(full_h16), L_cs_den = DEVBUF(full_h16);
@@ -653,6 +732,9 @@ int main(int argc, char **argv)
   VkDescriptorSet s_lut_fin  = SET(K_LUT_FIN, &lut_d, &lut_p);
   VkDescriptorSet s_gat      = SET(K_GAT_FWD, &raw, &in_gat, &ch0, &ch1, &ch2, &ch3, &params);
   VkDescriptorSet s_sigma    = SET(K_SIGMA_CFA, &in_gat, &params);
+  VkDescriptorSet s_sig_h    = SET(K_SIGMA_HIST, &in_gat, &sigma_hist);
+  VkDescriptorSet s_sig_f    = SET(K_SIGMA_FIN, &sigma_hist, &params);
+  (void)s_sigma;   /* single-WG original kept for A/B; two-stage is production */
   VkDescriptorSet s_unified  = SET(K_UNIFIED, &params);
   VkDescriptorSet s_norm     = SET(K_NORMALIZE, &in_gat, &ch0, &ch1, &ch2, &ch3, &params);
   VkDescriptorSet s_dr_red   = SET(K_DR_REDUCE, &in_gat, &raw, &params, &part);
@@ -706,7 +788,14 @@ int main(int argc, char **argv)
   if(noise_state_path)
   {
     FILE *sf = fopen(noise_state_path, "r");
-    if(sf) { if(fscanf(sf, "%f %f %d", &st_a, &st_s, &st_n) != 3) st_n = -1; fclose(sf); }
+    if(sf)
+    {
+      if(fscanf(sf, "%f %f %d", &st_a, &st_s, &st_n) != 3) st_n = -1;
+      /* optional 2nd line: learned banding rate (CPU exe ignores it) */
+      float r = 0.0f;
+      if(fscanf(sf, " rate %f", &r) == 1 && r > 0.0f) g_band_rate_ms = r;
+      fclose(sf);
+    }
   }
   const int have_state = (st_n >= 0 && st_a > 0.0f);
   int hold_frame = 0;   /* 1 = use stored model, skip P0 (+ LUT if cached) */
@@ -755,17 +844,21 @@ int main(int argc, char **argv)
   cb_submit_wait(cb);
   }  /* !hold_frame */
 
-  /* HOST SYNC #1: decide (alpha, sigma_sq) — fit / ext CLI / state / ema */
+  /* HOST SYNC #1: decide (alpha, sigma_sq) — fit / ext CLI / state / ema.
+   * [iGPU-opt] params writes are RECORDED into the merged SEG_BC command
+   * buffer via vkCmdUpdateBuffer instead of 3 synchronous staging submits
+   * (each waitIdle costs ~0.5-1 ms on a WDDM iGPU). */
   float alpha, sigma_sq;
   int   new_frames_since_fit = 0;
+  int   pend_trio = 0;
+  float trio_v[3];
   if(hold_frame)
   {
     alpha = st_a; sigma_sq = st_s;
     new_frames_since_fit = st_n + 1;
-    float trio[3] = { alpha, sigma_sq, sigma_sq / fmaxf(alpha, 1e-12f) };
-    upload(&params, &trio[0], 4, P_ALPHA * 4);
-    upload(&params, &trio[1], 4, P_SIGMA_SQ * 4);
-    upload(&params, &trio[2], 4, P_S_SCALE * 4);
+    trio_v[0] = alpha; trio_v[1] = sigma_sq;
+    trio_v[2] = sigma_sq / fmaxf(alpha, 1e-12f);
+    pend_trio = 1;
     fprintf(stderr, "[vk] noise HOLD (frames_since_fit=%d): alpha=%.8f sigma_sq=%.10f\n",
             new_frames_since_fit, alpha, sigma_sq);
   }
@@ -782,10 +875,9 @@ int main(int argc, char **argv)
     }
     if(ext_model || ema_beta > 0.0f)
     {
-      float trio[3] = { alpha, sigma_sq, sigma_sq / fmaxf(alpha, 1e-12f) };
-      upload(&params, &trio[0], 4, P_ALPHA * 4);
-      upload(&params, &trio[1], 4, P_SIGMA_SQ * 4);
-      upload(&params, &trio[2], 4, P_S_SCALE * 4);
+      trio_v[0] = alpha; trio_v[1] = sigma_sq;
+      trio_v[2] = sigma_sq / fmaxf(alpha, 1e-12f);
+      pend_trio = 1;
     }
     fprintf(stderr, "[vk] Phase 0 noise est%s: alpha=%.6f sigma_sq=%.8f\n",
             ext_model ? " OVERRIDE" : (ema_beta > 0.0f ? " EMA" : ""), alpha, sigma_sq);
@@ -802,17 +894,40 @@ int main(int argc, char **argv)
       float *tmp = malloc((GAT_LUT_SIZE * 2 + 8) * 4);
       if(fread(tmp, 4, GAT_LUT_SIZE * 2 + 8, cf) == (size_t)(GAT_LUT_SIZE * 2 + 8))
       {
-        upload(&lut_d, tmp, GAT_LUT_SIZE * 4, 0);
-        upload(&lut_x, tmp + GAT_LUT_SIZE, GAT_LUT_SIZE * 4, 0);
-        upload(&lut_p, tmp + 2 * GAT_LUT_SIZE, 8 * 4, 0);
+        /* stage all three regions once; copies are recorded in SEG_BC
+         * (staging is not reused until after that CB completes). */
+        memcpy((char *)g_stg_map,         tmp,                     GAT_LUT_SIZE * 4);
+        memcpy((char *)g_stg_map + 16384, tmp + GAT_LUT_SIZE,      GAT_LUT_SIZE * 4);
+        memcpy((char *)g_stg_map + 32768, tmp + 2 * GAT_LUT_SIZE,  8 * 4);
         lut_from_cache = 1;
       }
       free(tmp); fclose(cf);
     }
   }
 
-  /* ================= SEG B: Phase 1 + LUT ================= */
+  /* ============ SEG BC: Phase 1 + LUT + IRLS + P2b + P3/P4 =============
+   * [iGPU-opt] merged into ONE submission: the pre-IRLS readback was
+   * already redundant (blueprint note 9), s_init and the trio are known
+   * at record time -> vkCmdUpdateBuffer inline.  Saves 4-6 waitIdle
+   * round-trips per frame (~0.5-1 ms each on a WDDM iGPU). */
   cb = cb_begin();
+  if(pend_trio)
+  {
+    vkCmdUpdateBuffer(cb, params.buf, P_ALPHA * 4,    4, &trio_v[0]);
+    vkCmdUpdateBuffer(cb, params.buf, P_SIGMA_SQ * 4, 4, &trio_v[1]);
+    vkCmdUpdateBuffer(cb, params.buf, P_S_SCALE * 4,  4, &trio_v[2]);
+    barrier(cb);
+  }
+  if(lut_from_cache)
+  {
+    VkBufferCopy c1 = { .srcOffset = 0,     .dstOffset = 0, .size = GAT_LUT_SIZE * 4 };
+    VkBufferCopy c2 = { .srcOffset = 16384, .dstOffset = 0, .size = GAT_LUT_SIZE * 4 };
+    VkBufferCopy c3 = { .srcOffset = 32768, .dstOffset = 0, .size = 8 * 4 };
+    vkCmdCopyBuffer(cb, g_stg.buf, lut_d.buf, 1, &c1);
+    vkCmdCopyBuffer(cb, g_stg.buf, lut_x.buf, 1, &c2);
+    vkCmdCopyBuffer(cb, g_stg.buf, lut_p.buf, 1, &c3);
+    barrier(cb);
+  }
   PCI(0, W); PCI(1, H);
   dispatch_k(cb, K_GAT_FWD, s_gat, pc, 2,
              (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_P1a gat_full");
@@ -822,21 +937,30 @@ int main(int argc, char **argv)
     dispatch_k(cb, K_LUT_FIN, s_lut_fin, NULL, 0, 1, 1, 1, "K_O32_P0d lut_finalize");
   }
   PCI(0, W); PCI(1, H);
-  dispatch_k(cb, K_SIGMA_CFA, s_sigma, pc, 2, 4, 1, 1, "K_O32_P1b sigma_cfa");
+  /* [iGPU-opt] two-stage sigma_per_cfa (bit-identical to the single-WG
+   * original: histogram counts are order-independent).  WG count scales
+   * with the row count (size-based, not vendor-based): each WG carries a
+   * fixed 2x4096-bin zero+flush overhead, so small frames use few WGs
+   * (1080p: 2/ch) while 4K/8K get the parallelism (4-8/ch). */
+  const int sigma_wg_per_ch = (hh / 512 > 8) ? 8 : (hh / 512 < 1 ? 1 : hh / 512);
+  vkCmdFillBuffer(cb, sigma_hist.buf, 0, 4 * 4096 * 4, 0); barrier(cb);
+  PCI(0, W); PCI(1, H); PCI(2, sigma_wg_per_ch);
+  dispatch_k(cb, K_SIGMA_HIST, s_sig_h, pc, 3, (uint32_t)(4 * sigma_wg_per_ch), 1, 1,
+             "K_O32_P1b sigma_hist");
+  dispatch_k(cb, K_SIGMA_FIN, s_sig_f, NULL, 0, 1, 1, 1, "K_O32_P1b2 sigma_fin");
   dispatch_k(cb, K_UNIFIED, s_unified, NULL, 0, 1, 1, 1, "K_O32_P1c unified");
   PCI(0, W); PCI(1, H);
   dispatch_k(cb, K_NORMALIZE, s_norm, pc, 2,
              (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_P1d normalize");
-  cb_submit_wait(cb);
 
-  /* HOST SYNC #2: seed IRLS scale (values from SYNC #1, ext-adjusted) */
+  /* IRLS scale seed — known at record time (SYNC#1 values), inline update
+   * (the OpenCL host's second readback was redundant: blueprint note 9). */
   const float a_for_s = fmaxf(alpha, 1e-12f);
   const float s_init  = sigma_sq / a_for_s;
   const float s_min   = 0.05f * s_init, s_max = 50.0f * s_init;
-  upload(&params, &s_init, 4, P_S_SCALE * 4);
+  vkCmdUpdateBuffer(cb, params.buf, P_S_SCALE * 4, 4, &s_init);
+  barrier(cb);
 
-  /* ================= SEG C: IRLS + P2b + P3-6 ================= */
-  cb = cb_begin();
   for(int it = 0; it <= 2; it++)
   {
     PCI(0, W); PCI(1, H);
@@ -870,7 +994,11 @@ int main(int argc, char **argv)
   PCI(0, W); PCI(1, H); PCI(2, hw);
   dispatch_k(cb, K_P6_FUSED, s_p6, pc, 3,
              (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "K_O32_6 L_pixel+L_h_den_fused");
-  cb_submit_wait(cb);
+  /* [iGPU-opt] P6 and SEG_D share one submission on the common path;
+   * dump/small-image paths split as needed. */
+  const int need_split = (dump_dir != NULL) ||
+                         (cq_w < 4 || cq_h < 4 || ce_w < 4 || ce_h < 4);
+  if(need_split) cb_submit_wait(cb);
 
   if(dump_dir)
   {
@@ -902,7 +1030,7 @@ int main(int argc, char **argv)
   }
 
   /* ================= SEG D: P7 pyramid + P8-10 ================= */
-  cb = cb_begin();
+  if(need_split) cb = cb_begin();   /* common path: continue the P6 CB */
   PCI(0, hw); PCI(1, hh);
   dispatch_k(cb, K_BOX2_H16, s_Lq, pc, 2,
              (uint32_t)AUP(cq_w, 16), (uint32_t)AUP(cq_h, 16), 1, "K_O32_7a L_q");
@@ -988,7 +1116,12 @@ write_phase:
   if(noise_state_path && strcmp(noise_mode, "fit") != 0)
   {
     FILE *sf = fopen(noise_state_path, "w");
-    if(sf) { fprintf(sf, "%.9g %.9g %d\n", alpha, sigma_sq, new_frames_since_fit); fclose(sf); }
+    if(sf)
+    {
+      fprintf(sf, "%.9g %.9g %d\n", alpha, sigma_sq, new_frames_since_fit);
+      if(g_band_rate_ms > 0.0f) fprintf(sf, "rate %.6g\n", g_band_rate_ms);
+      fclose(sf);
+    }
     if(!lut_from_cache && lut_cache[0])
     {
       float *tmp = malloc((GAT_LUT_SIZE * 2 + 8) * 4);
