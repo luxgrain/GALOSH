@@ -16,6 +16,7 @@ The pipeline phases (P0 blind fit … P10 inverse) are documented in
 | CPU FP32 `--f16-storage` | **binary16 at contract points (§5)** | f32 | oracle for the GPU FP16 port |
 | CPU INT32 "r32" (`galosh_raw_cpu_int.c`) | **Q11.20** int32 | int32 (no FP, no INT64) | fixed-point reference; the normative ISP dataflow |
 | GPU INT16 "i16" (`galosh_int_*.cl`, frozen) | **INT16 line buffers (§4)**, INT32 elsewhere | int32 | streaming-feasibility evidence: bit-exact vs r32 at INT32 storage (full frames, 2026-07-04) |
+| Vulkan GPU FP32 (`galosh_vk.exe`, `standalone/vk`, 43 shaders) | f32 + **FP16 contract v1 (§4)** site variants | f32 | performance path (2–19× vs OpenCL); cross-vendor verified 69.7–70.6 dB vs CPU FP32 |
 
 Rule of thumb: **storage precision ≪ compute precision**. Both 16-bit storage
 contracts (§4, §5) are near-lossless because every accumulation happens in
@@ -79,6 +80,11 @@ Measured storage-quantization cost: **77.3 dB (synthetic 1080p) / 82.6 dB
 transparent. A Vulkan implementation that rounds at exactly these points can
 be bit-parity tested against the oracle.
 
+[IMPLEMENTED 2026-07 (v0.3.0): the Vulkan engine (`standalone/vk`,
+`galosh_vk.exe`) ships contract v1 via f16 site shader variants (e.g.
+`o32_k16_jbu_3p_f16`, `o32_fastup_3p_f16`); CPU `--f16-storage` remains the
+oracle (77–83 dB); OpenCL stays FP32 storage.]
+
 ## 5. GAT inverse LUT / GAT 逆変換 LUT
 
 The exact unbiased inverse (Makitalo–Foi) is realized as a piecewise LUT
@@ -90,6 +96,10 @@ matter for ports:
   regardless of 1080p/4K) and depends ONLY on (α, σ²) → under the video
   noise-model amortization (`--noise=hold/every:N/ema`) the LUT is reused
   and its cost disappears from steady-state frames.
+  [2026-07-11: the 6.7 ms was measured on the pre-B7a OpenCL FP64 LUT
+  kernel; both backends are now FP64-free (B7a / be8b761) and the Vulkan
+  cost differs — the resolution-independence and `--noise` amortization
+  claims are unchanged.]
 - r32 keeps the LUT in Q11.20 with the same break-point structure
   (`galosh_raw_cpu_int.c` jinc/LUT sections mirror the FP32 piecewise
   definition, sign-preserving floors included).
@@ -120,6 +130,7 @@ matter for ports:
 - FP32 canonical + V2.0 flags: `standalone/galosh_raw_cpu.c`, `standalone/galosh_cpu.h`
 - Fixed-point reference (Q11.20): `standalone/galosh_raw_cpu_int.c`, `standalone/galosh_cpu_int.h`
 - INT16 streaming GPU (frozen evidence): `standalone/galosh_int_*.{clh,cl}`, `galosh_int_pipe_test.c`
-- FP32 GPU OpenCL (frozen, maintenance): `standalone/galosh_raw_gpu.c`, `standalone/galosh.cl`
+- FP32 GPU OpenCL (V1-feature darktable-portable reference, FP32 storage / quality mode — no longer frozen: be8b761 de-FP64'd `galosh.cl` (Neumaier-Kahan, FP_CONTRACT OFF) + fixed LOESS TILE_DIM 24→16): `standalone/galosh_raw_gpu.c`, `standalone/galosh.cl`
+- Vulkan FP32 + FP16-storage-contract engine (performance path, 2–19× vs OpenCL; cross-vendor verified 69.7–70.6 dB vs CPU FP32): `standalone/vk/` (43 shaders), `galosh_vk.exe`
 - Identity harness: `standalone/tests/v2_identity.py` (+ `v2_baseline.json`)
 - Diagnostic HP probes (never ship): `standalone/*_hp.{c,h}` (int64-based, build-excluded)

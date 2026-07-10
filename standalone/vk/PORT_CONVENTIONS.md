@@ -1,5 +1,13 @@
 # OpenCL→GLSL transcription conventions (V2.0 Phase B2)
 
+> **[HISTORICAL B2 CONTRACT, status 2026-07-11]** — this file governed the
+> literal OpenCL→GLSL transcription. B3–B7g deliberately deviate
+> (`o32_pass12_sg`, `pad_2d_edge_3p`, `k16`/`fastup_inverse_fused`,
+> `sigma_hist`/`fin_mwg`, wht4/fastup/f16/h16/g16 variants, B7a de-FP64
+> Kahan), each proven by parity/byte-compare. The `manifest_*.json` files
+> cover only the B2 kernel set; the current shader set is 43 shaders
+> including Vulkan-only variants with no manifest entry.
+
 One `.comp` per kernel in `standalone/vk/shaders/`, filename = kernel name
 minus `galosh_` (e.g. `galosh_o32_gat_forward_full` → `o32_gat_forward_full.comp`).
 

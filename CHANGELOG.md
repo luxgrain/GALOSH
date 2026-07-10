@@ -71,7 +71,7 @@ End-user distribution ZIPs (attached to the GitHub release):
   Dubois 2005, Hirakawa 2007, Park 2009) — manuscript as submitted to
   IEEE Signal Processing Letters on 2026-07-09.
 
-## v0.1.0 — first public release (2026, unreleased)
+## v0.1.0 — first public release (2026-07-04)
 
 Initial public snapshot of GALOSH: a blind, training-free, search-free classical
 denoiser for raw Bayer and sRGB/YUV images.

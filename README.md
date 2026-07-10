@@ -69,7 +69,10 @@ everything blind:
 Bold = best among the blind, training-free methods. ¹INT16 quality is measured
 on the streaming GPU pipeline; its CPU entry is the correctness-first INT32
 reference. ²Reference CBM3D package is effectively single-threaded.
-³VRAM-bound tiled attention on this 12-GB GPU. Trained networks are reported
+³VRAM-bound tiled attention on this 12-GB GPU. In both tables, GPU s = OpenCL
+host, end-to-end per-image benchmark time (incl. I/O and per-process setup)
+on an RTX 4070 Ti — not the steady-state Vulkan pipeline times of the
+GPU-speed section below. Trained networks are reported
 honestly as upper references — in their own training domain they stay ahead.
 
 **Raw domain, RawNIND** (high-ISO crops; per-image LPIPS below each crop —
@@ -242,6 +245,8 @@ Raw Bayer (float32 `.bin`, RGGB, values in [0,1]):
 #                                       strength luma_str chroma_str alpha sigma_sq
 # alpha = sigma_sq = 0  -> fully blind (default);  positive values supply an
 # external noise model and are honored on both CPU and GPU.
+# Vulkan (./standalone/vk/galosh_vk.exe): same CLI as galosh_raw_cpu.exe, plus
+# the V2 flags (--noise/--wht/--upsample; see standalone/README.md).
 ```
 
 sRGB / YUV (float32 HWC `.bin`, values in [0,1]):
@@ -349,9 +354,10 @@ silicon, or a fully verified hardware datapath — those are future work.
   combination blind × training-free × multi-domain × speed, not SOTA quality.
 - The blind estimator under-estimates strongly spatially-correlated rendered
   noise (all high-pass estimators do); the sRGB results absorb this.
-- Raw path requires even dimensions; GPU kernels are tuned for NVIDIA
-  (OpenCL); other vendors may fail to build the kernels (pick another
-  `cl_device`).
+- Raw path requires even dimensions. GPU paths (OpenCL and Vulkan) are
+  verified on NVIDIA, Intel Arc, and AMD; on multi-GPU machines the OpenCL
+  device order can vary — pick another `cl_device` if the default device
+  fails.
 - The INT16 fixed-point CPU reference is correctness-first (not speed-optimized);
   its GPU throughput reflects paired-int32 emulation on FP-oriented hardware,
   not ISP-native speed.
@@ -359,7 +365,7 @@ silicon, or a fully verified hardware datapath — those are future work.
 ## Citing GALOSH / Who uses it?
 
 If GALOSH is useful in your research, please cite it (`CITATION.cff` has
-machine-readable metadata; the arXiv identifier will be added on release):
+machine-readable metadata):
 
 ```bibtex
 @article{galosh2026,
@@ -367,7 +373,9 @@ machine-readable metadata; the arXiv identifier will be added on release):
   title  = {{GALOSH}: Blind, Training-Free Denoising of Raw Bayer and sRGB
             Images by Parallel-Friendly Local Shrinkage},
   year   = {2026},
-  note   = {arXiv preprint, identifier to be added on release}
+  eprint = {2607.03768},
+  archivePrefix = {arXiv},
+  note   = {arXiv preprint arXiv:2607.03768}
 }
 ```
 
@@ -379,8 +387,9 @@ issue, or add yourself to [`ADOPTERS.md`](ADOPTERS.md). Entirely voluntary
 ## License and publication
 
 - **Code:** Apache-2.0 (see `LICENSE` and `NOTICE`).
-- **Paper / figures:** CC BY 4.0. Planned submission path: **arXiv → IEEE SPL →
-  IPOL** (reproducible-implementation article).
+- **Paper / figures:** CC BY 4.0. Publication path: **arXiv** (published,
+  [2607.03768](https://arxiv.org/abs/2607.03768)) → **IEEE SPL** (submitted) →
+  **IPOL** (planned; reproducible-implementation article).
 - A U.S. provisional patent application covering the methods has been filed
   (App. No. 64/058,343, May 6 2026).
 

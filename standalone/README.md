@@ -1,8 +1,9 @@
 # GALOSH standalone — canonical RAW pipeline
 
 Fully-blind RAW Bayer denoiser (Generalized Anscombe LOcal SHrinkage).
-**Canonical algorithm = GALOSH_RAW_O**: GAT-normalized overlapping 2×2 WHT
-luma shrinkage (BayesShrink-MAD + empirical Wiener, cycle-spun) + 3-level
+**Canonical algorithm = GALOSH_RAW_O**: GAT-normalized 2×2 WHT mosaic
+decomposition + overlapping 8×8 WHT luma shrinkage (BayesShrink-MAD +
+empirical Wiener, cycle-spun) + 3-level
 multi-scale LOESS chroma pyramid with L-guided joint-bilateral upsample.
 No block-matching, no sorting, no training, no noise profile.
 
@@ -12,8 +13,12 @@ No block-matching, no sorting, no training, no noise profile.
 |---|---|---|---|
 | **CPU FP32** (o) | `galosh_raw_cpu.c` | `galosh_raw_cpu.exe` | reference / offline quality |
 | **CPU INT32** (r32) | `galosh_raw_cpu_int.c` | `galosh_raw_cpu_int.exe` | Q11.20 fixed-point reference (FP-free) |
-| **GPU FP32** (o32) | `galosh_raw_gpu.c` + `galosh.cl` | `galosh_raw_gpu.exe` | fast GPU path (measured 18 ms @1080p / 46 ms @4K on an RTX 4070 Ti) |
+| **GPU FP32** (o32) | `galosh_raw_gpu.c` + `galosh.cl` | `galosh_raw_gpu.exe` | fast GPU path (measured 11.8 ms @1080p / 39.3 ms @4K on an RTX 4070 Ti; see the GPU-speed table in the top-level README) |
 | **GPU INT16** (i16) | `galosh_int_*.{clh,cl}` | `galosh_int_pipe_test.exe` | bit-exact vs r32 at INT32 storage; INT16-narrowed storage = near-lossless (~58-65 dB); fixed-point streaming **by design** (32 KB LDS, no FP) |
+
+Vulkan port (FP32 compute / FP16 inter-phase storage): `vk/` — 43 SPIR-V
+shaders + `galosh_vk.exe`, CPU-exe-compatible CLI; see the top-level README
+GPU-speed section.
 
 At INT32 storage the GPU pipeline is bit-exact against the r32 CPU reference
 end-to-end (verified on SIDD/RawNIND full frames, 2026-07-04). Narrowing the
@@ -52,7 +57,7 @@ alpha/sigma to estimate. On Windows/MSYS2, run with `C:\msys64\ucrt64\bin` on
 `PATH` (the OpenMP runtime `libgomp-1.dll` lives there). Set `GALOSH_VERBOSE=1`
 for per-phase diagnostics (all exes are quiet by default).
 
-## V2.0 options (CPU FP32 exe) — independent, freely combinable
+## V2.0 options (CPU FP32 exe + Vulkan exe) — independent, freely combinable
 
 All flags default to the canonical published pipeline (flags-off output is
 byte-identical to it — enforced by `tests/v2_identity.py`). Speed/quality
@@ -65,14 +70,15 @@ full frames, `benchmark/results_*/_metrics_v2.json`).
 | `--upsample=fast` | `jinc` | **−20%** | **neutral on both datasets** (ΔPSNR ≤ +0.02 dB, ΔLPIPS ≤ 0.0006); ring-free by construction | safe speed win, photos included |
 | `--wht=4` | `8` | −15% | high noise (SIDD): **−1.21 dB / +0.047 LPIPS**; low-ISO (RawNIND): neutral PSNR, LPIPS slightly better | video / speed-critical only |
 | both of the above | — | **−36%** (SIDD 10.3→6.5 s/frame) | = `--wht=4` quality | real-time-leaning pipelines |
-| `--noise=every:N` / `hold` / `ema:B` (+`--noise-state=F`) | `fit` (per-frame) | skips re-estimation on held frames (full payoff — LUT reuse — lands in the GPU context API) | held frames: byte-identical for a fixed model; `ema` tracks slow drift | video loops, fixed camera/ISO |
+| `--noise=every:N` / `hold` / `ema:B` (+`--noise-state=F`) | `fit` (per-frame) | skips re-estimation on held frames (full payoff — LUT reuse — is realized in the Vulkan port) | held frames: byte-identical for a fixed model; `ema` tracks slow drift | video loops, fixed camera/ISO |
 | `--f16-storage` | off | none (oracle, slightly slower) | 77–83 dB vs FP32 = invisible | GPU-FP16 parity reference only |
 | `luma_str` / `chroma_str` (args 7/8) | 1.0 / 1.0 | — | user taste (grain vs. smoothness) | tuning |
 
 GPU note: on the OpenCL/Vulkan pipeline the upsample stage is ~1% of frame
 time (fast upsample buys nothing there), while the 8×8 luma stage is 42–58%
-(`--wht=4` buys the most there). The V2.0 flags are CPU-exe only until the
-Vulkan port (Phase B).
+(`--wht=4` buys the most there). The Vulkan exe (`vk/galosh_vk.exe`,
+CPU-exe-compatible CLI) accepts the same flags; the OpenCL exe stays V1
+(quality mode, fit-every-frame).
 
 ## Deprecated lineage (ablation only)
 

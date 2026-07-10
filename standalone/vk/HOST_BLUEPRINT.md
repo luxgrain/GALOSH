@@ -41,7 +41,7 @@ fence-waited readbacks.
 | `N_REDUCE_WG` | 64 | sizes `partial_buf` / `partial_resid_buf` |
 | `GAT_LUT_SIZE` | 4096 | inverse-GAT LUT length |
 | `PARAMS_SIZE` | 32 | params_buf length in floats |
-| `TILE_WG_DIM` (`g_tile_wg_dim`) | 8 | WG dim for the o32 pass12 tiled dispatch (8×8 = 64 WIs/WG) |
+| `TILE_WG_DIM` (`g_tile_wg_dim`) | 8 | WG dim for the o32 pass12 tiled dispatch (8×8 = 64 WIs/WG) [Vulkan default (B7g): quality pass12 = `o32_pass12_sg` — local_size 512 (16 subgroups, subgroup size 32 pinned via VK_EXT_subgroup_size_control), 2 coefficients/lane, bitonic exact MAD median; sole deviation = pass2 wiener_energy tree-sum. 8×8 = 64 remains the OpenCL geometry and the `GALOSH_SG=0` classic bit-twin path.] |
 | `O32_TILE_SIZE` | 28 | host hardcodes `const int o32_tile_size = 28; /* matches galosh.cl O32_TILE_SIZE */` (line 1386) |
 
 ### params_buf float-index layout (PARAMS_SIZE = 32)
@@ -141,8 +141,8 @@ All are `CL_MEM_READ_WRITE` device buffers, no host pointer.
 | `lut_d_buf` | `lut_bytes = 4096*4` | f32 | inverse-GAT LUT (D values) |
 | `lut_x_buf` | `lut_bytes = 4096*4` | f32 | inverse-GAT LUT (x values) |
 | `lut_params_buf` | `8*sizeof(float) = 32` | f32 | LUT meta: d_min, d_max, y_break, t_break, sigma_raw, … (5 used, 8 allocated) |
-| `partial_buf` | `part_bytes = N_REDUCE_WG*5*sizeof(double) = 64*5*8 = 2560` | **f64** | dark-ref IRLS reduce partials (5 doubles per WG × 64 WGs) |
-| `partial_resid_buf` | `resid_bytes = N_REDUCE_WG*2*sizeof(double) = 64*2*8 = 1024` | **f64** | resid reduce partials (2 doubles per WG × 64 WGs) |
+| `partial_buf` | `part_bytes = N_REDUCE_WG*5*sizeof(double) = 64*5*8 = 2560` | **f64** | dark-ref IRLS reduce partials (5 doubles per WG × 64 WGs) [SUPERSEDED 2026-07-11: FP64 eliminated (Vulkan B7a + OpenCL be8b761, Neumaier-Kahan compensated FP32). Same byte sizes, but elements are now `[n_wg*5*2]` float pairs (galosh.cl:7573), not doubles.] |
+| `partial_resid_buf` | `resid_bytes = N_REDUCE_WG*2*sizeof(double) = 64*2*8 = 1024` | **f64** | resid reduce partials (2 doubles per WG × 64 WGs) [SUPERSEDED 2026-07-11: FP64 eliminated (B7a + be8b761); elements are now `[n_wg*2*2]` float pairs (galosh.cl:7714), not doubles.] |
 | `o32_blk_mean` | `o32_ne_total * 4` | f32 | P0 block means |
 | `o32_blk_var` | `o32_ne_total * 4` | f32 | P0 block Laplacian-MAD variances |
 | `o32_dark_thresh_hist` | `4096 * sizeof(cl_int) = 16384` | i32 | P0e histogram; **zero-filled by host before P0e** |
@@ -169,7 +169,7 @@ All are `CL_MEM_READ_WRITE` device buffers, no host pointer.
 | `o32_C{1,2,3}_e_up_raw` | `kqsize_f` each | f32 | K16 q→h (of e_to_q) raw output (kq stride) |
 | `o32_C{1,2,3}_e_up` | `ch_bytes_f` each | f32 | padded to chsize |
 | `o32_C{1,2,3}_h_den` | `ch_bytes_f` each | f32 | Phase 8 blended chroma |
-| `o32_C{1,2,3}_aligned` | `full_bytes_f` each | f32 | Phase 9 full-res chroma |
+| `o32_C{1,2,3}_aligned` | `full_bytes_f` each | f32 | Phase 9 full-res chroma [B7f: on the Vulkan common path C{1,2,3}_aligned are NOT materialized — the final upsample × inverse is fused (`k16_inverse_fused` / `fastup_inverse_fused`, f16 contract round in-register); buffers/dispatches K_O32_9 + K_O32_10 as two steps survive only for `GALOSH_DUMP_DIR`] |
 
 Debug-only (allocated on demand inside the `GALOSH_DUMP_DIR` block, line
 1722): `o32_pilot_debug` = `npix*4` f32, for `galosh_pass1_o32_dump`.
@@ -292,7 +292,7 @@ Then:
 |---|---|---|---|---|---|
 | 24 | `K_O32_2 fwd_L_cs` | `galosh_o32_forward_l_stride1` | 2D `align_up(W,16) × align_up(H,16)` | 16×16 | 0:`o32_in_gat_full`, 1:`o32_L_cs`, 2:`width`, 3:`height` |
 | 25 | `K_O32_3 chroma_extract` | `galosh_o32_chroma_extract_halfres` | 2D `align_up(hw,16) × align_up(hh,16)` | 16×16 | 0:`o32_in_gat_full`, 1:`o32_C1_h`, 2:`o32_C2_h`, 3:`o32_C3_h`, 4:`width`, 5:`height`, 6:`hw`, 7:`hh` |
-| 26 | `K_O32_5 pass12_L_fr` | `galosh_pass12_o32` | 2D tiled: `tiles_x = (W + 28 - 1)/28`, `tiles_y = (H + 28 - 1)/28`; global = `(tiles_x * 8, tiles_y * 8)` | 8×8 (`g_tile_wg_dim`) | 0:`o32_L_cs`, 1:`o32_L_cs_den`, 2:`width`, 3:`height`, 4:`luma_strength_o32 = strength * luma_str` (float), 5:`o32_phase_stride` (int; default 1 = all 16 cycle-spin phases; env `GALOSH_O32_PHASE_STRIDE`, clamped ≥ 1) |
+| 26 | `K_O32_5 pass12_L_fr` | `galosh_pass12_o32` | 2D tiled: `tiles_x = (W + 28 - 1)/28`, `tiles_y = (H + 28 - 1)/28`; global = `(tiles_x * 8, tiles_y * 8)` | 8×8 (`g_tile_wg_dim`) | 0:`o32_L_cs`, 1:`o32_L_cs_den`, 2:`width`, 3:`height`, 4:`luma_strength_o32 = strength * luma_str` (float), 5:`o32_phase_stride` (int; default 1 = all 16 cycle-spin phases; env `GALOSH_O32_PHASE_STRIDE`, clamped ≥ 1) — [B7g: Vulkan quality default = `o32_pass12_sg` (local 512, subgroup 32); 8×8 = OpenCL & `GALOSH_SG=0` classic bit-twin path] |
 | 27 | `K_O32_6 L_pixel+L_h_den_fused` | `galosh_o32_lpixel_lh_den_fused` | 2D `align_up(W,16) × align_up(H,16)` | 16×16 | 0:`o32_L_cs_den`, 1:`o32_L_pixel`, 2:`o32_L_h_den`, 3:`width`, 4:`height`, 5:`hw` |
 
 **Small-image guard** (lines 1425-1433): if `cq_w < 4 || cq_h < 4 || ce_w < 4
@@ -305,15 +305,22 @@ and `goto download_phase` (Phases 7-10 skipped entirely).
 kernel uses local **24×24** (R=7 halo → 30² LDS tile ≈ 14.4 KB FP32 — check
 Vulkan shared-memory budget); everything else 16×16.
 
+[SUPERSEDED 2026-07-11, commit be8b761: `GALOSH_O_LOESS_TILE_DIM` 24→16 —
+24×24 = 576 WIs exceeded AMD CL max workgroup 256 (silent
+CL_INVALID_WORK_GROUP_SIZE -54, LOESS never ran). LOESS local is now
+**16×16**, globals `align_up(...,16)`; LDS tile = (16+2*7)² = 30² per plane
+≈ 14.4 KB total. Dispatching 24×24 against the current TILE_DIM=16 kernel
+breaks indexing on every vendor — rows 7e/7f/7g below updated accordingly.]
+
 | # | Label | Kernel | Global | Local | Args |
 |---|---|---|---|---|---|
 | 28 | `K_O32_7a L_q` | `galosh_o32_box_downsample_2x` | 2D `align_up(cq_w,16) × align_up(cq_h,16)` | 16×16 | 0:`o32_L_h_den`, 1:`o32_L_q`, 2:`hw` (src_w), 3:`hh` (src_h) |
 | 29 | `K_O32_7b L_e` | `galosh_o32_box_downsample_2x` | 2D `align_up(ce_w,16) × align_up(ce_h,16)` | 16×16 | 0:`o32_L_q`, 1:`o32_L_e`, 2:`cq_w`, 3:`cq_h` |
 | 30 | `K_O32_7c C_q` | `galosh_o32_box_downsample_2x_3p` | 2D `align_up(cq_w,16) × align_up(cq_h,16)` | 16×16 | 0:`o32_C1_h`, 1:`o32_C2_h`, 2:`o32_C3_h`, 3:`o32_C1_q`, 4:`o32_C2_q`, 5:`o32_C3_q`, 6:`hw`, 7:`hh` |
 | 31 | `K_O32_7d C_e` | `galosh_o32_box_downsample_2x_3p` | 2D `align_up(ce_w,16) × align_up(ce_h,16)` | 16×16 | 0:`o32_C1_q`, 1:`o32_C2_q`, 2:`o32_C3_q`, 3:`o32_C1_e`, 4:`o32_C2_e`, 5:`o32_C3_e`, 6:`cq_w`, 7:`cq_h` |
-| 32 | `K_O32_7e LOESS_h_t` | `galosh_o32_loess_chroma_3p_tiled` | 2D `align_up(hw,24) × align_up(hh,24)` | **24×24** | 0:`o32_L_h_den`, 1:`o32_C1_h`, 2:`o32_C2_h`, 3:`o32_C3_h`, 4:`o32_C1_loess_h`, 5:`o32_C2_loess_h`, 6:`o32_C3_loess_h`, 7:`hw`, 8:`hh`, 9:`loess_strength = 1.0f` (float) |
-| 33 | `K_O32_7f LOESS_q_t` | `galosh_o32_loess_chroma_3p_tiled` | 2D `align_up(cq_w,24) × align_up(cq_h,24)` | 24×24 | 0:`o32_L_q`, 1:`o32_C1_q`, 2:`o32_C2_q`, 3:`o32_C3_q`, 4:`o32_C1_loess_q`, 5:`o32_C2_loess_q`, 6:`o32_C3_loess_q`, 7:`cq_w`, 8:`cq_h` — **arg 9 NOT re-set (OpenCL retains 1.0f from 7e; a Vulkan port must pass 1.0f explicitly)** |
-| 34 | `K_O32_7g LOESS_e_t` | `galosh_o32_loess_chroma_3p_tiled` | 2D `align_up(ce_w,24) × align_up(ce_h,24)` | 24×24 | 0:`o32_L_e`, 1:`o32_C1_e`, 2:`o32_C2_e`, 3:`o32_C3_e`, 4:`o32_C1_loess_e`, 5:`o32_C2_loess_e`, 6:`o32_C3_loess_e`, 7:`ce_w`, 8:`ce_h` — arg 9 retained (1.0f) |
+| 32 | `K_O32_7e LOESS_h_t` | `galosh_o32_loess_chroma_3p_tiled` | 2D `align_up(hw,16) × align_up(hh,16)` | **16×16** (was 24×24; be8b761) | 0:`o32_L_h_den`, 1:`o32_C1_h`, 2:`o32_C2_h`, 3:`o32_C3_h`, 4:`o32_C1_loess_h`, 5:`o32_C2_loess_h`, 6:`o32_C3_loess_h`, 7:`hw`, 8:`hh`, 9:`loess_strength = 1.0f` (float) |
+| 33 | `K_O32_7f LOESS_q_t` | `galosh_o32_loess_chroma_3p_tiled` | 2D `align_up(cq_w,16) × align_up(cq_h,16)` | 16×16 (was 24×24; be8b761) | 0:`o32_L_q`, 1:`o32_C1_q`, 2:`o32_C2_q`, 3:`o32_C3_q`, 4:`o32_C1_loess_q`, 5:`o32_C2_loess_q`, 6:`o32_C3_loess_q`, 7:`cq_w`, 8:`cq_h` — **arg 9 NOT re-set (OpenCL retains 1.0f from 7e; a Vulkan port must pass 1.0f explicitly)** |
+| 34 | `K_O32_7g LOESS_e_t` | `galosh_o32_loess_chroma_3p_tiled` | 2D `align_up(ce_w,16) × align_up(ce_h,16)` | 16×16 (was 24×24; be8b761) | 0:`o32_L_e`, 1:`o32_C1_e`, 2:`o32_C2_e`, 3:`o32_C3_e`, 4:`o32_C1_loess_e`, 5:`o32_C2_loess_e`, 6:`o32_C3_loess_e`, 7:`ce_w`, 8:`ce_h` — arg 9 retained (1.0f) |
 | 35 | `K_O32_7h crop_L_for_q` | `galosh_o32_crop_2d_topleft` | 2D `align_up(kq_w,16) × align_up(kq_h,16)` | 16×16 | 0:`o32_L_h_den` (src), 1:`o32_L_for_q` (dst), 2:`hw` (src_w), 3:`hh` (src_h), 4:`kq_w` (dst_w), 5:`kq_h` (dst_h) |
 | 36 | `K_O32_7i K16_q2h` | `galosh_o32_k16_joint_bilateral_upsample_3p` | 2D `align_up(kq_w,16) × align_up(kq_h,16)` | 16×16 | 0:`o32_C1_loess_q`, 1:`o32_C2_loess_q`, 2:`o32_C3_loess_q`, 3:`o32_L_for_q` (guide), 4:`o32_C1_q_up_raw`, 5:`o32_C2_q_up_raw`, 6:`o32_C3_q_up_raw`, 7:`cq_w` (lowres_w), 8:`cq_h` (lowres_h), 9:`k16_BW = 1.5f` (float) |
 | 37-39 | `K_O32_7j pad_q_up` ×3 (p = 0,1,2) | `galosh_o32_pad_2d_edge` | 2D `align_up(hw,16) × align_up(hh,16)` | 16×16 | 0:`o32_C{p+1}_q_up_raw` (src), 1:`o32_C{p+1}_q_up` (dst), 2:`kq_w` (src_w), 3:`kq_h` (src_h), 4:`hw` (dst_w), 5:`hh` (dst_h) — edge replicate |
@@ -328,8 +335,8 @@ Vulkan shared-memory budget); everything else 16×16.
 | # | Label | Kernel | Global | Local | Args |
 |---|---|---|---|---|---|
 | 49 | `K_O32_8 smoothstep` | `galosh_o32_smoothstep_blend_3p` | 2D `align_up(hw,16) × align_up(hh,16)` | 16×16 | 0:`o32_C1_h`, 1:`o32_C2_h`, 2:`o32_C3_h`, 3:`o32_C1_loess_h`, 4:`o32_C2_loess_h`, 5:`o32_C3_loess_h`, 6:`o32_C1_q_up`, 7:`o32_C2_q_up`, 8:`o32_C3_q_up`, 9:`o32_C1_e_up`, 10:`o32_C2_e_up`, 11:`o32_C3_e_up`, 12:`o32_C1_h_den`, 13:`o32_C2_h_den`, 14:`o32_C3_h_den`, 15:`hw`, 16:`hh`, 17:`slider = strength * chroma_str` (float) |
-| 50 | `K_O32_9 K16_final` | `galosh_o32_k16_joint_bilateral_upsample_3p` | 2D `align_up(W,16) × align_up(H,16)` | 16×16 | 0:`o32_C1_h_den`, 1:`o32_C2_h_den`, 2:`o32_C3_h_den`, 3:`o32_L_pixel` (full-res guide), 4:`o32_C1_aligned`, 5:`o32_C2_aligned`, 6:`o32_C3_aligned`, 7:`hw`, 8:`hh`, 9:`k16_BW = 1.5f` — output dim = 2*hw × 2*hh = W × H exactly |
-| 51 | `K_O32_10 inverse_final` | `galosh_o32_inverse_wht_dark_gat` | 2D `align_up(W,16) × align_up(H,16)` | 16×16 | 0:`o32_L_pixel`, 1:`o32_C1_aligned`, 2:`o32_C2_aligned`, 3:`o32_C3_aligned`, 4:`raw_buf` (**output — overwrites the input buffer**), 5:`lut_d_buf`, 6:`lut_x_buf`, 7:`lut_params_buf`, 8:`params_buf`, 9:`width`, 10:`height` — inverse 2×2 WHT + dark restore + ×unified_sigma + inverse GAT via LUT |
+| 50 | `K_O32_9 K16_final` | `galosh_o32_k16_joint_bilateral_upsample_3p` | 2D `align_up(W,16) × align_up(H,16)` | 16×16 | 0:`o32_C1_h_den`, 1:`o32_C2_h_den`, 2:`o32_C3_h_den`, 3:`o32_L_pixel` (full-res guide), 4:`o32_C1_aligned`, 5:`o32_C2_aligned`, 6:`o32_C3_aligned`, 7:`hw`, 8:`hh`, 9:`k16_BW = 1.5f` — output dim = 2*hw × 2*hh = W × H exactly — [B7f: fused with K_O32_10 on the Vulkan common path; standalone dispatch = `GALOSH_DUMP_DIR` only] |
+| 51 | `K_O32_10 inverse_final` | `galosh_o32_inverse_wht_dark_gat` | 2D `align_up(W,16) × align_up(H,16)` | 16×16 | 0:`o32_L_pixel`, 1:`o32_C1_aligned`, 2:`o32_C2_aligned`, 3:`o32_C3_aligned`, 4:`raw_buf` (**output — overwrites the input buffer**), 5:`lut_d_buf`, 6:`lut_x_buf`, 7:`lut_params_buf`, 8:`params_buf`, 9:`width`, 10:`height` — inverse 2×2 WHT + dark restore + ×unified_sigma + inverse GAT via LUT — [B7f: Vulkan common path runs this fused with K_O32_9 (`k16_inverse_fused` / `fastup_inverse_fused`); standalone dispatch = OpenCL / `GALOSH_DUMP_DIR`] |
 
 ### Download
 
@@ -340,6 +347,13 @@ file (`W*H` float32). **The final Bayer output buffer is `raw_buf`.**
 Total dispatches per o32 frame (normal-size image, no dump):
 6 (P0) + 6 (P1 incl. LUT) + 10 (IRLS) + 1 (P2b) + 4 (P3-6) + 21 (P7a-7o,
 pads ×3 each) + 3 (P8-10) = **51 kernel dispatches** + 2 fill-buffer ops.
+
+[SUPERSEDED for the Vulkan engine 2026-07-11: still exact for the OpenCL
+host, but the Vulkan common path post-B7f/B7g differs — pads 9→3
+(`o32_pad_2d_edge_3p`), K_O32_9+K_O32_10 fused into one dispatch
+(`o32_k16_inverse_fused` / `o32_fastup_inverse_fused`; unfused pair only
+under `GALOSH_DUMP_DIR`), and P1b sigma is two-stage (`o32_sigma_hist_mwg`
++ `o32_sigma_fin_mwg`). All proven bit-identical.]
 
 ---
 
@@ -407,7 +421,8 @@ even (checked in `main`).
 ## 5. NOTES / GOTCHAS for the Vulkan port
 
 1. **`align_up(n, a) = ((n + a - 1)/a)*a`** — every 2D global is padded to
-   the 16 (or 24 for tiled LOESS) local size; kernels self-guard on bounds.
+   the 16 (or 24 for tiled LOESS [SUPERSEDED 2026-07-11, be8b761: tiled
+   LOESS is now 16 too]) local size; kernels self-guard on bounds.
 2. **O32_TILE_SIZE = 28, TILE_WG_DIM = 8** — the pass12 (K_O32_5) dispatch
    is `global = (ceil(W/28)*8, ceil(H/28)*8), local = (8,8)`: each 8×8 WG
    owns one 28×28 output tile (halo handled in-kernel via LDS). This is
@@ -416,6 +431,11 @@ even (checked in `main`).
    The o32 mwg reduce/finalize kernels accumulate in double — the Vulkan
    device needs `shaderFloat64` (or a redesigned bit-exact-verified
    compensated-FP32 reduction; do not silently swap without re-verification).
+   [SUPERSEDED 2026-07-11: the "redesigned bit-exact-verified
+   compensated-FP32 reduction" this note allowed IS the shipped
+   implementation (B7a Vulkan, be8b761 OpenCL, Neumaier-Kahan,
+   FP_CONTRACT OFF). `shaderFloat64` / `cl_khr_fp64` NOT required;
+   Intel Arc runs both backends at 70.55 dB parity.]
 4. **No zero-fill of the IRLS partial buffers** on the o32 path — reduce
    kernels fully overwrite their 64 WG slots each dispatch. The only host
    fills are the two `clEnqueueFillBuffer(…, 0, 4096*sizeof(int))` on
@@ -431,6 +451,10 @@ even (checked in `main`).
    consumes only `o32_in_gat_full`). They are still bound to P1a/P1d/P2b, so
    either keep them or (deviation) strip them from those three kernels —
    but any deviation breaks kernel-source parity with `galosh.cl`.
+   [RESOLVED B7f 2026-07-11: the deviation was taken — ch0..3 dead stores
+   removed from gat_forward/normalize/dark_sub in the Vulkan shaders, output
+   proven byte-identical; bindings retained for layout parity. "Any deviation
+   breaks parity" no longer applies to this specific case.]
 8. **Env vars consulted on the o32 path**:
    - `GALOSH_O32_PHASE_STRIDE` — int arg 5 of pass12 (default 1, clamp ≥ 1);
      production = 1 (all 16 cycle-spin phases).
@@ -439,7 +463,8 @@ even (checked in `main`).
    - `GALOSH_VERBOSE` — post-download params/LUT diagnostics readback.
 9. **Sync semantics**: single in-order queue; the two mid-frame blocking
    reads (Phase-0 params, pre-IRLS α/σ²) are the only points where the CPU
-   waits mid-pipeline. Between them, all 51 dispatches can be recorded into
+   waits mid-pipeline. Between them, all 51 dispatches (OpenCL count;
+   Vulkan common path differs — see the §2 SUPERSEDED note) can be recorded into
    one command buffer per segment: [P0a..P0h] → fence/readback →
    [P1a..P1d(+LUT)] … the pre-IRLS readback also implicitly waits for P1
    (harmless: it only needs Phase-0's α/σ², which P1 doesn't modify —
