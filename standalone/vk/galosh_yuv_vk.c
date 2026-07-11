@@ -41,8 +41,16 @@
 
 #include "../galosh_yuv420.h"
 
+/* [embed] failure hook: the CLI exits on any Vulkan error (single-shot
+ * process), but a host-embedded engine (frameserver plugin) must NOT
+ * kill the host — embedders install a hook that longjmps back to the
+ * plugin, which then reports an error instead.  NULL hook = CLI
+ * behavior, byte-identical.  (日) 組み込み時はホストを殺さず longjmp 回収。 */
+static void (*g_vk_fail_hook)(int) = NULL;
 #define CHECK(x) do { VkResult _r = (x); if(_r != VK_SUCCESS) { \
-  fprintf(stderr, "VK error %d at %s:%d\n", _r, __FILE__, __LINE__); exit(1); } } while(0)
+  fprintf(stderr, "VK error %d at %s:%d\n", _r, __FILE__, __LINE__); \
+  if(g_vk_fail_hook) g_vk_fail_hook((int)_r); \
+  exit(1); } } while(0)
 
 #define PARAMS_SIZE   32
 #define GAT_LUT_SIZE  4096
