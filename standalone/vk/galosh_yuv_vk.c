@@ -381,6 +381,33 @@ static const char *g_noise_state = NULL;
 /* ================= staging I/O ================= */
 static Buf g_stg; static void *g_stg_map;
 
+/* [embed] grow-only staging (re)allocation — replaces the fixed-size
+ * creation the CLI used to do in main(); lets one device serve frames of
+ * any size (frameserver plugin) and multiple planar sub-runs. */
+static void ensure_staging(VkDeviceSize need)
+{
+  if(need < 1024) need = 1024;
+  if(g_stg.buf && g_stg.size >= need) return;
+  if(g_stg.buf)
+  {
+    vkUnmapMemory(g_dev, g_stg.mem);
+    vkDestroyBuffer(g_dev, g_stg.buf, NULL);
+    vkFreeMemory(g_dev, g_stg.mem, NULL);
+  }
+  g_stg = mkbuf(need,
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  CHECK(vkMapMemory(g_dev, g_stg.mem, 0, VK_WHOLE_SIZE, 0, &g_stg_map));
+}
+
+/* [embed] in-memory noise state — the frameserver plugin holds the blind
+ * fit per filter instance instead of the CLI's --noise-state files.
+ * mem == NULL keeps the file-based CLI behavior exactly. */
+typedef struct { int valid; float alpha, sigma_sq, sigma_gat; } galosh_vk_memstate;
+
+/* [embed] per-frame log suppression for host processes (video spam). */
+static int g_vk_quiet = 0;
+
 static void upload(Buf *dst, const void *src, VkDeviceSize sz, VkDeviceSize dst_off)
 {
   memcpy(g_stg_map, src, sz);
@@ -399,25 +426,174 @@ static void download(Buf *src, void *dst, VkDeviceSize sz, VkDeviceSize src_off)
   memcpy(dst, g_stg_map, sz);
 }
 
+/* ================= device init (once per process) =================
+ * EN: Factored out of main() so embedders (the GALOSH-frameserver
+ *     plugin) can bring the device up without the CLI: instance +
+ *     deterministic device selection (GALOSH_VK_DEVICE honored) +
+ *     subgroup probe + pipelines.  Idempotent; staging is allocated
+ *     lazily by ensure_staging().  Returns 0 on success.
+ * JP: main() から切り出し（プラグイン組み込み用）。冪等。
+ * ================================================================ */
+static int g_vk_inited = 0;
+static int galosh_yuv_vk_init_device(void)
+{
+  if(g_vk_inited) return 0;
+  /* --- instance / device (deterministic order + name match; same policy
+   * as galosh_vk.c — see its comment on unstable enumeration) --- */
+  VkApplicationInfo aiInfo = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+    .pApplicationName = "galosh-yuv-vk", .apiVersion = VK_API_VERSION_1_2 };
+  VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+    .pApplicationInfo = &aiInfo };
+  CHECK(vkCreateInstance(&ici, NULL, &g_inst));
+  uint32_t nd = 0; vkEnumeratePhysicalDevices(g_inst, &nd, NULL);
+  VkPhysicalDevice pds[8]; if(nd > 8) nd = 8;
+  vkEnumeratePhysicalDevices(g_inst, &nd, pds);
+  VkPhysicalDeviceProperties pp[8];
+  uint32_t order[8];
+  for(uint32_t i = 0; i < nd; i++)
+  { vkGetPhysicalDeviceProperties(pds[i], &pp[i]); order[i] = i; }
+  for(uint32_t a = 0; a + 1 < nd; a++)
+    for(uint32_t b = a + 1; b < nd; b++)
+    {
+      #define TYPE_RANK(t) ((t) == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 0 : \
+                            (t) == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 2)
+      const int ra = TYPE_RANK(pp[order[a]].deviceType);
+      const int rb = TYPE_RANK(pp[order[b]].deviceType);
+      if(rb < ra || (rb == ra &&
+         strcmp(pp[order[b]].deviceName, pp[order[a]].deviceName) < 0))
+      { uint32_t t = order[a]; order[a] = order[b]; order[b] = t; }
+    }
+  uint32_t di = order[0];
+  { const char *e = getenv("GALOSH_VK_DEVICE");
+    if(e && e[0])
+    {
+      if(e[0] >= '0' && e[0] <= '9')
+      { uint32_t w = (uint32_t)atoi(e); if(w < nd) di = order[w]; }
+      else
+      {
+        for(uint32_t i = 0; i < nd; i++)
+        {
+          const char *hay = pp[i].deviceName;
+          for(const char *h = hay; *h; h++)
+          {
+            const char *n = e, *q = h;
+            while(*n && *q && ((*n | 32) == (*q | 32))) { n++; q++; }
+            if(!*n) { di = i; goto dev_found; }
+          }
+        }
+        dev_found: ;
+      }
+    }
+  }
+  g_pd = pds[di];
+  vkGetPhysicalDeviceProperties(g_pd, &g_props);
+  fprintf(stderr, "[yuv_vk] device[%u] = %s\n", di, g_props.deviceName);
+
+  /* [B7g] subgroup-size-control probe (pass12_sg eligibility) */
+  {
+    uint32_t nx = 0;
+    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &nx, NULL);
+    VkExtensionProperties *xp = malloc(nx * sizeof *xp);
+    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &nx, xp);
+    int has = 0;
+    for(uint32_t i = 0; i < nx; i++)
+      if(strcmp(xp[i].extensionName, "VK_EXT_subgroup_size_control") == 0) has = 1;
+    free(xp);
+    if(has)
+    {
+      VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
+      VkPhysicalDeviceFeatures2 f2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &sf };
+      vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+      VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT };
+      VkPhysicalDeviceProperties2 p2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sp };
+      vkGetPhysicalDeviceProperties2(g_pd, &p2);
+      g_sg_ok = (sf.subgroupSizeControl && sf.computeFullSubgroups &&
+                 sp.minSubgroupSize <= 32 && 32 <= sp.maxSubgroupSize &&
+                 (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) ? 1 : 0;
+    }
+  }
+
+  uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &qn, NULL);
+  VkQueueFamilyProperties qf[16]; if(qn > 16) qn = 16;
+  vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &qn, qf);
+  g_qi = 0;
+  for(uint32_t i = 0; i < qn; i++)
+    if(qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { g_qi = i; break; }
+  float prio = 1.0f;
+  VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+    .queueFamilyIndex = g_qi, .queueCount = 1, .pQueuePriorities = &prio };
+  VkPhysicalDevice16BitStorageFeatures f16stor = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+    .storageBuffer16BitAccess = VK_TRUE };
+  VkPhysicalDeviceShaderFloat16Int8Features f16arith = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+    .pNext = &f16stor, .shaderFloat16 = VK_TRUE };
+  VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcf = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+    .subgroupSizeControl = VK_TRUE, .computeFullSubgroups = VK_TRUE };
+  if(g_sg_ok) f16stor.pNext = &sgcf;
+  const char *dev_exts[1] = { "VK_EXT_subgroup_size_control" };
+  VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+    .pNext = &f16arith,
+    .enabledExtensionCount = g_sg_ok ? 1u : 0u,
+    .ppEnabledExtensionNames = dev_exts,
+    .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = NULL };
+  CHECK(vkCreateDevice(g_pd, &dci, NULL, &g_dev));
+  vkGetDeviceQueue(g_dev, g_qi, 0, &g_q);
+  VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_qi };
+  CHECK(vkCreateCommandPool(g_dev, &cpci, NULL, &g_pool));
+  VkDescriptorPoolSize dps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                               .descriptorCount = 256 };
+  VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .maxSets = 64, .poolSizeCount = 1, .pPoolSizes = &dps };
+  CHECK(vkCreateDescriptorPool(g_dev, &dpi, NULL, &g_dpool));
+  VkQueryPoolCreateInfo qpci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+    .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 256 };
+  CHECK(vkCreateQueryPool(g_dev, &qpci, NULL, &g_qpool));
+
+  for(int i = 0; i < K_COUNT; i++)
+  {
+    if(g_k[i].sg32 && !g_sg_ok) continue;
+    make_kernel(&g_k[i]);
+  }
+
+  g_vk_inited = 1;
+  return 0;
+}
+
 /* ================= core: one YUV frame on device ================= */
 /* srgb: caller-owned 3ch interleaved f32 in/out (gamma sRGB domain —
  * exactly the OpenCL run_yuv_gat_gpu_buf contract).  luma_only skips the
  * chroma stage per YUV_BLUEPRINT.md §7.2 (the 420 gray pass / --pix=400). */
 static int run_core(float *srgb, const int W, const int H,
                     const float strength_y, const float strength_c,
-                    const int luma_only, const char *state_tag)
+                    const int luma_only, const char *state_tag,
+                    galosh_vk_memstate *mem)
 {
   const size_t npix = (size_t)W * H;
   const size_t fb = npix * 4, hb = npix * 2;
   const int npix_i = (int)npix;
   const double t0 = (double)clock() / CLOCKS_PER_SEC;
   g_ts_n = 0;
+  ensure_staging(3 * fb);
 
   /* ---- [video] noise-state load + hold decision ---- */
   char spath[1400] = { 0 }, lpath[1420] = { 0 };
   float st_a = 0.0f, st_s = 0.0f, st_g = 0.0f;
   int st_n = -1;
-  if(g_noise_state)
+  if(mem)
+  {
+    /* [embed] in-memory state (frameserver): held values live in the
+     * caller's instance struct; the noise-mode decision is the caller's
+     * (mem->valid == use held model; else fit and store back). */
+    if(mem->valid) { st_a = mem->alpha; st_s = mem->sigma_sq; st_g = mem->sigma_gat; st_n = 0; }
+  }
+  else if(g_noise_state)
   {
     snprintf(spath, sizeof(spath), "%s%s", g_noise_state, state_tag);
     snprintf(lpath, sizeof(lpath), "%s.lut", spath);
@@ -434,7 +610,9 @@ static int run_core(float *srgb, const int W, const int H,
   }
   const int have_state = (st_n >= 0 && st_a > 0.0f && st_g > 0.0f);
   int hold_frame = 0;
-  if(strcmp(g_noise_mode, "hold") == 0)
+  if(mem)
+    hold_frame = have_state;
+  else if(strcmp(g_noise_mode, "hold") == 0)
   {
     if(!have_state)
     { fprintf(stderr, "[yuv_vk] --noise=hold needs a valid --noise-state\n"); return 1; }
@@ -593,15 +771,25 @@ static int run_core(float *srgb, const int W, const int H,
 
   /* log the on-device blind fit (readback AFTER the frame — logging only) */
   download(&params, h_params, PARAMS_SIZE * 4, 0);
-  fprintf(stderr, "[yuv_vk] %dx%d blind sigma=%.5f alpha=%.6g sigma_sq=%.6e "
-                  "sigma_gat=%.4f s_y=%.2f s_c=%.2f%s%s\n",
-          W, H, h_params[P_SIGMA_Y], h_params[P_ALPHA], h_params[P_SIGMA_SQ],
-          h_params[P_SIGMA_GAT], strength_y, strength_c,
-          luma_only ? " (luma-only)" : "",
-          hold_frame ? " [noise HOLD]" : "");
+  if(!g_vk_quiet)
+    fprintf(stderr, "[yuv_vk] %dx%d blind sigma=%.5f alpha=%.6g sigma_sq=%.6e "
+                    "sigma_gat=%.4f s_y=%.2f s_c=%.2f%s%s\n",
+            W, H, h_params[P_SIGMA_Y], h_params[P_ALPHA], h_params[P_SIGMA_SQ],
+            h_params[P_SIGMA_GAT], strength_y, strength_c,
+            luma_only ? " (luma-only)" : "",
+            hold_frame ? " [noise HOLD]" : "");
+
+  /* [embed] write the fitted model back to the caller's in-memory state */
+  if(mem && !hold_frame)
+  {
+    mem->alpha = h_params[P_ALPHA];
+    mem->sigma_sq = h_params[P_SIGMA_SQ];
+    mem->sigma_gat = h_params[P_SIGMA_GAT];
+    mem->valid = 1;
+  }
 
   /* [video] persist state (+ 32 KB LUT sidecar on fit frames) */
-  if(spath[0] && strcmp(g_noise_mode, "fit") != 0)
+  if(!mem && spath[0] && strcmp(g_noise_mode, "fit") != 0)
   {
     const int new_n = hold_frame ? st_n + 1 : 0;
     FILE *sf = fopen(spath, "w");
@@ -640,8 +828,9 @@ static int run_core(float *srgb, const int W, const int H,
     }
     fprintf(stderr, "[yuv_vk]   TOTAL (GPU time)  %.3f ms\n", total);
   }
-  fprintf(stderr, "[yuv_vk] frame total %.1f ms\n",
-          1000.0 * ((double)clock() / CLOCKS_PER_SEC - t0));
+  if(!g_vk_quiet)
+    fprintf(stderr, "[yuv_vk] frame total %.1f ms\n",
+            1000.0 * ((double)clock() / CLOCKS_PER_SEC - t0));
 
   freebuf(&srgb_b); freebuf(&y_lin);
   freebuf(&y_stab); freebuf(&y_den); freebuf(&y_snap);
@@ -652,6 +841,7 @@ static int run_core(float *srgb, const int W, const int H,
   return 0;
 }
 
+#ifndef GALOSH_YUV_VK_NOMAIN
 /* ================= GALOSH-420 planar driver =================
  * Identical composition to the CPU / OpenCL drivers (galosh_yuv420.h is
  * the single shared front-end; YUV_BLUEPRINT.md §7).  ONE device init,
@@ -712,7 +902,7 @@ static int run_420(const char *in_path, const char *out_path,
         GALOSH420_EOTF_SRGB);
     gray[3 * i + 0] = v; gray[3 * i + 1] = v; gray[3 * i + 2] = v;
   }
-  if(run_core(gray, W, H, sy, sc, /*luma_only=*/1, "_luma")) return 1;
+  if(run_core(gray, W, H, sy, sc, /*luma_only=*/1, "_luma", NULL)) return 1;
   float *Ydeng = (float *)malloc(ysz * 4);
   if(!Ydeng) { fprintf(stderr, "alloc failed\n"); return 1; }
   for(size_t i = 0; i < ysz; i++)
@@ -761,7 +951,7 @@ static int run_420(const char *in_path, const char *out_path,
       rgb[3 * i + 1] = galosh420_eotf_fwd_f(galosh420_eotf_inv_f(G, eotf), GALOSH420_EOTF_SRGB);
       rgb[3 * i + 2] = galosh420_eotf_fwd_f(galosh420_eotf_inv_f(B, eotf), GALOSH420_EOTF_SRGB);
     }
-    if(run_core(rgb, pw, ph, sy, sc, /*luma_only=*/0, "_chroma")) return 1;
+    if(run_core(rgb, pw, ph, sy, sc, /*luma_only=*/0, "_chroma", NULL)) return 1;
     for(size_t i = 0; i < psz; i++)
     {
       const float Rp = galosh420_eotf_fwd_f(
@@ -887,136 +1077,7 @@ int main(int argc, char **argv)
   const float sc = (np > 5) ? (float)atof(pos[5]) : 1.0f;
   if(W <= 0 || H <= 0) { fprintf(stderr, "bad dims\n"); return 1; }
 
-  /* --- instance / device (deterministic order + name match; same policy
-   * as galosh_vk.c — see its comment on unstable enumeration) --- */
-  VkApplicationInfo aiInfo = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-    .pApplicationName = "galosh-yuv-vk", .apiVersion = VK_API_VERSION_1_2 };
-  VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-    .pApplicationInfo = &aiInfo };
-  CHECK(vkCreateInstance(&ici, NULL, &g_inst));
-  uint32_t nd = 0; vkEnumeratePhysicalDevices(g_inst, &nd, NULL);
-  VkPhysicalDevice pds[8]; if(nd > 8) nd = 8;
-  vkEnumeratePhysicalDevices(g_inst, &nd, pds);
-  VkPhysicalDeviceProperties pp[8];
-  uint32_t order[8];
-  for(uint32_t i = 0; i < nd; i++)
-  { vkGetPhysicalDeviceProperties(pds[i], &pp[i]); order[i] = i; }
-  for(uint32_t a = 0; a + 1 < nd; a++)
-    for(uint32_t b = a + 1; b < nd; b++)
-    {
-      #define TYPE_RANK(t) ((t) == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 0 : \
-                            (t) == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 2)
-      const int ra = TYPE_RANK(pp[order[a]].deviceType);
-      const int rb = TYPE_RANK(pp[order[b]].deviceType);
-      if(rb < ra || (rb == ra &&
-         strcmp(pp[order[b]].deviceName, pp[order[a]].deviceName) < 0))
-      { uint32_t t = order[a]; order[a] = order[b]; order[b] = t; }
-    }
-  uint32_t di = order[0];
-  { const char *e = getenv("GALOSH_VK_DEVICE");
-    if(e && e[0])
-    {
-      if(e[0] >= '0' && e[0] <= '9')
-      { uint32_t w = (uint32_t)atoi(e); if(w < nd) di = order[w]; }
-      else
-      {
-        for(uint32_t i = 0; i < nd; i++)
-        {
-          const char *hay = pp[i].deviceName;
-          for(const char *h = hay; *h; h++)
-          {
-            const char *n = e, *q = h;
-            while(*n && *q && ((*n | 32) == (*q | 32))) { n++; q++; }
-            if(!*n) { di = i; goto dev_found; }
-          }
-        }
-        dev_found: ;
-      }
-    }
-  }
-  g_pd = pds[di];
-  vkGetPhysicalDeviceProperties(g_pd, &g_props);
-  fprintf(stderr, "[yuv_vk] device[%u] = %s\n", di, g_props.deviceName);
-
-  /* [B7g] subgroup-size-control probe (pass12_sg eligibility) */
-  {
-    uint32_t nx = 0;
-    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &nx, NULL);
-    VkExtensionProperties *xp = malloc(nx * sizeof *xp);
-    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &nx, xp);
-    int has = 0;
-    for(uint32_t i = 0; i < nx; i++)
-      if(strcmp(xp[i].extensionName, "VK_EXT_subgroup_size_control") == 0) has = 1;
-    free(xp);
-    if(has)
-    {
-      VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sf = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
-      VkPhysicalDeviceFeatures2 f2 = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &sf };
-      vkGetPhysicalDeviceFeatures2(g_pd, &f2);
-      VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sp = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT };
-      VkPhysicalDeviceProperties2 p2 = {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sp };
-      vkGetPhysicalDeviceProperties2(g_pd, &p2);
-      g_sg_ok = (sf.subgroupSizeControl && sf.computeFullSubgroups &&
-                 sp.minSubgroupSize <= 32 && 32 <= sp.maxSubgroupSize &&
-                 (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) ? 1 : 0;
-    }
-  }
-
-  uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &qn, NULL);
-  VkQueueFamilyProperties qf[16]; if(qn > 16) qn = 16;
-  vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &qn, qf);
-  g_qi = 0;
-  for(uint32_t i = 0; i < qn; i++)
-    if(qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { g_qi = i; break; }
-  float prio = 1.0f;
-  VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-    .queueFamilyIndex = g_qi, .queueCount = 1, .pQueuePriorities = &prio };
-  VkPhysicalDevice16BitStorageFeatures f16stor = {
-    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-    .storageBuffer16BitAccess = VK_TRUE };
-  VkPhysicalDeviceShaderFloat16Int8Features f16arith = {
-    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
-    .pNext = &f16stor, .shaderFloat16 = VK_TRUE };
-  VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcf = {
-    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
-    .subgroupSizeControl = VK_TRUE, .computeFullSubgroups = VK_TRUE };
-  if(g_sg_ok) f16stor.pNext = &sgcf;
-  const char *dev_exts[1] = { "VK_EXT_subgroup_size_control" };
-  VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-    .pNext = &f16arith,
-    .enabledExtensionCount = g_sg_ok ? 1u : 0u,
-    .ppEnabledExtensionNames = dev_exts,
-    .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = NULL };
-  CHECK(vkCreateDevice(g_pd, &dci, NULL, &g_dev));
-  vkGetDeviceQueue(g_dev, g_qi, 0, &g_q);
-  VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_qi };
-  CHECK(vkCreateCommandPool(g_dev, &cpci, NULL, &g_pool));
-  VkDescriptorPoolSize dps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                               .descriptorCount = 256 };
-  VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-    .maxSets = 64, .poolSizeCount = 1, .pPoolSizes = &dps };
-  CHECK(vkCreateDescriptorPool(g_dev, &dpi, NULL, &g_dpool));
-  VkQueryPoolCreateInfo qpci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-    .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 256 };
-  CHECK(vkCreateQueryPool(g_dev, &qpci, NULL, &g_qpool));
-
-  for(int i = 0; i < K_COUNT; i++)
-  {
-    if(g_k[i].sg32 && !g_sg_ok) continue;
-    make_kernel(&g_k[i]);
-  }
-
-  /* staging: sized for the largest transfer (3ch f32 full frame) */
-  const size_t max_stage = (size_t)W * H * 3 * 4;
-  g_stg = mkbuf(max_stage > 1024 ? max_stage : 1024,
-    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-  CHECK(vkMapMemory(g_dev, g_stg.mem, 0, VK_WHOLE_SIZE, 0, &g_stg_map));
+  if(galosh_yuv_vk_init_device()) return 1;
 
   if(planar)
     return run_420(in_path, out_path, W, H, sy, sc,
@@ -1031,7 +1092,7 @@ int main(int argc, char **argv)
     if(fread(img, 4, npix * 3, f) != npix * 3)
     { fprintf(stderr, "short input\n"); return 1; }
     fclose(f); }
-  if(run_core(img, W, H, sy, sc, 0, "")) return 1;
+  if(run_core(img, W, H, sy, sc, 0, "", NULL)) return 1;
   { FILE *f = fopen(out_path, "wb");
     if(!f) { fprintf(stderr, "cannot write %s\n", out_path); return 1; }
     fwrite(img, 4, npix * 3, f); fclose(f); }
@@ -1039,3 +1100,4 @@ int main(int argc, char **argv)
   fprintf(stderr, "[yuv_vk] done: %s (%dx%d)\n", out_path, W, H);
   return 0;
 }
+#endif /* GALOSH_YUV_VK_NOMAIN */
