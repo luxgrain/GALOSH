@@ -14,6 +14,10 @@ Preprint: [PDF (English)](https://github.com/luxgrain/GALOSH/releases/download/v
 📦 **Download** — Windows standalone builds, no install needed: drag & drop a
 DNG or PNG onto the exe ([Releases](https://github.com/luxgrain/GALOSH/releases))
 
+🎬 **Video workflows** — VapourSynth / AviSynth+ plugin (one DLL, output
+byte-identical to the reference implementation):
+[GALOSH-frameserver](https://github.com/luxgrain/GALOSH-frameserver)
+
 GALOSH (Generalized Anscombe LOcal SHrinkage) is a **classical** image denoiser
 redesigned for modern parallel hardware:
 
