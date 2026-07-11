@@ -136,6 +136,47 @@ storage only. ⁴OpenCL 8K on the two slower GPUs is not run: a single kernel
 there exceeds the ~2 s Windows GPU watchdog, and the banded-submission
 mitigation is a Vulkan-host feature.
 
+## GALOSH-420 — planar YCbCr containers + Vulkan YUV engine
+
+The YUV pipeline accepts planar 4:2:0 / 4:2:2 / 4:4:4 / 4:0:0 integer
+containers directly (`--pix=420 --depth=8..16 --range=full|limited
+--matrix=bt601|bt709|bt2020|custom:Kr,Kb --eotf=srgb|g22|g24|bt709|hlg|pq|linear
+--siting=center|left|topleft`), format-preserving in/out — DVD, Blu-ray,
+HDR10 (PQ, 10-bit, top-left sited), HLG and JPEG profiles covered. Chroma is
+denoised at its **native half-resolution lattice** with a siting-phased
+downsampled-Y guide — an A/B experiment on SIDD (80 scenes × 3 sitings ×
+2 matrices) showed native beats upsample-to-444-first by +0.3–0.5 dB Cb/Cr
+at ~4× lower chroma cost, siting itself does not affect denoise quality, and
+only a guide-phase mismatch costs (−0.13/−0.19 dB) — hence the phase-matched
+guide is machine-verified by a built-in affine-field selftest
+(`--selftest-phase`). Spec: `docs/yuv420_frontend_spec.md`. One shared
+front-end header (`standalone/galosh_yuv420.h`) serves all three backends,
+so flag vocabulary and siting phases cannot drift.
+
+`standalone/vk/galosh_yuv_vk.exe` is the Vulkan YUV engine (same FP16
+storage contract and banded submissions as the raw engine; the heavy LOSH
+and LUT shaders are shared verbatim). Parity: 67.3 dB vs the CPU FP32
+reference on all three GPUs, 95 dB cross-GPU agreement; `--noise=hold` is
+**bit-identical** to fit on the same frame. Measured GPU times, ms (fps):
+
+| GPU | Mode | 1080p fit → hold | 4K fit → hold | 8K fit → hold |
+|---|---|---|---|---|
+| NVIDIA RTX 4070 Ti | 444 | 38.2 → 2.7 (376) | 50.4 → 11.0 (91) | 98.3 → 45.1 (22.2) |
+| | 420 | 54.4 → 2.6 (391) | 130 → 10.2 (98) | 316 → 105 (9.5) |
+| Intel Arc A310 | 444 | 139 → 34.7 (28.8) | 258 → 149 (6.7) | 754 → 625 (1.6) |
+| | 420 | 196 → 37.5 (26.7) | 416 → 158 (6.3) | 857 → 609 (1.6) |
+| AMD Radeon iGPU | 444 | 244 → 124 (8.1) | 593 → 499 (2.0) | 2116 → 1996 (0.5) |
+| | 420 | 252 → 118 (8.5) | 732 → 470 (2.1) | 2123 → 1881 (0.5) |
+
+**hold** = video steady state (`--noise=hold|every:N` reuses the blind noise
+model + 32 KB inverse-GAT LUT; the per-frame cost of the exact-median
+estimator disappears): 4:2:0 video runs 4K at 98 fps on the 4070 Ti in the
+quality configuration. OpenCL comparison (fit, NVIDIA): 444 47/79/170 ms at
+1080p/4K/8K — Vulkan is 1.6× faster fitting and ~7× at video steady state;
+on Arc the gap is ~20× (same register-spill root cause as the raw table).
+The OpenCL YUV host (`galosh_yuv_gpu.exe`) carries the same `--pix` front-end
+as the FP32 portable reference.
+
 ## Algorithm summary
 
 **GALOSH core** (shared by both domains)
@@ -164,14 +205,17 @@ upsampling (anti-ringed). Input/output = linear raw Bayer float32 in [0,1].
 **GALOSH-YUV/RGB** adds the color-image front-end: inverse sRGB gamma →
 full-range BT.709 YCbCr; Y takes GAT+shrinkage, Cb/Cr take the guided
 regression at full resolution; output clamped to [0,1]. Input = sRGB float32
-(HWC, [0,1]).
+(HWC, [0,1]), or a planar integer YCbCr container via the GALOSH-420
+front-end (`--pix=…`, see the section above): luma is denoised at full
+resolution (chroma-independent), chroma at its native subsampled lattice
+with a siting-phased luma guide.
 
 ## Repository layout
 
 | Path | Role |
 |---|---|
 | `standalone/` | **Canonical reference implementation** (CLI / exe) — the basis for the paper and all benchmarks |
-| `standalone/vk/` | Vulkan-compute port of the raw pipeline (GLSL shaders + host; see the GPU-speed section) |
+| `standalone/vk/` | Vulkan-compute engines: raw (`galosh_vk.exe`) + YUV/420 (`galosh_yuv_vk.exe`) — GLSL shaders + hosts; see the GPU-speed sections |
 | `standalone/tests/` | Smoke tests + dataset-free micro-benchmark |
 | `benchmark/scripts/` | Full benchmark harness (SIDD / RawNIND, raw + sRGB) |
 | `benchmark/results_*/` | Benchmark outputs — a few small timing-source JSONs are tracked; bulky regenerable artifacts (metrics JSONs, PNGs) are git-ignored |
@@ -214,7 +258,7 @@ mingw-w64-ucrt-x86_64-vulkan-headers mingw-w64-ucrt-x86_64-vulkan-loader`):
 
 ```sh
 cd standalone/vk
-bash build_vk.sh   # 43 SPIR-V shaders + galosh_vk.exe (CPU-exe-compatible CLI)
+bash build_vk.sh   # 53 SPIR-V shaders + galosh_vk.exe + galosh_yuv_vk.exe
 ```
 
 **Windows (MSYS2), exact commands.** A plain `bash` from PowerShell/cmd may
@@ -255,6 +299,21 @@ sRGB / YUV (float32 HWC `.bin`, values in [0,1]):
 ./galosh_yuv_cpu.exe  in.bin out.bin W H 1.0 1.0
 ./galosh_yuv_gpu.exe  in.bin out.bin W H 1.0 1.0 [cl_device]
 #                                        strength_y strength_c
+```
+
+Planar YCbCr containers (GALOSH-420 front-end; same flags on all three
+backends — raw planar Y+Cb+Cr, uint8 / uint16-LE for depth 9–16):
+
+```sh
+# JPEG-style 420 (8-bit full-range bt601, center-sited):
+./galosh_yuv_cpu.exe in.yuv out.yuv W H 1.0 1.0 \
+    --pix=420 --depth=8 --range=full --matrix=bt601 --eotf=srgb --siting=center
+# UHD HDR10 (10-bit limited PQ bt2020, top-left sited), Vulkan engine + video hold:
+./vk/galosh_yuv_vk.exe in.yuv out.yuv W H 1.0 1.0 \
+    --pix=420 --depth=10 --range=limited --matrix=bt2020 --eotf=pq --siting=topleft \
+    --noise=every:120 --noise-state=stream.ns
+# machine-verify the siting-phased guide construction (all backends):
+./galosh_yuv_cpu.exe --selftest-phase
 ```
 
 Notes:

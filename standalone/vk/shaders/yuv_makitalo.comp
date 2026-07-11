@@ -1,0 +1,51 @@
+#version 450
+/* yuv_makitalo.comp — transcribed from galosh.cl galosh_yuv_makitalo_inverse_Y
+ * (line 3517).  Exact-unbiased inverse GAT via the 4096-entry LUT:
+ *   d <= d_min : analytical y_break + sigma_raw*(d - t_break)  (dark-tail
+ *                fix — NOT a clamp to lut_x[0]);
+ *   d >= d_max : 1.0;
+ *   interior   : 12-iter binary search + lerp with /max(d1-d0, 1e-10).
+ * Input = f16 Y_den (denormalized); output overwrites the f32 linear Y.
+ * NO fast-math (YUV_BLUEPRINT.md constraint 1). */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) restrict readonly  buffer B0 { float16_t d_stab[]; };
+layout(std430, binding = 1) restrict writeonly buffer B1 { float x_out[]; };
+layout(std430, binding = 2) restrict readonly  buffer B2 { float lut_d[]; };
+layout(std430, binding = 3) restrict readonly  buffer B3 { float lut_x[]; };
+layout(std430, binding = 4) restrict readonly  buffer B4 { float lut_params[]; };
+layout(push_constant) uniform PC { int npix; } pc;
+
+const int GAT_LUT_SIZE = 4096;
+
+void main()
+{
+  const int i = int(gl_GlobalInvocationID.x);
+  if(i >= pc.npix) return;
+  const float d = float(d_stab[i]);
+  const float d_min     = lut_params[0];
+  const float d_max     = lut_params[1];
+  const float y_break   = lut_params[2];
+  const float t_break   = lut_params[3];
+  const float sigma_raw = lut_params[4];
+
+  float result;
+  if(d <= d_min) {
+    result = y_break + sigma_raw * (d - t_break);
+  } else if(d >= d_max) {
+    result = 1.0f;
+  } else {
+    int lo = 0, hi = GAT_LUT_SIZE - 1;
+    while(hi - lo > 1)
+    {
+      const int mid = (lo + hi) >> 1;
+      if(lut_d[mid] <= d) lo = mid; else hi = mid;
+    }
+    const float d0 = lut_d[lo], d1 = lut_d[hi];
+    const float t  = (d - d0) / max(d1 - d0, 1e-10f);
+    result = lut_x[lo] + t * (lut_x[hi] - lut_x[lo]);
+  }
+  x_out[i] = result;
+}

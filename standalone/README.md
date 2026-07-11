@@ -16,9 +16,25 @@ No block-matching, no sorting, no training, no noise profile.
 | **GPU FP32** (o32) | `galosh_raw_gpu.c` + `galosh.cl` | `galosh_raw_gpu.exe` | fast GPU path (measured 11.8 ms @1080p / 39.3 ms @4K on an RTX 4070 Ti; see the GPU-speed table in the top-level README) |
 | **GPU INT16** (i16) | `galosh_int_*.{clh,cl}` | `galosh_int_pipe_test.exe` | bit-exact vs r32 at INT32 storage; INT16-narrowed storage = near-lossless (~58-65 dB); fixed-point streaming **by design** (32 KB LDS, no FP) |
 
-Vulkan port (FP32 compute / FP16 inter-phase storage): `vk/` — 43 SPIR-V
-shaders + `galosh_vk.exe`, CPU-exe-compatible CLI; see the top-level README
-GPU-speed section.
+Vulkan port (FP32 compute / FP16 inter-phase storage): `vk/` — 53 SPIR-V
+shaders + `galosh_vk.exe` (raw) + `galosh_yuv_vk.exe` (YUV/420),
+CPU-exe-compatible CLIs; see the top-level README GPU-speed sections.
+
+## GALOSH-YUV + 420 containers
+
+The YUV drivers (`galosh_yuv_cpu.exe` / `galosh_yuv_gpu.exe` /
+`vk/galosh_yuv_vk.exe`) take sRGB float32 HWC by default, or planar integer
+YCbCr containers via the shared GALOSH-420 front-end (`galosh_yuv420.h`):
+`--pix=420|422|444|400 --depth=8..16 --range=full|limited
+--matrix=bt601|bt709|bt2020|custom:Kr,Kb
+--eotf=srgb|g22|g24|bt709|hlg|pq|linear --siting=center|left|topleft`,
+format-preserving in/out. Chroma is denoised at its native subsampled
+lattice with a siting-phased luma guide (spec:
+`../docs/yuv420_frontend_spec.md`; `--selftest-phase` machine-verifies the
+guide phase on any backend). The Vulkan YUV engine adds
+`--noise=hold|every:N --noise-state=F` video amortization (held frames are
+byte-identical to fit for a fixed model; port blueprint
+`vk/YUV_BLUEPRINT.md`).
 
 At INT32 storage the GPU pipeline is bit-exact against the r32 CPU reference
 end-to-end (verified on SIDD/RawNIND full frames, 2026-07-04). Narrowing the

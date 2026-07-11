@@ -1,0 +1,20 @@
+#version 450
+/* yuv_synth_alpha.comp — transcribed from galosh.cl
+ * galosh_yuv_q_synth_alpha_sigma_sq (line 4850).  Derive synthetic alpha
+ * and sigma^2 from the blind sigma_lin (quasi-linear GAT regime):
+ *   alpha = max(sigma_lin * 0.1, 1e-5);  sigma^2 = max(sigma_lin^2, 1e-8)
+ * Single WI; index args -> push constants. */
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer B0 { float params[]; };
+layout(push_constant) uniform PC {
+  int sigma_lin_idx; int alpha_idx; int sigma_sq_idx;
+} pc;
+
+void main()
+{
+  if(gl_GlobalInvocationID.x != 0u) return;
+  const float sigma_lin = params[pc.sigma_lin_idx];
+  params[pc.alpha_idx]    = max(sigma_lin * 0.1f, 1e-5f);
+  params[pc.sigma_sq_idx] = max(sigma_lin * sigma_lin, 1e-8f);
+}

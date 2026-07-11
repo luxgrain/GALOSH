@@ -1,0 +1,71 @@
+#version 450
+/* yuv_lap_mad_h16.comp — f16-plane sibling of yuv_lap_mad.comp (input is
+ * an FP16 storage-contract buffer, e.g. post-GAT Y_stab; exact widen to
+ * f32 before the Laplacian).  Selection logic identical — see the f32
+ * shader for the port notes and the do-not-parallelize warning. */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) restrict readonly buffer B0 { float16_t plane[]; };
+layout(std430, binding = 1) buffer B1 { float params[]; };
+layout(std430, binding = 2) buffer B2 { float scratch[]; };
+layout(push_constant) uniform PC {
+  int width; int height; int x_stride; int result_idx;
+} pc;
+
+float qselect_kth_g(const int n, const int k)
+{
+  int lo = 0, hi = n - 1;
+  while(lo < hi)
+  {
+    const float pivot = scratch[(lo + hi) >> 1];
+    int i = lo, j = hi;
+    while(i <= j)
+    {
+      while(scratch[i] < pivot) i++;
+      while(scratch[j] > pivot) j--;
+      if(i <= j)
+      { const float t = scratch[i]; scratch[i] = scratch[j]; scratch[j] = t; i++; j--; }
+    }
+    if(k <= j)      hi = j;
+    else if(k >= i) lo = i;
+    else            break;
+  }
+  return scratch[k];
+}
+
+void main()
+{
+  const int lid = int(gl_LocalInvocationID.x);
+  const int wg  = 64;
+
+  const int n_per_row   = (pc.width - 4 + pc.x_stride - 1) / pc.x_stride;
+  const int n_samples   = min((pc.width * pc.height) / 6, 200000);
+  const int n_full_rows = (n_per_row > 0) ? (n_samples / n_per_row) : 0;
+  const int n_partial   = (n_per_row > 0) ? (n_samples % n_per_row) : 0;
+
+  for(int y = lid; y <= n_full_rows && y < pc.height; y += wg)
+  {
+    const int row_samples = (y < n_full_rows) ? n_per_row : n_partial;
+    const int base = y * n_per_row;
+    for(int s = 0; s < row_samples; s++)
+    {
+      const int x = s * pc.x_stride;
+      const float a = float(plane[y * pc.width + x]);
+      const float b = float(plane[y * pc.width + x + 2]);
+      const float c = float(plane[y * pc.width + x + 4]);
+      scratch[base + s] = abs(a - 2.0f * b + c);
+    }
+  }
+  memoryBarrierBuffer();
+  barrier();
+
+  if(lid == 0)
+  {
+    const float mad = (n_samples >= 1)
+        ? qselect_kth_g(n_samples, n_samples / 2) : 0.0f;
+    const float sigma = max(mad / 1.6521f, 0.01f);
+    params[pc.result_idx] = sigma;
+  }
+}

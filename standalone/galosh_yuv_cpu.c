@@ -71,6 +71,9 @@
 #include <stdint.h>
 
 #include "galosh_cpu.h"
+#include "galosh_yuv420.h"   /* GALOSH-420 planar front-end (spec:
+                              * docs/yuv420_frontend_spec.md) — pure
+                              * container handling, no denoise math. */
 
 /* ============================================================
  * [MIXED] Pipeline tuning flags (set from CLI in main()).
@@ -638,17 +641,445 @@ cleanup:
 }
 
 /* ================================================================
+ * [LATEST: GALOSH-420] galosh_yuv_denoise_linear_rgb — LINEAR-domain twin
+ * of galosh_yuv_denoise_srgb (Phase 1-3 identical; Phase 0/4 gamma codecs
+ * removed; the final linear [0,1] clip is retained).
+ *
+ * EN: DELIBERATE COPY, not a refactor: the legacy sRGB entry point above
+ *     is the validated production path and must stay byte-identical under
+ *     -O3 (identity harness 2026-07-11); routing it through a shared body
+ *     risks codegen drift.  This twin is the half-resolution chroma-lattice
+ *     core of the GALOSH-420 path (spec §eotf): the caller reconstructs
+ *     half-res gamma R'G'B' from (siting-phased guide Y', Cb, Cr),
+ *     linearises with the container EOTF, calls this, re-encodes, and
+ *     extracts denoised Cb/Cr.  Exactly the form validated by the A/B rig
+ *     (arm A = native, ab_yuv420.py, 2026-07-11: +0.3..0.5 dB vs 444-first).
+ * JP: 意図的なコピー（リファクタ禁止）— レガシー sRGB パスのバイト一致を
+ *     保証するため。420 パスの半解像度クロマ格子コア。A/B リグ A アーム
+ *     （ネイティブ勝ち）と同一形態。
+ * ================================================================ */
+static void galosh_yuv_denoise_linear_rgb(const float *restrict in_lin,
+                                          float *restrict out_lin,
+                                          const int width, const int height,
+                                          const float strength_y,
+                                          const float strength_c,
+                                          float alpha, float sigma_sq)
+{
+  const size_t npx = (size_t)width * (size_t)height;
+
+  float *Y_stab  = dt_alloc_align_float(npx);
+  float *Cb_lin  = dt_alloc_align_float(npx);
+  float *Cr_lin  = dt_alloc_align_float(npx);
+  float *Y_den   = dt_alloc_align_float(npx);
+  float *Cb_den  = dt_alloc_align_float(npx);
+  float *Cr_den  = dt_alloc_align_float(npx);
+  if(!Y_stab || !Cb_lin || !Cr_lin || !Y_den || !Cb_den || !Cr_den)
+  {
+    fprintf(stderr, "[yuv420_core] alloc failed\n");
+    goto cleanup;
+  }
+
+  /* Phase 1 — linear RGB → BT.709 internal working YCbCr (same internal
+   * space as the legacy path; the container matrix lives in the caller). */
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npx; i++)
+  {
+    float Y, Cb, Cr;
+    rgb_to_ycbcr(in_lin[3 * i + 0], in_lin[3 * i + 1], in_lin[3 * i + 2],
+                 &Y, &Cb, &Cr);
+    Y_stab[i] = Y;
+    Cb_lin[i] = Cb;
+    Cr_lin[i] = Cr;
+  }
+
+  /* Phase 2 ① — blind α / σ² on the internal Y (if not supplied). */
+  if(alpha <= 0.0f || sigma_sq <= 0.0f)
+  {
+    const float sigma_lin = estimate_sigma_plane(Y_stab, width, height);
+    sigma_sq = fmaxf(sigma_lin * sigma_lin, 1e-8f);
+    alpha    = fmaxf(sigma_lin * 0.1f, 1e-5f);
+    fprintf(stderr, "[yuv420_core] Blind σ (MAD) = %.5f, α=%.6g σ²=%.6e\n",
+            sigma_lin, alpha, sigma_sq);
+  }
+
+  /* Phase 2 ②③ — GAT forward + unit-variance normalise. */
+  gat_build_inverse_table(alpha, sigma_sq);
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npx; i++)
+    Y_stab[i] = gat_forward(Y_stab[i], alpha, sigma_sq);
+  const float sigma_gat = estimate_sigma_plane(Y_stab, width, height);
+  const float unified_sigma = fmaxf(sigma_gat, 1e-6f);
+  const float inv_sg = 1.0f / unified_sigma;
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npx; i++) Y_stab[i] *= inv_sg;
+
+  /* Phase 2 ④ — Y LOSH Pass1(MAD)+Pass2. */
+  galosh_pass12_multiorient_blocked(Y_stab, Y_den, width, height,
+                                     strength_y, GALOSH_BLOCK_SIZE,
+                                     g_yuv_stride, g_yuv_n_orient,
+                                     /*use_robust_shrink=*/1);
+
+  /* Phase 3 — Cb/Cr Y_stab-guided chroma denoise (variant O/Q/P as set). */
+  if(g_galosh_yuv_use_q || g_galosh_yuv_use_p)
+    galosh_yuv_chroma_pyramid_p(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
+                                width, height, strength_c);
+  else
+    galosh_loess_chroma(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
+                        width, height, strength_c);
+
+  /* Phase 2 ⑤ + linear re-assembly.  Clip linear RGB to [0,1] exactly as
+   * the legacy path does before its OETF (validated A/B chain). */
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npx; i++)
+  {
+    const float Y_inv = gat_inverse_exact(Y_den[i] * unified_sigma);
+    float R, G, B;
+    ycbcr_to_rgb(Y_inv, Cb_den[i], Cr_den[i], &R, &G, &B);
+    out_lin[3 * i + 0] = fminf(fmaxf(R, 0.0f), 1.0f);
+    out_lin[3 * i + 1] = fminf(fmaxf(G, 0.0f), 1.0f);
+    out_lin[3 * i + 2] = fminf(fmaxf(B, 0.0f), 1.0f);
+  }
+
+cleanup:
+  dt_free_align(Y_stab); dt_free_align(Y_den);
+  dt_free_align(Cb_lin); dt_free_align(Cr_lin);
+  dt_free_align(Cb_den); dt_free_align(Cr_den);
+}
+
+/* ================================================================
+ * [LATEST: GALOSH-420] galosh_yuv_denoise_luma_plane — Phase 2 only
+ * (GAT + LOSH + exact-unbiased inverse) on a single LINEAR luma plane.
+ *
+ * EN: The GALOSH-420 full-resolution Y' path: chroma-INdependent by
+ *     construction (container Y'_den = EOTF(denoise(EOTF^-1(Y'))); the
+ *     denoised chroma never leaks into the output luma).  NCL note (spec
+ *     §eotf, documented approximation): EOTF^-1(Y') is not true luminance;
+ *     the blind PG fit runs on that domain and is self-consistent.
+ * JP: 420 のフル解像度ルマ経路。出力 Y' はクロマ非依存（NCL 近似は
+ *     spec に明記、ブラインド適合はその領域で自己整合）。
+ * ================================================================ */
+static void galosh_yuv_denoise_luma_plane(const float *restrict y_lin,
+                                          float *restrict y_out,
+                                          const int width, const int height,
+                                          const float strength_y,
+                                          float alpha, float sigma_sq)
+{
+  const size_t npx = (size_t)width * (size_t)height;
+  float *Y_stab = dt_alloc_align_float(npx);
+  float *Y_den  = dt_alloc_align_float(npx);
+  if(!Y_stab || !Y_den)
+  {
+    fprintf(stderr, "[yuv420_luma] alloc failed\n");
+    goto cleanup;
+  }
+
+  if(alpha <= 0.0f || sigma_sq <= 0.0f)
+  {
+    const float sigma_lin = estimate_sigma_plane(y_lin, width, height);
+    sigma_sq = fmaxf(sigma_lin * sigma_lin, 1e-8f);
+    alpha    = fmaxf(sigma_lin * 0.1f, 1e-5f);
+    fprintf(stderr, "[yuv420_luma] Blind σ (MAD) = %.5f, α=%.6g σ²=%.6e\n",
+            sigma_lin, alpha, sigma_sq);
+  }
+
+  gat_build_inverse_table(alpha, sigma_sq);
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npx; i++)
+    Y_stab[i] = gat_forward(y_lin[i], alpha, sigma_sq);
+  const float sigma_gat = estimate_sigma_plane(Y_stab, width, height);
+  const float unified_sigma = fmaxf(sigma_gat, 1e-6f);
+  const float inv_sg = 1.0f / unified_sigma;
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npx; i++) Y_stab[i] *= inv_sg;
+
+  galosh_pass12_multiorient_blocked(Y_stab, Y_den, width, height,
+                                     strength_y, GALOSH_BLOCK_SIZE,
+                                     g_yuv_stride, g_yuv_n_orient,
+                                     /*use_robust_shrink=*/1);
+
+  DT_OMP_FOR()
+  for(size_t i = 0; i < npx; i++)
+    y_out[i] = gat_inverse_exact(Y_den[i] * unified_sigma);
+
+cleanup:
+  dt_free_align(Y_stab);
+  dt_free_align(Y_den);
+}
+
+/* ================================================================
+ * [LATEST: GALOSH-420] planar-container driver.
+ *
+ * Pipeline (4:2:0; spec docs/yuv420_frontend_spec.md):
+ *   1. dequantise container codes → float gamma-domain Y' / Cb / Cr
+ *      (range/depth per flags; excursions preserved, no input clamp)
+ *   2. LUMA  (full res):  Y'_den = EOTF(luma_plane(EOTF^-1(Y')))
+ *   3. CHROMA (half res, NATIVE lattice — the A/B-validated form):
+ *      a. guide Yg' = galosh420_down_luma(Y', siting)   [phase-matched!]
+ *      b. R'G'B'_h  = NCL^-1(Yg', Cb, Cr)  (container matrix)
+ *      c. RGB_h     = EOTF^-1(R'G'B'_h)
+ *      d. galosh_yuv_denoise_linear_rgb() at the chroma lattice
+ *      e. R'G'B'_h_den = EOTF(...) → NCL → keep (Cb_den, Cr_den)
+ *   4. requantise; write planar (format-preserving: Y full res + chroma
+ *      at its native lattice; output clipped to [0,1] gamma / code range)
+ *   4:2:2 → provisional 444 (horizontal co-sited up/down around the
+ *   full-res core); 4:4:4 planar → direct full-res core; 4:0:0 → Y only.
+ * ================================================================ */
+static int galosh_yuv420_main(const char *in_path, const char *out_path,
+                              const int W, const int H,
+                              const float strength_y, const float strength_c,
+                              const float alpha_cli, const float sigma_cli,
+                              const galosh420_pix_t pix,
+                              const galosh420_siting_t siting,
+                              const galosh420_eotf_t eotf,
+                              const galosh420_matrix_t mat,
+                              const galosh420_range_t range,
+                              const int depth)
+{
+  if(pix == GALOSH420_PIX_420 && ((W | H) & 1))
+  { fprintf(stderr, "[yuv420] 4:2:0 requires even W and H (got %dx%d)\n", W, H); return 1; }
+  if(pix == GALOSH420_PIX_422 && (W & 1))
+  { fprintf(stderr, "[yuv420] 4:2:2 requires even W (got %d)\n", W); return 1; }
+
+  const int cw = (pix == GALOSH420_PIX_400) ? 0
+               : (pix == GALOSH420_PIX_444) ? W : W / 2;
+  const int ch = (pix == GALOSH420_PIX_400) ? 0
+               : (pix == GALOSH420_PIX_420) ? H / 2 : H;
+  const size_t ysz = (size_t)W * H;
+  const size_t csz = (size_t)cw * ch;
+  const int wide = (depth > 8);
+  const size_t code_bytes = (ysz + 2 * csz) * (wide ? 2 : 1);
+
+  fprintf(stderr, "[yuv420] pix=%d %dx%d chroma %dx%d depth=%d range=%s "
+                  "matrix Kr=%.4f Kb=%.4f eotf=%d siting=%d\n",
+          (int)pix, W, H, cw, ch, depth,
+          range == GALOSH420_RANGE_LIMITED ? "limited" : "full",
+          mat.kr, mat.kb, (int)eotf, (int)siting);
+
+  /* ---- read + dequantise --------------------------------------- */
+  uint8_t *raw = (uint8_t *)malloc(code_bytes);
+  float *Yp = dt_alloc_align_float(ysz);
+  float *Cb = csz ? dt_alloc_align_float(csz) : NULL;
+  float *Cr = csz ? dt_alloc_align_float(csz) : NULL;
+  float *Ywork = dt_alloc_align_float(ysz);
+  if(!raw || !Yp || !Ywork || (csz && (!Cb || !Cr)))
+  { fprintf(stderr, "[yuv420] alloc failed\n"); return 1; }
+
+  FILE *fi = fopen(in_path, "rb");
+  if(!fi) { fprintf(stderr, "cannot open %s\n", in_path); return 1; }
+  const size_t rd = fread(raw, 1, code_bytes, fi);
+  fclose(fi);
+  if(rd != code_bytes)
+  { fprintf(stderr, "[yuv420] short read (%zu of %zu — check --pix/--depth/W/H)\n",
+            rd, code_bytes); return 1; }
+
+  const uint16_t *raw16 = (const uint16_t *)raw;   /* LE host */
+  DT_OMP_FOR()
+  for(size_t i = 0; i < ysz; i++)
+    Yp[i] = galosh420_dequant_y(wide ? (float)raw16[i] : (float)raw[i],
+                                depth, range);
+  DT_OMP_FOR()
+  for(size_t i = 0; i < csz; i++)
+  {
+    Cb[i] = galosh420_dequant_c(wide ? (float)raw16[ysz + i]
+                                     : (float)raw[ysz + i], depth, range);
+    Cr[i] = galosh420_dequant_c(wide ? (float)raw16[ysz + csz + i]
+                                     : (float)raw[ysz + csz + i], depth, range);
+  }
+
+  /* ---- LUMA path (full res, chroma-independent) ------------------ */
+  DT_OMP_FOR()
+  for(size_t i = 0; i < ysz; i++)
+    Ywork[i] = galosh420_eotf_inv_f(Yp[i], eotf);
+  float *Yden = dt_alloc_align_float(ysz);
+  if(!Yden) { fprintf(stderr, "[yuv420] alloc failed\n"); return 1; }
+  galosh_yuv_denoise_luma_plane(Ywork, Yden, W, H,
+                                strength_y, alpha_cli, sigma_cli);
+  fprintf(stderr, "[yuv420] luma done\n");
+
+  /* ---- CHROMA path ------------------------------------------------ */
+  float *CbD = NULL, *CrD = NULL;    /* denoised chroma at native lattice */
+  if(pix != GALOSH420_PIX_400)
+  {
+    const int pw = (pix == GALOSH420_PIX_420) ? cw : W;   /* processing dims */
+    const int ph = (pix == GALOSH420_PIX_420) ? ch : H;
+    const size_t psz = (size_t)pw * ph;
+
+    /* guide Y' + chroma at the processing lattice (gamma domain) */
+    float *Yg  = dt_alloc_align_float(psz);
+    float *Cbp = dt_alloc_align_float(psz);
+    float *Crp = dt_alloc_align_float(psz);
+    float *rgb = dt_alloc_align_float(psz * 3);
+    if(!Yg || !Cbp || !Crp || !rgb)
+    { fprintf(stderr, "[yuv420] alloc failed\n"); return 1; }
+
+    if(pix == GALOSH420_PIX_420)
+    {
+      galosh420_down_luma(Yp, W, H, Yg, siting);   /* siting-phased guide */
+      memcpy(Cbp, Cb, csz * sizeof(float));
+      memcpy(Crp, Cr, csz * sizeof(float));
+    }
+    else if(pix == GALOSH420_PIX_422)
+    {
+      memcpy(Yg, Yp, ysz * sizeof(float));         /* co-located after upH */
+      galosh420_up422_h(Cb, cw, H, Cbp);
+      galosh420_up422_h(Cr, cw, H, Crp);
+    }
+    else /* 444 planar */
+    {
+      memcpy(Yg, Yp, ysz * sizeof(float));
+      memcpy(Cbp, Cb, csz * sizeof(float));
+      memcpy(Crp, Cr, csz * sizeof(float));
+    }
+
+    /* NCL^-1 + EOTF^-1 → linear RGB at the processing lattice */
+    DT_OMP_FOR()
+    for(size_t i = 0; i < psz; i++)
+    {
+      float R, G, B;
+      galosh420_ncl_inv(Yg[i], Cbp[i], Crp[i], mat, &R, &G, &B);
+      rgb[3 * i + 0] = galosh420_eotf_inv_f(R, eotf);
+      rgb[3 * i + 1] = galosh420_eotf_inv_f(G, eotf);
+      rgb[3 * i + 2] = galosh420_eotf_inv_f(B, eotf);
+    }
+
+    galosh_yuv_denoise_linear_rgb(rgb, rgb, pw, ph,
+                                  strength_y, strength_c,
+                                  alpha_cli, sigma_cli);
+
+    /* EOTF + NCL → extract denoised Cb/Cr at the processing lattice */
+    DT_OMP_FOR()
+    for(size_t i = 0; i < psz; i++)
+    {
+      const float Rp = galosh420_eotf_fwd_f(rgb[3 * i + 0], eotf);
+      const float Gp = galosh420_eotf_fwd_f(rgb[3 * i + 1], eotf);
+      const float Bp = galosh420_eotf_fwd_f(rgb[3 * i + 2], eotf);
+      float yy;
+      galosh420_ncl_fwd(Rp, Gp, Bp, mat, &yy, &Cbp[i], &Crp[i]);
+    }
+
+    CbD = dt_alloc_align_float(csz);
+    CrD = dt_alloc_align_float(csz);
+    if(!CbD || !CrD) { fprintf(stderr, "[yuv420] alloc failed\n"); return 1; }
+    if(pix == GALOSH420_PIX_422)
+    {
+      galosh420_down422_h(Cbp, W, H, CbD);
+      galosh420_down422_h(Crp, W, H, CrD);
+    }
+    else
+    {
+      memcpy(CbD, Cbp, csz * sizeof(float));
+      memcpy(CrD, Crp, csz * sizeof(float));
+    }
+    dt_free_align(Yg); dt_free_align(Cbp); dt_free_align(Crp);
+    dt_free_align(rgb);
+    fprintf(stderr, "[yuv420] chroma done (native lattice %dx%d)\n", pw, ph);
+  }
+
+  /* ---- requantise + write (format-preserving) --------------------- */
+  DT_OMP_FOR()
+  for(size_t i = 0; i < ysz; i++)
+  {
+    const float yl = fminf(fmaxf(Yden[i], 0.0f), 1.0f);
+    const int c = galosh420_requant_y(galosh420_eotf_fwd_f(yl, eotf),
+                                      depth, range);
+    if(wide) ((uint16_t *)raw)[i] = (uint16_t)c;
+    else     raw[i] = (uint8_t)c;
+  }
+  DT_OMP_FOR()
+  for(size_t i = 0; i < csz; i++)
+  {
+    const int cb = galosh420_requant_c(CbD[i], depth, range);
+    const int cr = galosh420_requant_c(CrD[i], depth, range);
+    if(wide)
+    {
+      ((uint16_t *)raw)[ysz + i]       = (uint16_t)cb;
+      ((uint16_t *)raw)[ysz + csz + i] = (uint16_t)cr;
+    }
+    else
+    {
+      raw[ysz + i]       = (uint8_t)cb;
+      raw[ysz + csz + i] = (uint8_t)cr;
+    }
+  }
+
+  FILE *fo = fopen(out_path, "wb");
+  if(!fo) { fprintf(stderr, "cannot open %s\n", out_path); return 1; }
+  const size_t wr = fwrite(raw, 1, code_bytes, fo);
+  fclose(fo);
+  if(wr != code_bytes)
+  { fprintf(stderr, "short write (%zu of %zu)\n", wr, code_bytes); return 1; }
+
+  free(raw);
+  dt_free_align(Yp); dt_free_align(Cb); dt_free_align(Cr);
+  dt_free_align(Ywork); dt_free_align(Yden);
+  dt_free_align(CbD); dt_free_align(CrD);
+  return 0;
+}
+
+/* ================================================================
  * main: CLI driver (same binary I/O style as galosh_raw_cpu).
  * ================================================================ */
 int main(int argc, char **argv)
 {
+  /* GALOSH-420 planar-container options (spec docs/yuv420_frontend_spec.md);
+   * all externally specified, no auto-detection. */
+  galosh420_pix_t    g420_pix    = GALOSH420_PIX_444;  /* 444 = legacy sRGB float mode */
+  int                g420_planar = 0;                  /* any --pix= given */
+  galosh420_siting_t g420_siting = GALOSH420_SITING_CENTER;
+  galosh420_eotf_t   g420_eotf   = GALOSH420_EOTF_SRGB;
+  galosh420_matrix_t g420_mat    = GALOSH420_MAT_BT709;
+  galosh420_range_t  g420_range  = GALOSH420_RANGE_FULL;
+  int                g420_depth  = 8;
+
   /* Strip --stride / --orient flags before positional parsing. */
   int new_argc = 0;
   char *positional[32];
   for(int i = 0; i < argc; i++)
   {
     const char *a = argv[i];
-    if(strncmp(a, "--stride=", 9) == 0)
+    if(strcmp(a, "--selftest-phase") == 0)
+    {
+      /* MANDATORY affine-field phase verification (spec §guide
+       * construction).  Machine-proves the siting-phased guide. */
+      return galosh420_phase_selftest();
+    }
+    else if(strncmp(a, "--pix=", 6) == 0)
+    {
+      const char *v = a + 6;
+      if(!strcmp(v, "420"))      g420_pix = GALOSH420_PIX_420;
+      else if(!strcmp(v, "422")) g420_pix = GALOSH420_PIX_422;
+      else if(!strcmp(v, "400")) g420_pix = GALOSH420_PIX_400;
+      else if(!strcmp(v, "444")) g420_pix = GALOSH420_PIX_444;
+      else { fprintf(stderr, "bad --pix=%s (420|422|444|400)\n", v); return 1; }
+      g420_planar = 1;
+    }
+    else if(strncmp(a, "--siting=", 9) == 0)
+    {
+      if(galosh420_parse_siting(a + 9, &g420_siting))
+      { fprintf(stderr, "bad --siting=%s (center|left|topleft)\n", a + 9); return 1; }
+    }
+    else if(strncmp(a, "--eotf=", 7) == 0)
+    {
+      if(galosh420_parse_eotf(a + 7, &g420_eotf))
+      { fprintf(stderr, "bad --eotf=%s (srgb|g22|g24|bt709|hlg|pq|linear)\n", a + 7); return 1; }
+    }
+    else if(strncmp(a, "--matrix=", 9) == 0)
+    {
+      if(galosh420_parse_matrix(a + 9, &g420_mat))
+      { fprintf(stderr, "bad --matrix=%s (bt601|bt709|bt2020|custom:Kr,Kb)\n", a + 9); return 1; }
+    }
+    else if(strncmp(a, "--range=", 8) == 0)
+    {
+      if(galosh420_parse_range(a + 8, &g420_range))
+      { fprintf(stderr, "bad --range=%s (full|limited)\n", a + 8); return 1; }
+    }
+    else if(strncmp(a, "--depth=", 8) == 0)
+    {
+      g420_depth = atoi(a + 8);
+      if(g420_depth < 8 || g420_depth > 16)
+      { fprintf(stderr, "bad --depth=%d (8..16)\n", g420_depth); return 1; }
+    }
+    else if(strncmp(a, "--stride=", 9) == 0)
     {
       g_yuv_stride = atoi(a + 9);
       if(g_yuv_stride < 1 || g_yuv_stride > 8) g_yuv_stride = 2;
@@ -696,7 +1127,14 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "Usage: %s in.bin out.bin width height "
             "[strength_y=1.0] [strength_c=1.0] [alpha=0] [sigma_sq=0]\n"
-            "       [--stride=1|2] [--orient=1|4] [--variant=o|q|p]\n",
+            "       [--stride=1|2] [--orient=1|4] [--variant=o|q|p]\n"
+            "  GALOSH-420 planar container mode (spec docs/yuv420_frontend_spec.md):\n"
+            "       [--pix=420|422|444|400] [--depth=8..16] [--range=full|limited]\n"
+            "       [--matrix=bt601|bt709|bt2020|custom:Kr,Kb]\n"
+            "       [--eotf=srgb|g22|g24|bt709|hlg|pq|linear]\n"
+            "       [--siting=center|left|topleft]  [--selftest-phase]\n"
+            "  planar in/out = Y plane + Cb + Cr, row-major, uint8 (depth 8)\n"
+            "  or uint16 LE (depth 9-16); chroma at native lattice.\n",
             argv[0]);
     return 1;
   }
@@ -723,6 +1161,15 @@ int main(int argc, char **argv)
   }
 
   init_galosh_kaiser();
+
+  /* GALOSH-420 planar-container route (--pix given).  The flags-off
+   * default remains the legacy sRGB float path below, byte-identical
+   * (identity harness 2026-07-11). */
+  if(g420_planar)
+    return galosh_yuv420_main(in_path, out_path, width, height,
+                              strength_y, strength_c, alpha_cli, sigma_cli,
+                              g420_pix, g420_siting, g420_eotf,
+                              g420_mat, g420_range, g420_depth);
 
   const size_t npx = (size_t)width * (size_t)height;
   const size_t nbytes = npx * 3 * sizeof(float);

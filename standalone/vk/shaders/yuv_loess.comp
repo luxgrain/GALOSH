@@ -1,0 +1,102 @@
+#version 450
+/* yuv_loess.comp — transcribed from galosh.cl galosh_yuv_guided_loess
+ * (line 3912).  Y-guided bilateral LOESS chroma denoise: per pixel a
+ * 15x15 (R=7) window, mirror-reflect edges, bilateral weight
+ * exp(-dY^2/(2*BW^2)) with BW=3, weighted degree-1 regression C ~ a*Y+b
+ * with Bayes-MAP ridge eps = strength_c^2 (tau^2=1), output clamped to
+ * the full-window input-chroma band (anti-overshoot; RAW chroma clamp
+ * reflected to YUV).
+ *
+ * Port notes (YUV_BLUEPRINT.md §5.9, §6):
+ *  - native_exp -> GLSL exp() (the vendor fast-exp is deliberately not
+ *    bit-reproducible; chroma parity vs CPU is statistical);
+ *  - the OpenCL kernel's params binding is bound but UNREAD -> dropped
+ *    (blueprint §5.6 suggested deviation);
+ *  - guide = the NORMALIZED POST-GAT NOISY Y snapshot (q_y_snap), NOT
+ *    the denoised linear Y (2026-06-28 guide-domain trap, §5.3).
+ * [FP16 v1] guide + chroma in/out are f16 contract buffers; the 7
+ * accumulators and the regression stay f32.  Heavy kernel — host must
+ * dispatch through the TDR-safe banding helper. */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : enable
+#include "galosh_f16_rne.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) restrict readonly  buffer B0 { float16_t y_guide[]; };
+layout(std430, binding = 1) restrict readonly  buffer B1 { float16_t cb_in[]; };
+layout(std430, binding = 2) restrict readonly  buffer B2 { float16_t cr_in[]; };
+layout(std430, binding = 3) restrict writeonly buffer B3 { float16_t cb_out[]; };
+layout(std430, binding = 4) restrict writeonly buffer B4 { float16_t cr_out[]; };
+layout(push_constant) uniform PC { int width; int height; float strength_c; } pc;
+
+const int   YG_LOESS_RADIUS = 7;
+const float YG_LOESS_BW     = 3.0f;
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x);
+  const int y = int(gl_GlobalInvocationID.y);
+  if(x >= pc.width || y >= pc.height) return;
+
+  const int cx = y * pc.width + x;
+  const float Y_c = float(y_guide[cx]);
+  const float inv_2sigma_sq = 1.0f / (2.0f * YG_LOESS_BW * YG_LOESS_BW);
+
+  float sumW   = 0.0f, sumY   = 0.0f, sumYY  = 0.0f;
+  float sumCb  = 0.0f, sumCr  = 0.0f;
+  float sumYCb = 0.0f, sumYCr = 0.0f;
+  float lo_cb = 1e30f, hi_cb = -1e30f, lo_cr = 1e30f, hi_cr = -1e30f;
+
+  for(int dy = -YG_LOESS_RADIUS; dy <= YG_LOESS_RADIUS; dy++){
+    int yi = y + dy;
+    if(yi < 0) yi = -yi;
+    if(yi >= pc.height) yi = 2 * pc.height - yi - 2;
+    for(int dx = -YG_LOESS_RADIUS; dx <= YG_LOESS_RADIUS; dx++){
+      int xi = x + dx;
+      if(xi < 0) xi = -xi;
+      if(xi >= pc.width) xi = 2 * pc.width - xi - 2;
+      const int p = yi * pc.width + xi;
+      const float Yi  = float(y_guide[p]);
+      const float Cbi = float(cb_in[p]);
+      const float Cri = float(cr_in[p]);
+      lo_cb = min(lo_cb, Cbi); hi_cb = max(hi_cb, Cbi);
+      lo_cr = min(lo_cr, Cri); hi_cr = max(hi_cr, Cri);
+      const float dY = Yi - Y_c;
+      const float w  = exp(-dY * dY * inv_2sigma_sq);
+      sumW   += w;
+      sumY   += w * Yi;
+      sumYY  += w * Yi * Yi;
+      sumCb  += w * Cbi;
+      sumCr  += w * Cri;
+      sumYCb += w * Yi * Cbi;
+      sumYCr += w * Yi * Cri;
+    }
+  }
+
+  const float invW = 1.0f / max(sumW, 1e-10f);
+  const float mean_Y   = sumY   * invW;
+  const float mean_YY  = sumYY  * invW;
+  const float mean_Cb  = sumCb  * invW;
+  const float mean_Cr  = sumCr  * invW;
+  const float mean_YCb = sumYCb * invW;
+  const float mean_YCr = sumYCr * invW;
+
+  const float var_Y   = max(mean_YY - mean_Y * mean_Y, 0.0f);
+  const float cov_YCb = mean_YCb - mean_Y * mean_Cb;
+  const float cov_YCr = mean_YCr - mean_Y * mean_Cr;
+
+  const float eps_gat = pc.strength_c * pc.strength_c * 1.0f;
+  const float denom   = max(var_Y + eps_gat, 1e-6f);
+  const float a_cb    = cov_YCb / denom;
+  const float a_cr    = cov_YCr / denom;
+  const float b_cb    = mean_Cb - a_cb * mean_Y;
+  const float b_cr    = mean_Cr - a_cr * mean_Y;
+
+  float ocb = a_cb * Y_c + b_cb;
+  float ocr = a_cr * Y_c + b_cr;
+  if(hi_cb >= lo_cb) ocb = clamp(ocb, lo_cb, hi_cb);
+  if(hi_cr >= lo_cr) ocr = clamp(ocr, lo_cr, hi_cr);
+  cb_out[cx] = float16_t(galosh_f16_rne(ocb));
+  cr_out[cx] = float16_t(galosh_f16_rne(ocr));
+}

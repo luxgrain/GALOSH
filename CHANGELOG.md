@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.4.0 — GALOSH-420: planar YCbCr containers + Vulkan YUV engine (2026-07-11)
+
+### GALOSH-420 planar front-end (all three backends)
+- Native 4:2:0 / 4:2:2 / 4:4:4 / 4:0:0 planar integer containers,
+  format-preserving in/out: `--pix --depth=8..16 --range=full|limited
+  --matrix=bt601|bt709|bt2020|custom:Kr,Kb
+  --eotf=srgb|g22|g24|bt709|hlg|pq|linear --siting=center|left|topleft`
+  (DVD / Blu-ray / HDR10 / HLG / JPEG profiles). One shared header
+  (`standalone/galosh_yuv420.h`) serves CPU, OpenCL and Vulkan — flag
+  vocabulary and siting phases cannot drift between backends.
+- Design locked by A/B experiment (SIDD 80 scenes × 3 sitings × 2 matrices,
+  `benchmark/scripts/ab_yuv420.py`): chroma denoised at its NATIVE
+  half-resolution lattice with a siting-phased downsampled-Y guide beats
+  upsample-to-444-first by +0.3–0.5 dB Cb/Cr at ~4× lower chroma cost;
+  siting itself does not affect denoise quality; only guide-phase mismatch
+  costs (−0.13/−0.19 dB). Spec: `docs/yuv420_frontend_spec.md`; the
+  phase-matched guide is machine-verified by a built-in affine-field
+  selftest (`--selftest-phase`, all backends).
+- Luma is denoised at full resolution and is chroma-independent by
+  construction; the legacy sRGB float path is byte-identical with the new
+  flags off (identity harness). CPU reproduces the design rig at ±0.000 dB
+  (16-bit); validation harness `benchmark/scripts/bench_yuv420_planar.py`.
+
+### Vulkan YUV engine (`standalone/vk/galosh_yuv_vk.exe`, new)
+- 10 new SPIR-V kernels + the raw engine's LOSH / inverse-LUT shaders
+  reused verbatim (port blueprint: `standalone/vk/YUV_BLUEPRINT.md`).
+  FP16 inter-phase storage contract, zero mid-frame readbacks,
+  watchdog-safe banded submissions (8K completes on every GPU).
+- Parity: 67.3 dB vs the CPU FP32 reference on NVIDIA / Arc / AMD iGPU,
+  95 dB cross-GPU agreement.
+- Video amortization ported from the raw engine: `--noise=hold|every:N` +
+  state file + 32 KB LUT sidecar; a held frame skips both exact-median
+  noise estimators and is **bit-identical** to fit on the same frame.
+  Measured (RTX 4070 Ti, GPU time): 4:2:0 video steady state
+  **1080p 2.6 ms (391 fps), 4K 10.2 ms (98 fps)**; full table in README.
+- OpenCL YUV host refactored to a buffer-based core (byte-identical legacy
+  CLI) and carries the same `--pix` front-end as the FP32 portable
+  reference (NVIDIA 4K 444: OpenCL 79 ms vs Vulkan 50 ms fit / 11 ms hold).
+
 ## v0.3.0 — V2 engine: Vulkan compute + video modes + cross-vendor GPU (2026-07-11)
 
 ### Vulkan compute port (`standalone/vk/`, new)

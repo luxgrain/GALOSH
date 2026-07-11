@@ -1,0 +1,44 @@
+#version 450
+/* yuv_ycc2srgb.comp — transcribed from galosh.cl galosh_yuv_ycbcr_to_srgb
+ * (§YG11, line 3189).  BT.709 inverse, linear clip [0,1], sRGB OETF.
+ * Cb/Cr read from f16 contract buffers (exact widen); Y and output f32. */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) restrict readonly  buffer B0 { float Y_in[]; };
+layout(std430, binding = 1) restrict readonly  buffer B1 { float16_t Cb_in[]; };
+layout(std430, binding = 2) restrict readonly  buffer B2 { float16_t Cr_in[]; };
+layout(std430, binding = 3) restrict writeonly buffer B3 { float srgb_rgb_out[]; };
+layout(push_constant) uniform PC { int npix; } pc;
+
+const float SRGB_A = 0.055f, SRGB_ONEP = 1.055f, SRGB_GAMMA = 2.4f;
+const float SRGB_PHI = 12.92f, SRGB_THRS_L = 0.0031308f;
+const float BT709_KR = 0.2126f, BT709_KG = 0.7152f, BT709_KB = 0.0722f;
+const float BT709_CB_DEN = 1.8556f, BT709_CR_DEN = 1.5748f;
+
+float lin_to_srgb(float c)
+{
+  return (c <= SRGB_THRS_L) ? (SRGB_PHI * c)
+                            : (SRGB_ONEP * pow(c, 1.0f / SRGB_GAMMA) - SRGB_A);
+}
+
+void main()
+{
+  const int i = int(gl_GlobalInvocationID.x);
+  if(i >= pc.npix) return;
+  const float Y  = Y_in[i];
+  const float Cb = float(Cb_in[i]);
+  const float Cr = float(Cr_in[i]);
+  const float R = Y + BT709_CR_DEN * Cr;
+  const float G = Y - (BT709_KR * BT709_CR_DEN / BT709_KG) * Cr
+                    - (BT709_KB * BT709_CB_DEN / BT709_KG) * Cb;
+  const float B = Y + BT709_CB_DEN * Cb;
+  const float Rc = max(min(R, 1.0f), 0.0f);
+  const float Gc = max(min(G, 1.0f), 0.0f);
+  const float Bc = max(min(B, 1.0f), 0.0f);
+  const int base = 3 * i;
+  srgb_rgb_out[base + 0] = lin_to_srgb(Rc);
+  srgb_rgb_out[base + 1] = lin_to_srgb(Gc);
+  srgb_rgb_out[base + 2] = lin_to_srgb(Bc);
+}

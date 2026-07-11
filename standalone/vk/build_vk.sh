@@ -20,7 +20,9 @@ o32_pass12_wht4 o32_fastup_3p o32_sigma_hist_mwg o32_sigma_fin_mwg \
 o32_box_downsample_2x_h16 o32_crop_2d_topleft_h16 o32_loess_chroma_3p_tiled_g16 \
 o32_k16_jbu_3p_f16 o32_fastup_3p_f16 \
 o32_pad_2d_edge_3p o32_k16_inverse_fused o32_fastup_inverse_fused \
-o32_pass12_sg"
+o32_pass12_sg \
+yuv_srgb2ycc yuv_ycc2srgb yuv_lap_mad yuv_lap_mad_h16 yuv_synth_alpha \
+yuv_gat_fwd yuv_sigma_norm yuv_sigma_denorm yuv_makitalo yuv_loess"
 
 for k in $ACTIVE; do
   glslc -O --target-env=vulkan1.2 "shaders/$k.comp" -o "shaders/$k.spv"
@@ -29,3 +31,5 @@ echo "shaders: $(echo $ACTIVE | wc -w) compiled"
 
 gcc -O2 -std=c11 galosh_vk.c -o galosh_vk.exe -lvulkan-1 -lm
 echo "galosh_vk.exe built"
+gcc -O2 -std=c11 galosh_yuv_vk.c -o galosh_yuv_vk.exe -lvulkan-1 -lm
+echo "galosh_yuv_vk.exe built"

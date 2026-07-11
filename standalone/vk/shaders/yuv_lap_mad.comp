@@ -1,0 +1,80 @@
+#version 450
+/* yuv_lap_mad.comp — transcribed from galosh.cl galosh_yuv_q_lap_mad
+ * (line 4752).  Blind sigma via |Laplacian| EXACT median: single WG of 64
+ * WIs writes samples to global scratch at deterministic row-major indices
+ * (matches CPU estimate_sigma_plane order), then WI 0 runs a SERIAL
+ * iterative Hoare quickselect for the exact k-th smallest (k = n/2).
+ * EXACTNESS IS THE POINT (bit-faithful to CPU quick_select_kth) — do NOT
+ * parallelize the selection without a parity gate (YUV_BLUEPRINT.md §5.5).
+ * The quickselect mutates scratch (partition swaps) — scratch is
+ * write-once-per-dispatch, so this is safe.
+ * NOTE: the OpenCL kernel's `lap_max` arg is an unused host-ABI relic —
+ * dropped here (push = W, H, x_stride, result_idx).
+ * (日) 逐次 quickselect による厳密中央値。並列化禁止（CPU とビット一致が目的）。
+ * f32-plane variant; f16 sibling = yuv_lap_mad_h16.comp. */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) restrict readonly buffer B0 { float plane[]; };
+layout(std430, binding = 1) buffer B1 { float params[]; };
+layout(std430, binding = 2) buffer B2 { float scratch[]; };
+layout(push_constant) uniform PC {
+  int width; int height; int x_stride; int result_idx;
+} pc;
+
+float qselect_kth_g(const int n, const int k)
+{
+  int lo = 0, hi = n - 1;
+  while(lo < hi)
+  {
+    const float pivot = scratch[(lo + hi) >> 1];
+    int i = lo, j = hi;
+    while(i <= j)
+    {
+      while(scratch[i] < pivot) i++;
+      while(scratch[j] > pivot) j--;
+      if(i <= j)
+      { const float t = scratch[i]; scratch[i] = scratch[j]; scratch[j] = t; i++; j--; }
+    }
+    if(k <= j)      hi = j;
+    else if(k >= i) lo = i;
+    else            break;
+  }
+  return scratch[k];
+}
+
+void main()
+{
+  const int lid = int(gl_LocalInvocationID.x);
+  const int wg  = 64;
+
+  const int n_per_row   = (pc.width - 4 + pc.x_stride - 1) / pc.x_stride;
+  const int n_samples   = min((pc.width * pc.height) / 6, 200000);
+  const int n_full_rows = (n_per_row > 0) ? (n_samples / n_per_row) : 0;
+  const int n_partial   = (n_per_row > 0) ? (n_samples % n_per_row) : 0;
+
+  for(int y = lid; y <= n_full_rows && y < pc.height; y += wg)
+  {
+    const int row_samples = (y < n_full_rows) ? n_per_row : n_partial;
+    const int base = y * n_per_row;
+    for(int s = 0; s < row_samples; s++)
+    {
+      const int x = s * pc.x_stride;
+      const float a = plane[y * pc.width + x];
+      const float b = plane[y * pc.width + x + 2];
+      const float c = plane[y * pc.width + x + 4];
+      scratch[base + s] = abs(a - 2.0f * b + c);
+    }
+  }
+  /* single-WG global fence (= OpenCL barrier(CLK_GLOBAL_MEM_FENCE)) */
+  memoryBarrierBuffer();
+  barrier();
+
+  if(lid == 0)
+  {
+    const float mad = (n_samples >= 1)
+        ? qselect_kth_g(n_samples, n_samples / 2) : 0.0f;
+    /* MAD -> sigma: Var(lap)=6 sigma^2 -> sigma = MAD/(0.6745*sqrt(6)) */
+    const float sigma = max(mad / 1.6521f, 0.01f);
+    params[pc.result_idx] = sigma;
+  }
+}

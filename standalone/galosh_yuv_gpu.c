@@ -20,6 +20,8 @@
  */
 
 #include "galosh_gpu.h"
+#include "galosh_yuv420.h"   /* GALOSH-420 planar front-end — same header as
+                              * the CPU reference (flag/phase drift impossible). */
 
 
 /* ================================================================
@@ -53,28 +55,22 @@ static int g_yuv_fp16 = 0;
  * 2-source CL build: galosh_fused.cl + galosh_yuv_gat.cl
  * I/O: 3ch sRGB float32 interleaved (H×W×3)
  * ================================================================ */
-static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
-                           int width, int height,
-                           float strength_y, float strength_c,
-                           int cl_device_idx)
+/* EN: Buffer-based core (2026-07-11 refactor for GALOSH-420): `srgb` is
+ *     an in-out 3ch float buffer owned by the CALLER — this function no
+ *     longer allocates, reads, writes or frees it.  The compute pipeline
+ *     between the old fread/fwrite is UNCHANGED (legacy file path verified
+ *     byte-identical through the thin wrapper below).
+ * JP: バッファ入出力版コア（420 用リファクタ）。srgb は呼び出し側所有。
+ *     旧 fread/fwrite 間の計算は完全不変（ラッパ経由でバイト一致検証済み）。 */
+static int run_yuv_gat_gpu_buf(float *srgb,
+                               int width, int height,
+                               float strength_y, float strength_c,
+                               int cl_device_idx)
 {
     const size_t npix = (size_t)width * height;
     int ret = 1;
     prof_count = 0;
 
-    /* --- Read 3ch sRGB input --- */
-    float *srgb = alloc_float(3 * npix);
-    if(!srgb) { fprintf(stderr, "[YUV_GAT] Memory allocation failed (%zu px)\n", npix); return 1; }
-    {
-        FILE *f = fopen(input_file, "rb");
-        if(!f) { fprintf(stderr, "[YUV_GAT] Cannot open %s\n", input_file); free_aligned(srgb); return 1; }
-        size_t nrd = fread(srgb, sizeof(float), 3 * npix, f);
-        fclose(f);
-        if(nrd != 3 * npix) {
-            fprintf(stderr, "[YUV_GAT] Read %zu floats, expected %zu\n", nrd, 3 * npix);
-            free_aligned(srgb); return 1;
-        }
-    }
     fprintf(stderr, "[YUV_GAT] %dx%d, strength_y=%.3f, strength_c=%.3f\n",
             width, height, strength_y, strength_c);
 
@@ -1065,19 +1061,13 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
     clFinish(queue);
     double t_gpu = get_time_ms() - t_pipe_start;
 
+    /* Result lands back in the caller-owned srgb buffer (file I/O moved
+     * to the run_yuv_gat_gpu wrapper, 2026-07-11 GALOSH-420 refactor). */
     err = clEnqueueReadBuffer(queue, srgb_buf, CL_TRUE, 0,
                               3 * npix * sizeof(float), srgb, 0, NULL, NULL);
     if(err != CL_SUCCESS) {
         fprintf(stderr, "[YUV_GAT] output download failed: err=%d\n", (int)err);
         goto yg_cleanup;
-    }
-
-    {
-        FILE *f = fopen(output_file, "wb");
-        if(!f) { fprintf(stderr, "[YUV_GAT] Cannot write %s\n", output_file); goto yg_cleanup; }
-        size_t nwr = fwrite(srgb, sizeof(float), 3 * npix, f);
-        fclose(f);
-        if(nwr != 3 * npix) { fprintf(stderr, "[YUV_GAT] Short write to %s\n", output_file); goto yg_cleanup; }
     }
 
     /* Profiling report */
@@ -1211,8 +1201,251 @@ yg_cleanup:
     if(prog)    clReleaseProgram(prog);
     if(queue)   clReleaseCommandQueue(queue);
     if(context) clReleaseContext(context);
+    /* srgb is caller-owned (buffer-based core) — not freed here. */
+    return ret;
+}
+
+/* Thin file wrapper — reproduces the pre-refactor CLI behaviour exactly
+ * (fread -> run_yuv_gat_gpu_buf -> fwrite); legacy path byte-identical. */
+static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
+                           int width, int height,
+                           float strength_y, float strength_c,
+                           int cl_device_idx)
+{
+    const size_t npix = (size_t)width * height;
+    float *srgb = alloc_float(3 * npix);
+    if(!srgb) { fprintf(stderr, "[YUV_GAT] Memory allocation failed (%zu px)\n", npix); return 1; }
+    {
+        FILE *f = fopen(input_file, "rb");
+        if(!f) { fprintf(stderr, "[YUV_GAT] Cannot open %s\n", input_file); free_aligned(srgb); return 1; }
+        size_t nrd = fread(srgb, sizeof(float), 3 * npix, f);
+        fclose(f);
+        if(nrd != 3 * npix) {
+            fprintf(stderr, "[YUV_GAT] Read %zu floats, expected %zu\n", nrd, 3 * npix);
+            free_aligned(srgb); return 1;
+        }
+    }
+    const int ret = run_yuv_gat_gpu_buf(srgb, width, height,
+                                        strength_y, strength_c, cl_device_idx);
+    if(ret == 0)
+    {
+        FILE *f = fopen(output_file, "wb");
+        if(!f) { fprintf(stderr, "[YUV_GAT] Cannot write %s\n", output_file); free_aligned(srgb); return 1; }
+        size_t nwr = fwrite(srgb, sizeof(float), 3 * npix, f);
+        fclose(f);
+        if(nwr != 3 * npix) { fprintf(stderr, "[YUV_GAT] Short write to %s\n", output_file); free_aligned(srgb); return 1; }
+    }
     free_aligned(srgb);
     return ret;
+}
+
+/* ================================================================
+ * [LATEST: GALOSH-420] OpenCL planar-container driver (FP32 generic).
+ *
+ * EN: Host-side front-end (galosh_yuv420.h — same code as the CPU
+ *     reference, so the flag vocabulary and phase behaviour CANNOT
+ *     drift), GPU core reused unchanged at two lattices:
+ *       LUMA   full res : gray image (R=G=B=EOTF^-1(Y')) through the
+ *               core — internal BT.709 Y of a gray image IS the plane
+ *               (weights sum to 1), chroma lanes carry zeros.
+ *       CHROMA half res : (siting-phased guide Y', Cb, Cr) -> NCL^-1
+ *               -> EOTF^-1 -> sRGB-gamma re-encode -> core -> decode
+ *               -> EOTF -> NCL -> extract Cb/Cr.
+ *     The sRGB re-encode adapter exists because the GPU core's entry
+ *     kernel is srgb_to_linear_ycbcr; the round trip is float-exact to
+ *     ~1e-7 and keeps every GPU kernel untouched (same composition as
+ *     the validated A/B rig, arm A).
+ * JP: フロントエンドは CPU と同一ヘッダ（語彙・位相の乖離が構造的に
+ *     不可能）。GPU コアは無改変で 2 格子再利用。sRGB 再エンコードは
+ *     コア入口カーネル都合のアダプタ（float ~1e-7 で可逆）。
+ * ================================================================ */
+static int run_yuv420_gpu(const char *in_path, const char *out_path,
+                          const int W, const int H,
+                          const float strength_y, const float strength_c,
+                          const int cl_dev,
+                          const galosh420_pix_t pix,
+                          const galosh420_siting_t siting,
+                          const galosh420_eotf_t eotf,
+                          const galosh420_matrix_t mat,
+                          const galosh420_range_t range,
+                          const int depth)
+{
+    if(pix == GALOSH420_PIX_420 && ((W | H) & 1))
+    { fprintf(stderr, "[yuv420_gpu] 4:2:0 requires even W/H (got %dx%d)\n", W, H); return 1; }
+    if(pix == GALOSH420_PIX_422 && (W & 1))
+    { fprintf(stderr, "[yuv420_gpu] 4:2:2 requires even W (got %d)\n", W); return 1; }
+
+    const int cw = (pix == GALOSH420_PIX_400) ? 0
+                 : (pix == GALOSH420_PIX_444) ? W : W / 2;
+    const int ch = (pix == GALOSH420_PIX_400) ? 0
+                 : (pix == GALOSH420_PIX_420) ? H / 2 : H;
+    const size_t ysz = (size_t)W * H;
+    const size_t csz = (size_t)cw * ch;
+    const int wide = (depth > 8);
+    const size_t code_bytes = (ysz + 2 * csz) * (wide ? 2 : 1);
+
+    fprintf(stderr, "[yuv420_gpu] pix=%d %dx%d chroma %dx%d depth=%d range=%s "
+                    "Kr=%.4f Kb=%.4f eotf=%d siting=%d\n",
+            (int)pix, W, H, cw, ch, depth,
+            range == GALOSH420_RANGE_LIMITED ? "limited" : "full",
+            mat.kr, mat.kb, (int)eotf, (int)siting);
+
+    uint8_t *raw = (uint8_t *)malloc(code_bytes);
+    float *Yp = alloc_float(ysz);
+    float *Cb = csz ? alloc_float(csz) : NULL;
+    float *Cr = csz ? alloc_float(csz) : NULL;
+    float *gray = alloc_float(ysz * 3);
+    if(!raw || !Yp || !gray || (csz && (!Cb || !Cr)))
+    { fprintf(stderr, "[yuv420_gpu] alloc failed\n"); return 1; }
+
+    FILE *fi = fopen(in_path, "rb");
+    if(!fi) { fprintf(stderr, "cannot open %s\n", in_path); return 1; }
+    const size_t rd = fread(raw, 1, code_bytes, fi);
+    fclose(fi);
+    if(rd != code_bytes)
+    { fprintf(stderr, "[yuv420_gpu] short read (%zu of %zu)\n", rd, code_bytes); return 1; }
+
+    const uint16_t *raw16 = (const uint16_t *)raw;
+    for(size_t i = 0; i < ysz; i++)
+        Yp[i] = galosh420_dequant_y(wide ? (float)raw16[i] : (float)raw[i],
+                                    depth, range);
+    for(size_t i = 0; i < csz; i++)
+    {
+        Cb[i] = galosh420_dequant_c(wide ? (float)raw16[ysz + i]
+                                         : (float)raw[ysz + i], depth, range);
+        Cr[i] = galosh420_dequant_c(wide ? (float)raw16[ysz + csz + i]
+                                         : (float)raw[ysz + csz + i], depth, range);
+    }
+
+    /* ---- LUMA (full res, gray image through the unchanged core) ----- */
+    for(size_t i = 0; i < ysz; i++)
+    {
+        const float v = galosh420_eotf_fwd_f(
+            fminf(fmaxf(galosh420_eotf_inv_f(Yp[i], eotf), 0.0f), 1.0f),
+            GALOSH420_EOTF_SRGB);
+        gray[3 * i + 0] = v; gray[3 * i + 1] = v; gray[3 * i + 2] = v;
+    }
+    if(run_yuv_gat_gpu_buf(gray, W, H, strength_y, strength_c, cl_dev))
+    { fprintf(stderr, "[yuv420_gpu] luma core failed\n"); return 1; }
+    /* decode: gray output R=G=B ~ Y_den(linear) -> container gamma */
+    float *Ydeng = alloc_float(ysz);
+    if(!Ydeng) { fprintf(stderr, "[yuv420_gpu] alloc failed\n"); return 1; }
+    for(size_t i = 0; i < ysz; i++)
+    {
+        const float lin = galosh420_eotf_inv_f(gray[3 * i + 1], GALOSH420_EOTF_SRGB);
+        Ydeng[i] = galosh420_eotf_fwd_f(fminf(fmaxf(lin, 0.0f), 1.0f), eotf);
+    }
+    fprintf(stderr, "[yuv420_gpu] luma done\n");
+
+    /* ---- CHROMA (native lattice) ------------------------------------ */
+    float *CbD = NULL, *CrD = NULL;
+    if(pix != GALOSH420_PIX_400)
+    {
+        const int pw = (pix == GALOSH420_PIX_420) ? cw : W;
+        const int ph = (pix == GALOSH420_PIX_420) ? ch : H;
+        const size_t psz = (size_t)pw * ph;
+        float *Yg  = alloc_float(psz);
+        float *Cbp = alloc_float(psz);
+        float *Crp = alloc_float(psz);
+        float *rgb = alloc_float(psz * 3);
+        if(!Yg || !Cbp || !Crp || !rgb)
+        { fprintf(stderr, "[yuv420_gpu] alloc failed\n"); return 1; }
+
+        if(pix == GALOSH420_PIX_420)
+        {
+            galosh420_down_luma(Yp, W, H, Yg, siting);
+            memcpy(Cbp, Cb, csz * sizeof(float));
+            memcpy(Crp, Cr, csz * sizeof(float));
+        }
+        else if(pix == GALOSH420_PIX_422)
+        {
+            memcpy(Yg, Yp, ysz * sizeof(float));
+            galosh420_up422_h(Cb, cw, H, Cbp);
+            galosh420_up422_h(Cr, cw, H, Crp);
+        }
+        else
+        {
+            memcpy(Yg, Yp, ysz * sizeof(float));
+            memcpy(Cbp, Cb, csz * sizeof(float));
+            memcpy(Crp, Cr, csz * sizeof(float));
+        }
+
+        for(size_t i = 0; i < psz; i++)
+        {
+            float R, G, B;
+            galosh420_ncl_inv(Yg[i], Cbp[i], Crp[i], mat, &R, &G, &B);
+            const float rl = galosh420_eotf_inv_f(R, eotf);
+            const float gl = galosh420_eotf_inv_f(G, eotf);
+            const float bl = galosh420_eotf_inv_f(B, eotf);
+            rgb[3 * i + 0] = galosh420_eotf_fwd_f(rl, GALOSH420_EOTF_SRGB);
+            rgb[3 * i + 1] = galosh420_eotf_fwd_f(gl, GALOSH420_EOTF_SRGB);
+            rgb[3 * i + 2] = galosh420_eotf_fwd_f(bl, GALOSH420_EOTF_SRGB);
+        }
+        if(run_yuv_gat_gpu_buf(rgb, pw, ph, strength_y, strength_c, cl_dev))
+        { fprintf(stderr, "[yuv420_gpu] chroma core failed\n"); return 1; }
+        for(size_t i = 0; i < psz; i++)
+        {
+            const float Rp = galosh420_eotf_fwd_f(
+                galosh420_eotf_inv_f(rgb[3 * i + 0], GALOSH420_EOTF_SRGB), eotf);
+            const float Gp = galosh420_eotf_fwd_f(
+                galosh420_eotf_inv_f(rgb[3 * i + 1], GALOSH420_EOTF_SRGB), eotf);
+            const float Bp = galosh420_eotf_fwd_f(
+                galosh420_eotf_inv_f(rgb[3 * i + 2], GALOSH420_EOTF_SRGB), eotf);
+            float yy;
+            galosh420_ncl_fwd(Rp, Gp, Bp, mat, &yy, &Cbp[i], &Crp[i]);
+        }
+        CbD = alloc_float(csz);
+        CrD = alloc_float(csz);
+        if(!CbD || !CrD) { fprintf(stderr, "[yuv420_gpu] alloc failed\n"); return 1; }
+        if(pix == GALOSH420_PIX_422)
+        {
+            galosh420_down422_h(Cbp, W, H, CbD);
+            galosh420_down422_h(Crp, W, H, CrD);
+        }
+        else
+        {
+            memcpy(CbD, Cbp, csz * sizeof(float));
+            memcpy(CrD, Crp, csz * sizeof(float));
+        }
+        free_aligned(Yg); free_aligned(Cbp); free_aligned(Crp);
+        free_aligned(rgb);
+        fprintf(stderr, "[yuv420_gpu] chroma done (native lattice %dx%d)\n", pw, ph);
+    }
+
+    /* ---- requantise + write (format-preserving) ---------------------- */
+    for(size_t i = 0; i < ysz; i++)
+    {
+        const int c = galosh420_requant_y(Ydeng[i], depth, range);
+        if(wide) ((uint16_t *)raw)[i] = (uint16_t)c;
+        else     raw[i] = (uint8_t)c;
+    }
+    for(size_t i = 0; i < csz; i++)
+    {
+        const int cb = galosh420_requant_c(CbD[i], depth, range);
+        const int cr = galosh420_requant_c(CrD[i], depth, range);
+        if(wide)
+        {
+            ((uint16_t *)raw)[ysz + i]       = (uint16_t)cb;
+            ((uint16_t *)raw)[ysz + csz + i] = (uint16_t)cr;
+        }
+        else
+        {
+            raw[ysz + i]       = (uint8_t)cb;
+            raw[ysz + csz + i] = (uint8_t)cr;
+        }
+    }
+    FILE *fo = fopen(out_path, "wb");
+    if(!fo) { fprintf(stderr, "cannot write %s\n", out_path); return 1; }
+    const size_t wr = fwrite(raw, 1, code_bytes, fo);
+    fclose(fo);
+    if(wr != code_bytes)
+    { fprintf(stderr, "short write (%zu of %zu)\n", wr, code_bytes); return 1; }
+
+    free(raw);
+    free_aligned(Yp); free_aligned(Cb); free_aligned(Cr);
+    free_aligned(gray); free_aligned(Ydeng);
+    free_aligned(CbD); free_aligned(CrD);
+    return 0;
 }
 
 
@@ -1231,6 +1464,16 @@ yg_cleanup:
  * ================================================================ */
 int main(int argc, char **argv)
 {
+    /* GALOSH-420 planar-container options (spec docs/yuv420_frontend_spec.md;
+     * flag vocabulary shared with the CPU reference via galosh_yuv420.h). */
+    galosh420_pix_t    g420_pix    = GALOSH420_PIX_444;
+    int                g420_planar = 0;
+    galosh420_siting_t g420_siting = GALOSH420_SITING_CENTER;
+    galosh420_eotf_t   g420_eotf   = GALOSH420_EOTF_SRGB;
+    galosh420_matrix_t g420_mat    = GALOSH420_MAT_BT709;
+    galosh420_range_t  g420_range  = GALOSH420_RANGE_FULL;
+    int                g420_depth  = 8;
+
     /* Strip --variant flag before positional parsing. */
     int new_argc = 0;
     char *positional[32];
@@ -1246,6 +1489,46 @@ int main(int argc, char **argv)
         {
             g_yuv_fp16 = 1;   /* mobile GPU/NPU FP16 LOSH; default is FP32 (matches CPU) */
         }
+        else if(strcmp(a, "--selftest-phase") == 0)
+        {
+            return galosh420_phase_selftest();
+        }
+        else if(strncmp(a, "--pix=", 6) == 0)
+        {
+            const char *v = a + 6;
+            if(!strcmp(v, "420"))      g420_pix = GALOSH420_PIX_420;
+            else if(!strcmp(v, "422")) g420_pix = GALOSH420_PIX_422;
+            else if(!strcmp(v, "400")) g420_pix = GALOSH420_PIX_400;
+            else if(!strcmp(v, "444")) g420_pix = GALOSH420_PIX_444;
+            else { fprintf(stderr, "bad --pix=%s\n", v); return 1; }
+            g420_planar = 1;
+        }
+        else if(strncmp(a, "--siting=", 9) == 0)
+        {
+            if(galosh420_parse_siting(a + 9, &g420_siting))
+            { fprintf(stderr, "bad --siting=%s\n", a + 9); return 1; }
+        }
+        else if(strncmp(a, "--eotf=", 7) == 0)
+        {
+            if(galosh420_parse_eotf(a + 7, &g420_eotf))
+            { fprintf(stderr, "bad --eotf=%s\n", a + 7); return 1; }
+        }
+        else if(strncmp(a, "--matrix=", 9) == 0)
+        {
+            if(galosh420_parse_matrix(a + 9, &g420_mat))
+            { fprintf(stderr, "bad --matrix=%s\n", a + 9); return 1; }
+        }
+        else if(strncmp(a, "--range=", 8) == 0)
+        {
+            if(galosh420_parse_range(a + 8, &g420_range))
+            { fprintf(stderr, "bad --range=%s\n", a + 8); return 1; }
+        }
+        else if(strncmp(a, "--depth=", 8) == 0)
+        {
+            g420_depth = atoi(a + 8);
+            if(g420_depth < 8 || g420_depth > 16)
+            { fprintf(stderr, "bad --depth=%d (8..16)\n", g420_depth); return 1; }
+        }
         else
         {
             if(new_argc < 32) positional[new_argc++] = (char *)a;
@@ -1256,7 +1539,11 @@ int main(int argc, char **argv)
 
     if(argc < 7) {
         fprintf(stderr,
-            "Usage: %s <in.bin> <out.bin> <W> <H> <s_y> <s_c> [cl_dev] [--variant=o|q]\n",
+            "Usage: %s <in.bin> <out.bin> <W> <H> <s_y> <s_c> [cl_dev] [--variant=o|q]\n"
+            "  GALOSH-420 planar mode: [--pix=420|422|444|400] [--depth=8..16]\n"
+            "  [--range=full|limited] [--matrix=bt601|bt709|bt2020|custom:Kr,Kb]\n"
+            "  [--eotf=srgb|g22|g24|bt709|hlg|pq|linear] [--siting=center|left|topleft]\n"
+            "  [--selftest-phase]\n",
             argv[0]);
         return 1;
     }
@@ -1276,5 +1563,9 @@ int main(int argc, char **argv)
             g_galosh_yuv_q_gpu ? 'Q' : 'O',
             g_galosh_yuv_q_gpu ? "Q (Laplacian-MAD σ + multi-scale chroma)" :
                                  "O (Foi-Alenius σ + single-scale chroma)");
+    if(g420_planar)
+        return run_yuv420_gpu(input_file, output_file, width, height, sy, sc,
+                              dev, g420_pix, g420_siting, g420_eotf,
+                              g420_mat, g420_range, g420_depth);
     return run_yuv_gat_gpu(input_file, output_file, width, height, sy, sc, dev);
 }
