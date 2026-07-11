@@ -1018,7 +1018,16 @@ static int galosh_yuv420_main(const char *in_path, const char *out_path,
 
 /* ================================================================
  * main: CLI driver (same binary I/O style as galosh_raw_cpu).
+ *
+ * EN: GALOSH_YUV_NOMAIN excludes this CLI entry so the whole file can be
+ *     #include'd as a library translation unit by embedders (VapourSynth
+ *     plugin, darktable IOP) — the static pipeline functions above become
+ *     directly callable in the including TU.  The canonical exe build is
+ *     untouched (flag absent ⇒ byte-identical, identity harness).
+ * JP: 組み込み用（VS プラグイン / darktable IOP が .c ごと include）。
+ *     フラグ無しの正規 exe ビルドはバイト一致のまま。
  * ================================================================ */
+#ifndef GALOSH_YUV_NOMAIN
 int main(int argc, char **argv)
 {
   /* GALOSH-420 planar-container options (spec docs/yuv420_frontend_spec.md);
@@ -1209,3 +1218,4 @@ int main(int argc, char **argv)
   dt_free_align(out_buf);
   return 0;
 }
+#endif /* GALOSH_YUV_NOMAIN */
