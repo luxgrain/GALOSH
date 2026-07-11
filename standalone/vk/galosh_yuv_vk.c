@@ -52,6 +52,10 @@ static void (*g_vk_fail_hook)(int) = NULL;
   if(g_vk_fail_hook) g_vk_fail_hook((int)_r); \
   exit(1); } } while(0)
 
+/* hook-aware fatal for non-CHECK failure sites (file/shader/memtype):
+ * CLI exits exactly as before (hook NULL); embedders recover. */
+#define VK_FATAL() do { if(g_vk_fail_hook) g_vk_fail_hook(-1); exit(1); } while(0)
+
 #define PARAMS_SIZE   32
 #define GAT_LUT_SIZE  4096
 #define O32_TILE      28
@@ -85,7 +89,7 @@ static uint32_t find_mem(uint32_t bits, VkMemoryPropertyFlags want)
   for(uint32_t i = 0; i < mp.memoryTypeCount; i++)
     if((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
       return i;
-  fprintf(stderr, "no memtype 0x%x\n", want); exit(1);
+  fprintf(stderr, "no memtype 0x%x\n", want); VK_FATAL();
 }
 
 /* like find_mem but returns -1 instead of exiting (optional properties) */
@@ -169,10 +173,15 @@ static VkShaderModule load_spv(const char *name)
   char path[1200];
   snprintf(path, sizeof(path), "%s/shaders/%s.spv", g_exe_dir, name);
   FILE *f = fopen(path, "rb");
-  if(!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+  if(!f)   /* flat layout fallback: g_exe_dir may BE the shader dir */
+  {
+    snprintf(path, sizeof(path), "%s/%s.spv", g_exe_dir, name);
+    f = fopen(path, "rb");
+  }
+  if(!f) { fprintf(stderr, "cannot open %s\n", path); VK_FATAL(); }
   fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
   uint32_t *code = malloc(sz);
-  if(fread(code, 1, sz, f) != (size_t)sz) { fprintf(stderr, "short read %s\n", path); exit(1); }
+  if(fread(code, 1, sz, f) != (size_t)sz) { fprintf(stderr, "short read %s\n", path); VK_FATAL(); }
   fclose(f);
   VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                   .codeSize = (size_t)sz, .pCode = code };
@@ -218,7 +227,7 @@ static void make_kernel(Kern *k)
 static VkDescriptorSet mkset(int kid, const Buf *bufs[], int n)
 {
   if(n != g_k[kid].nbind)
-  { fprintf(stderr, "mkset %s: %d bufs != %d binds\n", g_k[kid].spv, n, g_k[kid].nbind); exit(1); }
+  { fprintf(stderr, "mkset %s: %d bufs != %d binds\n", g_k[kid].spv, n, g_k[kid].nbind); VK_FATAL(); }
   VkDescriptorSetAllocateInfo a = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
     .descriptorPool = g_dpool, .descriptorSetCount = 1, .pSetLayouts = &g_k[kid].dsl };
   VkDescriptorSet ds; CHECK(vkAllocateDescriptorSets(g_dev, &a, &ds));
@@ -425,7 +434,7 @@ static Buf mk_staging(VkDeviceSize need, int want_cached)
     mt = find_mem_opt(mr.memoryTypeBits,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-  if(mt < 0) { fprintf(stderr, "no staging memtype\n"); exit(1); }
+  if(mt < 0) { fprintf(stderr, "no staging memtype\n"); VK_FATAL(); }
   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
     .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
   CHECK(vkAllocateMemory(g_dev, &mai, NULL, &b.mem));
