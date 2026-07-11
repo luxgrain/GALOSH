@@ -36,6 +36,18 @@ ahead of the BM3D/NLM family even when those are given an oracle noise level —
 while trained networks remain ahead in their own training domain (reported
 honestly in the paper).
 
+## Review snapshot vs. post-submission engineering
+
+The IEEE SPL submission (under review) corresponds to the **v0.1.0 snapshot**
+of this repository (arXiv:2607.03768 v1): the GALOSH core algorithm, the
+CPU/OpenCL reference implementations, and the benchmark campaign reported in
+the paper. Everything added since — the Vulkan V2 engine, GALOSH-420 planar
+containers, the YUV video modes, the speed tables, the Windows standalone
+builds, and the darktable / VapourSynth integration work — is
+**post-submission engineering**: reproducibility, deployment and portability
+work on the *same single-frame algorithm*. None of it extends the paper's
+scientific claims.
+
 ## Results
 
 **[▶ Interactive comparison viewer](https://luxgrain.github.io/GALOSH/)** —
