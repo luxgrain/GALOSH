@@ -566,6 +566,47 @@ static int galosh_yuv_vk_init_device(void)
   return 0;
 }
 
+/* ---- per-(W,H) run-buffer cache (2 slots, see run_core) ---- */
+typedef struct
+{
+  int valid, W, H;
+  Buf srgb_b, y_lin, y_stab, y_den, y_snap, cb_b, cr_b, cb_den, cr_den,
+      ne_scr, params, lut_d, lut_x, lut_p;
+} RunBufs;
+static RunBufs g_rb[2];
+static int g_rb_next = 0;
+
+static RunBufs *acquire_run_bufs(const int W, const int H)
+{
+  for(int i = 0; i < 2; i++)
+    if(g_rb[i].valid && g_rb[i].W == W && g_rb[i].H == H) return &g_rb[i];
+  RunBufs *rb = &g_rb[g_rb_next];
+  g_rb_next ^= 1;
+  if(rb->valid)
+  {
+    freebuf(&rb->srgb_b); freebuf(&rb->y_lin);
+    freebuf(&rb->y_stab); freebuf(&rb->y_den); freebuf(&rb->y_snap);
+    freebuf(&rb->cb_b); freebuf(&rb->cr_b);
+    freebuf(&rb->cb_den); freebuf(&rb->cr_den);
+    freebuf(&rb->ne_scr); freebuf(&rb->params);
+    freebuf(&rb->lut_d); freebuf(&rb->lut_x); freebuf(&rb->lut_p);
+  }
+  const size_t npix = (size_t)W * H;
+  const size_t fb = npix * 4, hb = npix * 2;
+  rb->W = W; rb->H = H;
+  rb->srgb_b = DEVBUF(3 * fb);
+  rb->y_lin  = DEVBUF(fb);
+  rb->y_stab = DEVBUF(hb); rb->y_den = DEVBUF(hb); rb->y_snap = DEVBUF(hb);
+  rb->cb_b = DEVBUF(hb); rb->cr_b = DEVBUF(hb);
+  rb->cb_den = DEVBUF(hb); rb->cr_den = DEVBUF(hb);
+  rb->ne_scr = DEVBUF((200000 + 64) * 4);
+  rb->params = DEVBUF(PARAMS_SIZE * 4);
+  rb->lut_d = DEVBUF(GAT_LUT_SIZE * 4); rb->lut_x = DEVBUF(GAT_LUT_SIZE * 4);
+  rb->lut_p = DEVBUF(8 * 4);
+  rb->valid = 1;
+  return rb;
+}
+
 /* ================= core: one YUV frame on device ================= */
 /* srgb: caller-owned 3ch interleaved f32 in/out (gamma sRGB domain —
  * exactly the OpenCL run_yuv_gat_gpu_buf contract).  luma_only skips the
@@ -626,16 +667,22 @@ static int run_core(float *srgb, const int W, const int H,
   else if(strncmp(g_noise_mode, "ema", 3) == 0)
   { fprintf(stderr, "[yuv_vk] --noise=ema not supported (v1: fit|hold|every:N)\n"); return 1; }
 
-  /* per-run buffers (sizes are frame-dependent; device/pipelines persist) */
-  Buf srgb_b = DEVBUF(3 * fb);
-  Buf y_lin  = DEVBUF(fb);
-  Buf y_stab = DEVBUF(hb), y_den = DEVBUF(hb), y_snap = DEVBUF(hb);
-  Buf cb_b = DEVBUF(hb), cr_b = DEVBUF(hb);
-  Buf cb_den = DEVBUF(hb), cr_den = DEVBUF(hb);
-  Buf ne_scr = DEVBUF((200000 + 64) * 4);
-  Buf params = DEVBUF(PARAMS_SIZE * 4);
-  Buf lut_d = DEVBUF(GAT_LUT_SIZE * 4), lut_x = DEVBUF(GAT_LUT_SIZE * 4);
-  Buf lut_p = DEVBUF(8 * 4);
+  /* per-run buffers, cached across calls per (W,H) — vkAllocateMemory is
+   * ~ms-slow under WDDM, and video use re-enters every frame (2 slots:
+   * the 420 composition alternates full-res luma / half-res chroma).
+   * Reuse is numerically inert: every buffer is fully (re)written before
+   * it is read within a frame.  (日) 毎フレームの確保/解放が支配的だった
+   * ため 2 スロットでキャッシュ。数値へは完全に不干渉。 */
+  RunBufs *rb = acquire_run_bufs(W, H);
+  Buf srgb_b = rb->srgb_b;
+  Buf y_lin  = rb->y_lin;
+  Buf y_stab = rb->y_stab, y_den = rb->y_den, y_snap = rb->y_snap;
+  Buf cb_b = rb->cb_b, cr_b = rb->cr_b;
+  Buf cb_den = rb->cb_den, cr_den = rb->cr_den;
+  Buf ne_scr = rb->ne_scr;
+  Buf params = rb->params;
+  Buf lut_d = rb->lut_d, lut_x = rb->lut_x;
+  Buf lut_p = rb->lut_p;
 
   upload(&srgb_b, srgb, 3 * fb, 0);
   float h_params[PARAMS_SIZE] = { 0 };
@@ -832,11 +879,7 @@ static int run_core(float *srgb, const int W, const int H,
     fprintf(stderr, "[yuv_vk] frame total %.1f ms\n",
             1000.0 * ((double)clock() / CLOCKS_PER_SEC - t0));
 
-  freebuf(&srgb_b); freebuf(&y_lin);
-  freebuf(&y_stab); freebuf(&y_den); freebuf(&y_snap);
-  freebuf(&cb_b); freebuf(&cr_b); freebuf(&cb_den); freebuf(&cr_den);
-  freebuf(&ne_scr); freebuf(&params);
-  freebuf(&lut_d); freebuf(&lut_x); freebuf(&lut_p);
+  /* buffers stay in the (W,H) cache slot — no per-frame free */
   CHECK(vkResetDescriptorPool(g_dev, g_dpool, 0));
   return 0;
 }
