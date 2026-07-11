@@ -223,7 +223,20 @@ def run_galosh_gpu(noisy, w, h, uid, strength=1.0, ls=1.0, cs=1.0,
                 continue
             dt = time.time() - t0
             if r.returncode == 0 and out_path.exists():
-                if cl_device is None: _galosh_cl_dev = d
+                # [2026-07-11] galosh.cl now builds AND runs on ALL vendors
+                # (de-FP64 + LOESS WG fix), so "first device that works" would
+                # silently accept a slow iGPU whenever the enumeration order
+                # shuffles.  Auto-probe therefore requires the exe's
+                # "<<< SELECTED" device line to name the NVIDIA card; a forced
+                # cl_device= argument keeps the old accept-anything behavior.
+                if cl_device is None:
+                    sel = next((ln for ln in
+                                r.stderr.decode("utf-8", "replace").splitlines()
+                                if "<<< SELECTED" in ln), "")
+                    if "NVIDIA" not in sel:
+                        out_path.unlink(missing_ok=True)
+                        continue
+                    _galosh_cl_dev = d
                 den = np.fromfile(str(out_path), dtype=np.float32).reshape(h, w)
                 out_path.unlink(missing_ok=True); in_path.unlink(missing_ok=True)
                 return den, dt
