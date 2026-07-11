@@ -80,6 +80,17 @@ static uint32_t find_mem(uint32_t bits, VkMemoryPropertyFlags want)
   fprintf(stderr, "no memtype 0x%x\n", want); exit(1);
 }
 
+/* like find_mem but returns -1 instead of exiting (optional properties) */
+static int find_mem_opt(uint32_t bits, VkMemoryPropertyFlags want)
+{
+  VkPhysicalDeviceMemoryProperties mp;
+  vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
+  for(uint32_t i = 0; i < mp.memoryTypeCount; i++)
+    if((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
+      return (int)i;
+  return -1;
+}
+
 static Buf mkbuf(VkDeviceSize sz, VkBufferUsageFlags use, VkMemoryPropertyFlags props)
 {
   Buf b; b.size = sz;
@@ -379,7 +390,40 @@ static const char *g_noise_mode = "fit";
 static const char *g_noise_state = NULL;
 
 /* ================= staging I/O ================= */
-static Buf g_stg; static void *g_stg_map;
+/* Two staging buffers: HOST_VISIBLE|COHERENT memory is typically
+ * write-combined — CPU WRITES are fast but READS crawl (~200 MB/s;
+ * measured 125 ms for a 25 MB readback memcpy).  Downloads therefore use
+ * a second buffer that prefers HOST_CACHED (graceful fallback when the
+ * device has no such type).  (日) 読み戻し用は HOST_CACHED を優先。 */
+static Buf g_stg;    static void *g_stg_map;      /* upload   (WC ok)   */
+static Buf g_stg_dn; static void *g_stg_dn_map;   /* download (cached)  */
+
+static Buf mk_staging(VkDeviceSize need, int want_cached)
+{
+  Buf b; b.size = need;
+  VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size = need,
+    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+  CHECK(vkCreateBuffer(g_dev, &bi, NULL, &b.buf));
+  VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_dev, b.buf, &mr);
+  int mt = -1;
+  if(want_cached)
+    mt = find_mem_opt(mr.memoryTypeBits,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                      VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+  if(mt < 0)
+    mt = find_mem_opt(mr.memoryTypeBits,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if(mt < 0) { fprintf(stderr, "no staging memtype\n"); exit(1); }
+  VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+    .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+  CHECK(vkAllocateMemory(g_dev, &mai, NULL, &b.mem));
+  CHECK(vkBindBufferMemory(g_dev, b.buf, b.mem, 0));
+  return b;
+}
 
 /* [embed] grow-only staging (re)allocation — replaces the fixed-size
  * creation the CLI used to do in main(); lets one device serve frames of
@@ -393,11 +437,14 @@ static void ensure_staging(VkDeviceSize need)
     vkUnmapMemory(g_dev, g_stg.mem);
     vkDestroyBuffer(g_dev, g_stg.buf, NULL);
     vkFreeMemory(g_dev, g_stg.mem, NULL);
+    vkUnmapMemory(g_dev, g_stg_dn.mem);
+    vkDestroyBuffer(g_dev, g_stg_dn.buf, NULL);
+    vkFreeMemory(g_dev, g_stg_dn.mem, NULL);
   }
-  g_stg = mkbuf(need,
-    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  g_stg = mk_staging(need, /*want_cached=*/0);
   CHECK(vkMapMemory(g_dev, g_stg.mem, 0, VK_WHOLE_SIZE, 0, &g_stg_map));
+  g_stg_dn = mk_staging(need, /*want_cached=*/1);
+  CHECK(vkMapMemory(g_dev, g_stg_dn.mem, 0, VK_WHOLE_SIZE, 0, &g_stg_dn_map));
 }
 
 /* [embed] in-memory noise state — the frameserver plugin holds the blind
@@ -407,6 +454,7 @@ typedef struct { int valid; float alpha, sigma_sq, sigma_gat; } galosh_vk_memsta
 
 /* [embed] per-frame log suppression for host processes (video spam). */
 static int g_vk_quiet = 0;
+
 
 static void upload(Buf *dst, const void *src, VkDeviceSize sz, VkDeviceSize dst_off)
 {
@@ -421,9 +469,9 @@ static void download(Buf *src, void *dst, VkDeviceSize sz, VkDeviceSize src_off)
 {
   VkCommandBuffer cb = cb_begin();
   VkBufferCopy c = { .srcOffset = src_off, .dstOffset = 0, .size = sz };
-  vkCmdCopyBuffer(cb, src->buf, g_stg.buf, 1, &c);
+  vkCmdCopyBuffer(cb, src->buf, g_stg_dn.buf, 1, &c);
   cb_submit_wait(cb);
-  memcpy(dst, g_stg_map, sz);
+  memcpy(dst, g_stg_dn_map, sz);
 }
 
 /* ================= device init (once per process) =================
@@ -862,11 +910,11 @@ static int run_core(float *srgb, const int W, const int H,
     VkBufferCopy c1 = { .srcOffset = 0, .dstOffset = 0, .size = 3 * fb };
     VkBufferCopy c2 = { .srcOffset = 0, .dstOffset = 3 * fb,
                         .size = PARAMS_SIZE * 4 };
-    vkCmdCopyBuffer(cb, srgb_b.buf, g_stg.buf, 1, &c1);
-    vkCmdCopyBuffer(cb, params.buf, g_stg.buf, 1, &c2);
+    vkCmdCopyBuffer(cb, srgb_b.buf, g_stg_dn.buf, 1, &c1);
+    vkCmdCopyBuffer(cb, params.buf, g_stg_dn.buf, 1, &c2);
     cb_submit_wait(cb);              /* the ONE wait of the fast path */
-    memcpy(srgb, g_stg_map, 3 * fb);
-    memcpy(h_params, (char *)g_stg_map + 3 * fb, PARAMS_SIZE * 4);
+    memcpy(srgb, g_stg_dn_map, 3 * fb);
+    memcpy(h_params, (char *)g_stg_dn_map + 3 * fb, PARAMS_SIZE * 4);
   }
   else
   {
