@@ -684,7 +684,20 @@ static int run_core(float *srgb, const int W, const int H,
   Buf lut_d = rb->lut_d, lut_x = rb->lut_x;
   Buf lut_p = rb->lut_p;
 
-  upload(&srgb_b, srgb, 3 * fb, 0);
+  /* [embed fast path] once the banding rates are learned and the frame is
+   * cheap (fast GPU), record the ENTIRE frame as ONE submission with a
+   * single wait: vkQueueWaitIdle costs ~ms under WDDM and the multi-
+   * segment layout paid it 20+ times per frame (measured 1080p: 3 ms GPU
+   * vs ~280 ms wall in the frameserver).  CLI runs (mem == NULL) never
+   * take this path — their structure is byte-for-byte untouched.  The
+   * banded multi-submission layout remains the TDR-safe fallback and the
+   * first-frame rate-learning path.  (日) 埋め込み時のみの 1 サブミッション
+   * 高速路。CLI は構造ごと不変。 */
+  const int fast = (mem != NULL) && g_rate_p12 > 0.0f &&
+      (luma_only || g_rate_loess > 0.0f) &&
+      ((double)g_rate_p12 * (double)AUP(H, O32_TILE) +
+       (luma_only ? 0.0 : (double)g_rate_loess * (double)AUP(H, 16))) < 300.0;
+
   float h_params[PARAMS_SIZE] = { 0 };
   if(hold_frame)   /* held model lands directly in the initial upload */
   {
@@ -692,7 +705,11 @@ static int run_core(float *srgb, const int W, const int H,
     h_params[P_SIGMA_SQ]  = st_s;
     h_params[P_SIGMA_GAT] = st_g;
   }
-  upload(&params, h_params, PARAMS_SIZE * 4, 0);
+  if(!fast)
+  {
+    upload(&srgb_b, srgb, 3 * fb, 0);
+    upload(&params, h_params, PARAMS_SIZE * 4, 0);
+  }
 
   /* [video] LUT sidecar: on hold frames load the 32 KB cache and skip the
    * device rebuild; a missing sidecar is fine (alpha/sigma_sq are already
@@ -746,6 +763,15 @@ static int run_core(float *srgb, const int W, const int H,
   /* ---- SEG 1: decompose + noise est + GAT + norm + LUT (one submit,
    * ZERO mid-frame readback — blueprint §5.2 deviation) ---- */
   VkCommandBuffer cb = cb_begin();
+  if(fast)
+  {
+    ensure_staging(3 * fb + 256);
+    memcpy(g_stg_map, srgb, 3 * fb);
+    VkBufferCopy c = { .srcOffset = 0, .dstOffset = 0, .size = 3 * fb };
+    vkCmdCopyBuffer(cb, g_stg.buf, srgb_b.buf, 1, &c);
+    vkCmdUpdateBuffer(cb, params.buf, 0, PARAMS_SIZE * 4, h_params);
+    barrier(cb);
+  }
   PCI(0, npix_i);
   dispatch_k(cb, K_SRGB2YCC, s_dec, pc, 1,
              (uint32_t)AUP(npix, 256), 1, 1, "YG1 srgb2ycc");
@@ -780,44 +806,75 @@ static int run_core(float *srgb, const int W, const int H,
     dispatch_k(cb, K_LUT_BUILD, s_lut, NULL, 0, GAT_LUT_SIZE / 256, 1, 1, "YG4c build_lut");
     dispatch_k(cb, K_LUT_FIN, s_lutf, NULL, 0, 1, 1, 1, "YG4d lut_fin");
   }
-  cb_submit_wait(cb);
-
-  /* ---- pass12 (banded, TDR-safe) ---- */
   PCI(0, W); PCI(1, H); PCF(2, strength_y); PCI(3, 1 /* phase_stride */);
-  dispatch_k_banded(kid_p12, s_p12, pc, 4,
-             (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE),
-             "YG4f pass12", &g_rate_p12);
+  if(fast)
+  {
+    dispatch_k(cb, kid_p12, s_p12, pc, 4,
+               (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE), 1,
+               "YG4f pass12");
+  }
+  else
+  {
+    cb_submit_wait(cb);
+    /* ---- pass12 (banded, TDR-safe) ---- */
+    dispatch_k_banded(kid_p12, s_p12, pc, 4,
+               (uint32_t)AUP(W, O32_TILE), (uint32_t)AUP(H, O32_TILE),
+               "YG4f pass12", &g_rate_p12);
+    cb = cb_begin();
+  }
 
   /* ---- SEG 2: denorm + inverse GAT (y_den in place; the OpenCL
    * copy-back to y_stab is skipped — documented deviation) ---- */
-  cb = cb_begin();
   PCI(0, P_SIGMA_GAT); PCI(1, npix_i);
   dispatch_k(cb, K_DENORM, s_den, pc, 2,
              (uint32_t)AUP(npix, 256), 1, 1, "YG4g' denorm");
   PCI(0, npix_i);
   dispatch_k(cb, K_MAKITALO, s_mak, pc, 1,
              (uint32_t)AUP(npix, 256), 1, 1, "YG4h makitalo");
-  cb_submit_wait(cb);
-
-  /* ---- chroma LOESS (banded, heavy) ---- */
+  /* ---- chroma LOESS (banded when not fast, heavy) ---- */
   if(!luma_only)
   {
     PCI(0, W); PCI(1, H); PCF(2, strength_c);
-    dispatch_k_banded(K_LOESS, s_lo, pc, 3,
-               (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16),
-               "YG5 loess", &g_rate_loess);
+    if(fast)
+      dispatch_k(cb, K_LOESS, s_lo, pc, 3,
+                 (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "YG5 loess");
+    else
+    {
+      cb_submit_wait(cb);
+      dispatch_k_banded(K_LOESS, s_lo, pc, 3,
+                 (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16),
+                 "YG5 loess", &g_rate_loess);
+      cb = cb_begin();
+    }
+  }
+  else if(!fast)
+  {
+    cb_submit_wait(cb);
+    cb = cb_begin();
   }
 
   /* ---- recompose + download ---- */
-  cb = cb_begin();
   PCI(0, npix_i);
   dispatch_k(cb, K_YCC2SRGB, s_rec, pc, 1,
              (uint32_t)AUP(npix, 256), 1, 1, "YG9 ycc2srgb");
-  cb_submit_wait(cb);
-  download(&srgb_b, srgb, 3 * fb, 0);
-
-  /* log the on-device blind fit (readback AFTER the frame — logging only) */
-  download(&params, h_params, PARAMS_SIZE * 4, 0);
+  if(fast)
+  {
+    VkBufferCopy c1 = { .srcOffset = 0, .dstOffset = 0, .size = 3 * fb };
+    VkBufferCopy c2 = { .srcOffset = 0, .dstOffset = 3 * fb,
+                        .size = PARAMS_SIZE * 4 };
+    vkCmdCopyBuffer(cb, srgb_b.buf, g_stg.buf, 1, &c1);
+    vkCmdCopyBuffer(cb, params.buf, g_stg.buf, 1, &c2);
+    cb_submit_wait(cb);              /* the ONE wait of the fast path */
+    memcpy(srgb, g_stg_map, 3 * fb);
+    memcpy(h_params, (char *)g_stg_map + 3 * fb, PARAMS_SIZE * 4);
+  }
+  else
+  {
+    cb_submit_wait(cb);
+    download(&srgb_b, srgb, 3 * fb, 0);
+    /* log the on-device blind fit (readback AFTER the frame) */
+    download(&params, h_params, PARAMS_SIZE * 4, 0);
+  }
   if(!g_vk_quiet)
     fprintf(stderr, "[yuv_vk] %dx%d blind sigma=%.5f alpha=%.6g sigma_sq=%.6e "
                     "sigma_gat=%.4f s_y=%.2f s_c=%.2f%s%s\n",
