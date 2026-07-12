@@ -156,3 +156,6 @@ _backup/
 
 # Vulkan build artifacts
 *.spv
+
+# script stdout logs (may embed absolute local paths — never commit)
+*.log
