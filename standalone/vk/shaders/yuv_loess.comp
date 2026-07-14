@@ -28,16 +28,31 @@ layout(std430, binding = 1) restrict readonly  buffer B1 { float16_t cb_in[]; };
 layout(std430, binding = 2) restrict readonly  buffer B2 { float16_t cr_in[]; };
 layout(std430, binding = 3) restrict writeonly buffer B3 { float16_t cb_out[]; };
 layout(std430, binding = 4) restrict writeonly buffer B4 { float16_t cr_out[]; };
-layout(push_constant) uniform PC { int width; int height; float strength_c; } pc;
+layout(std430, binding = 5) restrict readonly  buffer B5 { float params[]; };
+layout(push_constant) uniform PC { int width; int height; float strength_c; int halfres420; } pc;
 
-const int   YG_LOESS_RADIUS = 7;
+const int   YG_LOESS_RADIUS = 7;    /* full-res (444) default */
 const float YG_LOESS_BW     = 3.0f;
+const int   P_SIGMA_SQ      = 14;   /* params[] index = blind sigma_sq */
 
 void main()
 {
   const int x = int(gl_GlobalInvocationID.x);
   const int y = int(gl_GlobalInvocationID.y);
   if(x >= pc.width || y >= pc.height) return;
+
+  /* [GALOSH-420 2026-07-12] noise-adaptive chroma radius on the NATIVE
+   * half-res 4:2:0 lattice — port of the CPU galosh_yuv420_chroma_radius:
+   * the full-res R=7 window covers ~4x area at half-res and over-smooths
+   * iso-luminant chroma (Cr fell below noisy on Set8 sigma20).  sigma_lin =
+   * sqrt(sigma_sq) (uniform across the image so R is uniform): <0.027 -> R=2,
+   * else R=3.  444 (full-res chroma) keeps R=7.  JP: 半解像度420クロマのみ
+   * σ_lin から半径可変(2/3)、444はR=7据置。*/
+  int R = YG_LOESS_RADIUS;
+  if(pc.halfres420 != 0) {
+    const float sigma_lin = sqrt(max(params[P_SIGMA_SQ], 0.0f));
+    R = (sigma_lin < 0.027f) ? 2 : 3;
+  }
 
   const int cx = y * pc.width + x;
   const float Y_c = float(y_guide[cx]);
@@ -48,11 +63,11 @@ void main()
   float sumYCb = 0.0f, sumYCr = 0.0f;
   float lo_cb = 1e30f, hi_cb = -1e30f, lo_cr = 1e30f, hi_cr = -1e30f;
 
-  for(int dy = -YG_LOESS_RADIUS; dy <= YG_LOESS_RADIUS; dy++){
+  for(int dy = -R; dy <= R; dy++){
     int yi = y + dy;
     if(yi < 0) yi = -yi;
     if(yi >= pc.height) yi = 2 * pc.height - yi - 2;
-    for(int dx = -YG_LOESS_RADIUS; dx <= YG_LOESS_RADIUS; dx++){
+    for(int dx = -R; dx <= R; dx++){
       int xi = x + dx;
       if(xi < 0) xi = -xi;
       if(xi >= pc.width) xi = 2 * pc.width - xi - 2;

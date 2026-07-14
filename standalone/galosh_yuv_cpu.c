@@ -91,6 +91,13 @@
 static int g_yuv_stride   = 2;   /* [LATEST] */
 static int g_yuv_n_orient = 1;   /* [LATEST] */
 
+/* [GALOSH-420 2026-07-12] Half-res 4:2:0 chroma flag.  When set (by the
+ * 420 driver ONLY, and only for pix==420), the linear-domain chroma LOESS
+ * uses a noise-adaptive radius (galosh_yuv420_chroma_radius) instead of the
+ * full-res GALOSH_LOESS_RADIUS.  0 = legacy/full-res behaviour (unchanged
+ * for 4:2:2 / 4:4:4 / the legacy sRGB path). */
+static int g_yuv420_halfres_chroma = 0;
+
 /* GALOSH_YUV_G adopts MAD-based BayesShrink (Pass1 sigma_Y estimator)
  * unconditionally.  sigma_Y = median(|AC coef|)/0.6745, robust to ~25%
  * outlier coefficients (Donoho-Johnstone 1995).  Kills the spatial noise
@@ -641,6 +648,50 @@ cleanup:
 }
 
 /* ================================================================
+ * [GALOSH-420 2026-07-12] Noise-adaptive chroma LOESS radius for the
+ * NATIVE half-resolution 4:2:0 lattice.
+ *
+ * EN: GALOSH_LOESS_RADIUS (=7, 15x15 window) is calibrated for a FULL-
+ *     resolution chroma lattice.  Applied unchanged on the 4:2:0 half-res
+ *     lattice it covers ~30x30 full-res pixels (4x the area), and because
+ *     galosh_loess_chroma is a pure guide-Y projection with NO fidelity
+ *     term on the input chroma (out = a*Y_c + b), that oversized window
+ *     annihilates chroma structure orthogonal to local luma (iso-luminant
+ *     hue edges).  Measured effect: on Set8 the native-420 Cr fell BELOW
+ *     the noisy input at sigma20 (34.01 vs 34.53 dB); the 444-then-
+ *     downsample route did not (34.88).  Matching the footprint to the
+ *     444 route restores it.  The optimum is mildly noise-dependent
+ *     (bias-variance crossover): low noise favours a tight window
+ *     (structure preservation), high noise a slightly wider one (variance
+ *     reduction).  Calibrated on Set8 (tractor+snowboard f40, sigma 10-50;
+ *     benchmark/results_set8_video/_diag): the per-sigma argmax over
+ *     R in {1..7} is R=2 for sigma_lin<=~0.023 (sigma10/20) and R=3 for
+ *     sigma_lin>=~0.031 (sigma30-50).  Threshold 0.027 (the midpoint)
+ *     recovers Cr ~+1.8 dB at sigma20 and ~+0.6 at sigma50 and beats the
+ *     444 route, while R=2/R=3 differ by <0.1 dB right at the boundary
+ *     (insensitive).  sigma_lin = sqrt(sigma_sq) = the blind MAD estimate.
+ *     Only 4:2:0 uses this (4:2:2 / 4:4:4 chroma is processed at full res,
+ *     where GALOSH_LOESS_RADIUS is already correct).  Env
+ *     GALOSH_YUV420_CHROMA_R=<1..7> pins a fixed radius (A/B, regression
+ *     bisection, or extreme-noise override beyond the calibrated range).
+ * JP: 半解像度4:2:0クロマのLOESS半径をブラインドσから決定。R=7は
+ *     フル解像度較正値で、半解像度では実効footprintが約2倍(面積4倍)に
+ *     なり、fidelity項の無いguide-Y射影(out=a*Y_c+b)が等輝度色エッジ
+ *     (色相のみの境界)を過平均で消す(Set8 σ20でnative-420のCrがnoisy
+ *     未満34.01<34.53に劣化、444経由は34.88で無事)。444経路とfootprintを
+ *     揃えると回復。最適はσ依存(bias-variance crossover): σ小→R小(構造
+ *     保存)/σ大→Rやや大(分散低減)。Set8較正でσ_lin<0.027→R=2, 以上→R=3
+ *     (境界でのR=2/3差は<0.1dBで鈍感)。422/444はフル解像度なので不変。
+ *     GALOSH_YUV420_CHROMA_R で固定Rを強制(A/B・回帰二分・範囲外の高σ)。
+ * ================================================================ */
+static int galosh_yuv420_chroma_radius(float sigma_lin)
+{
+  const char *e = getenv("GALOSH_YUV420_CHROMA_R");
+  if(e && e[0]) { const int v = atoi(e); if(v >= 1 && v <= 7) return v; }
+  return (sigma_lin < 0.027f) ? 2 : 3;
+}
+
+/* ================================================================
  * [LATEST: GALOSH-420] galosh_yuv_denoise_linear_rgb — LINEAR-domain twin
  * of galosh_yuv_denoise_srgb (Phase 1-3 identical; Phase 0/4 gamma codecs
  * removed; the final linear [0,1] clip is retained).
@@ -723,6 +774,17 @@ static void galosh_yuv_denoise_linear_rgb(const float *restrict in_lin,
   if(g_galosh_yuv_use_q || g_galosh_yuv_use_p)
     galosh_yuv_chroma_pyramid_p(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
                                 width, height, strength_c);
+  else if(g_yuv420_halfres_chroma)
+  {
+    /* [GALOSH-420 2026-07-12] noise-adaptive half-res radius; see
+     * galosh_yuv420_chroma_radius above.  sigma_lin = sqrt(sigma_sq). */
+    const float sigma_lin = sqrtf(sigma_sq);
+    const int R = galosh_yuv420_chroma_radius(sigma_lin);
+    fprintf(stderr, "[yuv420_core] half-res chroma LOESS R=%d "
+            "(adaptive, sigma_lin=%.5f)\n", R, sigma_lin);
+    galosh_loess_chroma_r(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
+                          width, height, strength_c, R);
+  }
   else
     galosh_loess_chroma(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
                         width, height, strength_c);
@@ -942,9 +1004,14 @@ static int galosh_yuv420_main(const char *in_path, const char *out_path,
       rgb[3 * i + 2] = galosh420_eotf_inv_f(B, eotf);
     }
 
+    /* [GALOSH-420 2026-07-12] enable the noise-adaptive chroma radius ONLY
+     * on the native half-res 4:2:0 lattice (4:2:2 / 4:4:4 process chroma at
+     * full res, where the full-res GALOSH_LOESS_RADIUS is already correct). */
+    g_yuv420_halfres_chroma = (pix == GALOSH420_PIX_420) ? 1 : 0;
     galosh_yuv_denoise_linear_rgb(rgb, rgb, pw, ph,
                                   strength_y, strength_c,
                                   alpha_cli, sigma_cli);
+    g_yuv420_halfres_chroma = 0;
 
     /* EOTF + NCL → extract denoised Cb/Cr at the processing lattice */
     DT_OMP_FOR()

@@ -162,7 +162,7 @@ static Kern g_k[K_COUNT] = {
   [K_PASS12]     = { "o32_pass12",        2, 16 },
   [K_PASS12_SG]  = { "o32_pass12_sg",     2, 16, .sg32 = 1 },
   [K_MAKITALO]   = { "yuv_makitalo",      5,  4 },
-  [K_LOESS]      = { "yuv_loess",         5, 12 },
+  [K_LOESS]      = { "yuv_loess",         6, 16 },
   [K_YCC2SRGB]   = { "yuv_ycc2srgb",      4,  4 },
 };
 
@@ -391,6 +391,10 @@ static void dispatch_k_banded(int kid, VkDescriptorSet ds,
   if(g_ts_n < 255) g_ts_n += 2;
 }
 static float g_rate_p12 = 0.0f, g_rate_loess = 0.0f;
+/* [GALOSH-420 2026-07-12] set to 1 by the 420 driver / frameserver before the
+ * NATIVE half-res chroma run_core pass so the LOESS shader uses the noise-
+ * adaptive radius (R=2/3) instead of the full-res R=7.  0 = full-res (444). */
+static int g_vk_yuv420_halfres = 0;
 
 /* [video] --noise=fit|hold|every:N + --noise-state=FILE — same semantics
  * as the RAW Vulkan host (galosh_vk.c B5).  YUV holds THREE scalars
@@ -814,7 +818,8 @@ static int run_core(float *srgb, const int W, const int H,
   VkDescriptorSet s_p12   = SET(kid_p12, &y_stab, &y_den);
   VkDescriptorSet s_den   = SET(K_DENORM, &y_den, &params);
   VkDescriptorSet s_mak   = SET(K_MAKITALO, &y_den, &y_lin, &lut_d, &lut_x, &lut_p);
-  VkDescriptorSet s_lo    = SET(K_LOESS, &y_snap, &cb_b, &cr_b, &cb_den, &cr_den);
+  VkDescriptorSet s_lo    = SET(K_LOESS, &y_snap, &cb_b, &cr_b, &cb_den,
+                                &cr_den, &params);
   /* recompose: chroma = LOESS out, or the untouched noisy planes when
    * luma_only (420 gray pass — blueprint §7.2 rebind) */
   VkDescriptorSet s_rec   = luma_only
@@ -828,6 +833,15 @@ static int run_core(float *srgb, const int W, const int H,
   /* ---- SEG 1: decompose + noise est + GAT + norm + LUT (one submit,
    * ZERO mid-frame readback — blueprint §5.2 deviation) ---- */
   VkCommandBuffer cb = cb_begin();
+  /* [GALOSH-420 2026-07-12] held frames skip the GPU noise-est kernels, so the
+   * held (memstate) params must be uploaded for the LOESS radius shader to read
+   * a valid sigma_sq.  The fast path already does this below; the banded path
+   * otherwise leaves params stale -> wrong adaptive R on held chroma frames. */
+  if(hold_frame && !fast)
+  {
+    vkCmdUpdateBuffer(cb, params.buf, 0, PARAMS_SIZE * 4, h_params);
+    barrier(cb);
+  }
   if(fast)
   {
     ensure_staging(3 * fb + 256);
@@ -899,14 +913,16 @@ static int run_core(float *srgb, const int W, const int H,
   /* ---- chroma LOESS (banded when not fast, heavy) ---- */
   if(!luma_only)
   {
-    PCI(0, W); PCI(1, H); PCF(2, strength_c);
+    /* [GALOSH-420 2026-07-12] halfres420 flag -> shader picks the noise-
+     * adaptive chroma radius (R=2/3) instead of the full-res R=7. */
+    PCI(0, W); PCI(1, H); PCF(2, strength_c); PCI(3, g_vk_yuv420_halfres);
     if(fast)
-      dispatch_k(cb, K_LOESS, s_lo, pc, 3,
+      dispatch_k(cb, K_LOESS, s_lo, pc, 4,
                  (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "YG5 loess");
     else
     {
       cb_submit_wait(cb);
-      dispatch_k_banded(K_LOESS, s_lo, pc, 3,
+      dispatch_k_banded(K_LOESS, s_lo, pc, 4,
                  (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16),
                  "YG5 loess", &g_rate_loess);
       cb = cb_begin();
@@ -1116,7 +1132,11 @@ static int run_420(const char *in_path, const char *out_path,
       rgb[3 * i + 1] = galosh420_eotf_fwd_f(galosh420_eotf_inv_f(G, eotf), GALOSH420_EOTF_SRGB);
       rgb[3 * i + 2] = galosh420_eotf_fwd_f(galosh420_eotf_inv_f(B, eotf), GALOSH420_EOTF_SRGB);
     }
+    /* [GALOSH-420 2026-07-12] noise-adaptive chroma radius only on the native
+     * half-res 4:2:0 lattice (422/444 chroma is full-res -> R=7 unchanged). */
+    g_vk_yuv420_halfres = (pix == GALOSH420_PIX_420) ? 1 : 0;
     if(run_core(rgb, pw, ph, sy, sc, /*luma_only=*/0, "_chroma", NULL)) return 1;
+    g_vk_yuv420_halfres = 0;
     for(size_t i = 0; i < psz; i++)
     {
       const float Rp = galosh420_eotf_fwd_f(
