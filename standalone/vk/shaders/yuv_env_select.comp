@@ -1,0 +1,57 @@
+#version 450
+/* yuv_env_select.comp — [2026-07-19 Y-ENV Vulkan port]  ON-DEVICE
+ * degenerate detection + MAD fallback selection, preserving the vk YUV
+ * host's ZERO-mid-frame-readback design (blueprint §5.2) while mirroring
+ * the CPU blind_alpha_sigma semantics exactly:
+ *
+ *   mode 0 (dispatched between ne_finalize and the dark passes — the ONLY
+ *     point where the floor pair discriminates; ne_finalize's valid path
+ *     writes σ²=0 placeholder while both degenerate branches write
+ *     (α=1e-4, σ²=1e-6), and the dark refine later overwrites σ²):
+ *       params[P_ENV_DEGEN] = (α==1e-4 && σ²==1e-6) ? 1 : 0
+ *
+ *   mode 1 (dispatched after dark refine + the fallback lap_mad/synth pair
+ *     that wrote MAD α/σ² into the spare slots 26/27):
+ *       degenerate -> adopt the MAD pair (CPU: "envelope est degenerate ->
+ *       MAD fallback"; yuv_synth_alpha already applies the CPU clamps)
+ *       valid      -> clamp α>=1e-5, σ²>=1e-8 (CPU blind_alpha_sigma)
+ *
+ * (日) 中間 readback ゼロを守るためのオンデバイス fallback。mode 0 で
+ * floor ペア判定 (dark refine が σ² を上書きする前が唯一の判定点)、
+ * mode 1 で MAD 採用 or クランプ。CPU と同一セマンティクス。 */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer B0 { float params[]; };
+
+layout(push_constant) uniform PC { int mode; } pc;
+
+const int P_ALPHA        = 13;
+const int P_SIGMA_SQ     = 14;
+const int P_ENV_DEGEN    = 25;
+const int P_ALPHA_MAD    = 26;
+const int P_SIGMA_SQ_MAD = 27;
+
+void main()
+{
+  if(gl_GlobalInvocationID.x != 0u) return;
+
+  if(pc.mode == 0)
+  {
+    params[P_ENV_DEGEN] =
+        (params[P_ALPHA] == 1e-4f && params[P_SIGMA_SQ] == 1e-6f) ? 1.0 : 0.0;
+  }
+  else
+  {
+    if(params[P_ENV_DEGEN] > 0.5)
+    {
+      params[P_ALPHA]    = params[P_ALPHA_MAD];
+      params[P_SIGMA_SQ] = params[P_SIGMA_SQ_MAD];
+    }
+    else
+    {
+      params[P_ALPHA]    = max(params[P_ALPHA],    1e-5f);
+      params[P_SIGMA_SQ] = max(params[P_SIGMA_SQ], 1e-8f);
+    }
+  }
+}

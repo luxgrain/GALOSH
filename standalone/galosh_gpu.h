@@ -146,6 +146,8 @@ static float cl_half_to_float(cl_half h)
 #define P_YG_SIGMA_CB     21
 #define P_YG_SIGMA_CR     22
 #define P_YG_EPS_BIV      23
+/* [2026-07-19 Y-ENV] envelope noise-est scratch slot (dark threshold) */
+#define P_ENV_DARK_THRESH 24
 
 /* Memory allocation */
 static inline float *alloc_float(size_t n) {

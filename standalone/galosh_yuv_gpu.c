@@ -49,8 +49,10 @@ static int g_yuv_fp16 = 0;
  *
  * JP: sRGB 入力を linear YCbCr に分解し、Y は GAT+LOSH+Makitalo 逆、
  *     Cb/Cr は Y 駆動線形 VST+LOSH+逆 VST + bivariate Wiener で
- *     処理する完全 GPU パイプライン。Foi+Alenius blind estimation で
- *     Y の (α,σ²) を推定し、Cb/Cr パラメータは解析式で導出。
+ *     処理する完全 GPU パイプライン。Y の (α,σ²) は Laplacian-MAD +
+ *     合成 α で推定（c5481e0 以降 両モード共通; CPU canonical は
+ *     2026-07-19 に single-plane lower-envelope へ切替済みで、GPU の
+ *     envelope 移植は GPU 解放待ちの queued 作業）。Cb/Cr は解析式。
  *
  * 2-source CL build: galosh_fused.cl + galosh_yuv_gat.cl
  * I/O: 3ch sRGB float32 interleaved (H×W×3)
@@ -62,6 +64,23 @@ static int g_yuv_fp16 = 0;
  *     byte-identical through the thin wrapper below).
  * JP: バッファ入出力版コア（420 用リファクタ）。srgb は呼び出し側所有。
  *     旧 fread/fwrite 間の計算は完全不変（ラッパ経由でバイト一致検証済み）。 */
+/* [2026-07-19 PARITY] GALOSH-420 half-res chroma lane marker + the CPU
+ * reference's noise-adaptive half-res LOESS radius (galosh_yuv_cpu.c
+ * galosh_yuv420_chroma_radius, added in 146b5ab 2026-07-14 CPU-only; the
+ * GPU lane had silently stayed at the legacy full-res R=7).  The flag is
+ * set by run_yuv420_gpu around its chroma-lane core call ONLY — the legacy
+ * sRGB route and the 420 luma lane keep R=7 (luma lane chroma is all-zero,
+ * radius-invariant).  Same env override, same threshold as CPU.
+ * (日) 420 クロマレーン専用: CPU の noise-adaptive R (2/3, env 上書き可) を
+ * GPU にも適用するフラグ。レガシー経路は R=7 不変。 */
+static int g_yuv420_halfres_chroma = 0;
+static int galosh_yuv420_chroma_radius_host(float sigma_lin)
+{
+    const char *e = getenv("GALOSH_YUV420_CHROMA_R");
+    if(e && e[0]) { const int v = atoi(e); if(v >= 1 && v <= 7) return v; }
+    return (sigma_lin < 0.027f) ? 2 : 3;
+}
+
 static int run_yuv_gat_gpu_buf(float *srgb,
                                int width, int height,
                                float strength_y, float strength_c,
@@ -88,6 +107,11 @@ static int run_yuv_gat_gpu_buf(float *srgb,
     cl_kernel k_srgb2ycbcr = NULL, k_ycbcr2srgb = NULL;
     cl_kernel k_blk_stats = NULL, k_dark_samp = NULL, k_noise_est = NULL;
     cl_kernel k_dark_lap = NULL, k_dark_final = NULL, k_chroma_derive = NULL;
+    /* [2026-07-19 Y-ENV] envelope chain (CPU-canonical port): 3 new
+     * single-plane kernels + 3 REUSED o32 kernels (plane-agnostic). */
+    cl_kernel k_env_blk = NULL, k_env_fin = NULL, k_env_dark_th = NULL,
+              k_env_dark_thf = NULL, k_env_dark_lap = NULL,
+              k_env_dark_fin = NULL;
     cl_kernel k_gat_fwd = NULL;
     cl_kernel k_f2h = NULL, k_h2f = NULL;
     cl_kernel k_build_lut = NULL, k_lut_fin = NULL;
@@ -130,6 +154,7 @@ static int run_yuv_gat_gpu_buf(float *srgb,
     cl_mem gf_a_cr_x    = NULL, gf_b_cr_x    = NULL;
     cl_mem blk_mean_buf = NULL, blk_var_buf = NULL;
     cl_mem dark_hist_buf = NULL, lap_hist_buf = NULL;
+    cl_mem env_dark_hist_buf = NULL, env_lap_hist_buf = NULL;  /* Y-ENV 4096-bin */
     cl_mem params_buf = NULL;
     cl_mem lut_d_buf = NULL, lut_x_buf = NULL, lut_params_buf = NULL;
     /* [LATEST: GALOSH_YUV_Q] chroma pyramid buffers (FP16 throughout
@@ -238,6 +263,13 @@ static int run_yuv_gat_gpu_buf(float *srgb,
     YG_KERNEL(k_dark_lap,     "galosh_yuv_noise_dark_lap_hist_Y");
     YG_KERNEL(k_dark_final,   "galosh_yuv_noise_dark_finalize_Y");
     YG_KERNEL(k_chroma_derive,"galosh_yuv_chroma_params_derive");
+    /* [2026-07-19 Y-ENV] envelope chain (default noise est; CPU canonical) */
+    YG_KERNEL(k_env_blk,      "galosh_yuv_env_block_stats");
+    YG_KERNEL(k_env_fin,      "galosh_o32_ne_finalize");
+    YG_KERNEL(k_env_dark_th,  "galosh_yuv_env_dark_thresh_hist");
+    YG_KERNEL(k_env_dark_thf, "galosh_o32_ne_dark_thresh_finalize");
+    YG_KERNEL(k_env_dark_lap, "galosh_yuv_env_dark_lap_hist");
+    YG_KERNEL(k_env_dark_fin, "galosh_o32_ne_dark_finalize");
     YG_KERNEL(k_gat_fwd,      "galosh_yuv_gat_forward_Y");
     YG_KERNEL(k_f2h,          "galosh_yuv_float_to_half");
     YG_KERNEL(k_h2f,          "galosh_yuv_half_to_float");
@@ -326,6 +358,9 @@ static int run_yuv_gat_gpu_buf(float *srgb,
         blk_var_buf   = clCreateBuffer(context, CL_MEM_READ_WRITE, ne_total * sizeof(float), NULL, &err);
         dark_hist_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, 1024 * sizeof(cl_int), NULL, &err);
         lap_hist_buf  = clCreateBuffer(context, CL_MEM_READ_WRITE, 2048 * sizeof(cl_int), NULL, &err);
+        /* [Y-ENV] 4096-bin dark histograms (CPU env spec = O32_DARK_HIST_BINS) */
+        env_dark_hist_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, 4096 * sizeof(cl_int), NULL, &err);
+        env_lap_hist_buf  = clCreateBuffer(context, CL_MEM_READ_WRITE, 4096 * sizeof(cl_int), NULL, &err);
         if(err) { fprintf(stderr, "[YUV_GAT] alloc noise bufs err=%d\n", err); goto yg_cleanup; }
 
         params_buf     = clCreateBuffer(context, CL_MEM_READ_WRITE, PARAMS_SIZE * sizeof(float), NULL, &err);
@@ -440,7 +475,10 @@ static int run_yuv_gat_gpu_buf(float *srgb,
     /* ================================================================
      * Phase 2: Y blind noise estimation.
      *
-     * [LATEST: GALOSH_YUV_O] (default) — Foi+Alenius 2008 block-based.
+     * [LATEST: GALOSH_YUV_O] (default) — Laplacian-MAD since c5481e0
+     *   (the pre-fix default was the Foi+Alenius 2008 block regression,
+     *   now [DEPRECATED] below; CPU canonical moved to the single-plane
+     *   lower-envelope 2026-07-19 — GPU envelope port is QUEUED).
      * [LATEST: GALOSH_YUV_Q] (--variant=q) — Laplacian-MAD on Y plane,
      *   matching CPU galosh_yuv_cpu --variant=q.  Single-workgroup
      *   histogram median; output σ_lin → params[P_YG_SIGMA_Y], then
@@ -448,12 +486,131 @@ static int run_yuv_gat_gpu_buf(float *srgb,
      * ================================================================ */
     /* Noise est = Laplacian-MAD → synth α/σ², which MATCHES the canonical CPU
      * galosh_yuv_cpu (YUV_G): GPU-MAD α≈0.00177 vs CPU 0.00170 (verified 2026-06-28).
-     * The legacy block-mean/var Foi-Alenius regression (else branch below, reusing
+     * The legacy block-mean/var Foi-Alenius regression (dead branch below, reusing
      * the RAW-Bayer galosh_noise_estimate kernel) FLOORS / systematically
      * underestimates on the SINGLE-PLANE Y (α=1e-4 floor on small frames, 0.0006 vs
-     * CPU 0.0021 on full frames) → GPU under-denoised by ~4.6 dB.  Both default and
-     * --variant=q now use the MAD path; the block path is kept [DEPRECATED]. */
-    if(1)  /* was: if(g_galosh_yuv_q_gpu) */
+     * CPU 0.0021 on full frames) → GPU under-denoised by ~4.6 dB.
+     *
+     * [2026-07-19 Y-ENV] DEFAULT = the envelope chain (§Y-ENV in galosh.cl),
+     * the faithful port of the CPU canonical estimate_noise_plane_envelope
+     * (ablation: +0.39 dB / −0.056 LPIPS vs MAD over 54 cells).  Selection
+     * mirrors the CPU blind_alpha_sigma exactly:
+     *   GALOSH_YUV_NOISE_EST unset  -> envelope, MAD fallback on degenerate
+     *   GALOSH_YUV_NOISE_EST=mad    -> legacy Laplacian-MAD + synthetic α
+     * Degenerate detection = the o32 floor literals (α==1e-4 && σ²==1e-6). */
+    const char *yuv_env_nem = getenv("GALOSH_YUV_NOISE_EST");
+    const int yuv_env_use_mad =
+        (yuv_env_nem && strcmp(yuv_env_nem, "mad") == 0);
+    int yuv_env_degenerate = 0;
+    if(!yuv_env_use_mad)
+    {
+        const int env_n_bx = width / 16;
+        const int env_n_by = height / 16;
+        const int env_total = env_n_bx * env_n_by;
+        const cl_int zero = 0;
+        clEnqueueFillBuffer(queue, env_dark_hist_buf, &zero, sizeof(cl_int),
+                            0, 4096 * sizeof(cl_int), 0, NULL, NULL);
+        clEnqueueFillBuffer(queue, env_lap_hist_buf, &zero, sizeof(cl_int),
+                            0, 4096 * sizeof(cl_int), 0, NULL, NULL);
+
+        /* Y-ENV.1: single-plane block stats (16x16, exact rank-n/2 median) */
+        clSetKernelArg(k_env_blk, 0, sizeof(cl_mem), &y_buf);
+        clSetKernelArg(k_env_blk, 1, sizeof(cl_mem), &blk_mean_buf);
+        clSetKernelArg(k_env_blk, 2, sizeof(cl_mem), &blk_var_buf);
+        clSetKernelArg(k_env_blk, 3, sizeof(int), &width);
+        clSetKernelArg(k_env_blk, 4, sizeof(int), &height);
+        clSetKernelArg(k_env_blk, 5, sizeof(int), &env_n_bx);
+        clSetKernelArg(k_env_blk, 6, sizeof(int), &env_n_by);
+        dispatch_1d_named(queue, k_env_blk, align_up(env_total, 64), 64,
+                          "YENV1 blk_stats");
+
+        /* Y-ENV.2: lower-envelope + Huber WLS (o32 kernel, lws 256) */
+        clSetKernelArg(k_env_fin, 0, sizeof(cl_mem), &blk_mean_buf);
+        clSetKernelArg(k_env_fin, 1, sizeof(cl_mem), &blk_var_buf);
+        clSetKernelArg(k_env_fin, 2, sizeof(cl_mem), &y_buf);
+        clSetKernelArg(k_env_fin, 3, sizeof(int), &width);
+        clSetKernelArg(k_env_fin, 4, sizeof(int), &height);
+        clSetKernelArg(k_env_fin, 5, sizeof(int), &env_total);
+        clSetKernelArg(k_env_fin, 6, sizeof(cl_mem), &params_buf);
+        dispatch_1d_named(queue, k_env_fin, 256, 256, "YENV2 ne_finalize");
+
+        /* [2026-07-19 FIX] Degenerate check MUST sit between YENV2 and the
+         * dark passes.  ne_finalize's valid path writes σ²=0 (placeholder,
+         * later overwritten by YENV4b) while both degenerate branches write
+         * the floor pair (α=1e-4, σ²=1e-6) — so HERE the pair discriminates
+         * perfectly.  The first wiring checked after YENV4b: the dark refine
+         * had already overwritten σ² with a real value, the && never fired,
+         * and a degenerate lane sailed on with α=1e-4 instead of falling
+         * back to MAD (caught on the 420 chroma lane vs the CPU reference,
+         * which returns degenerate BEFORE its own dark refine — same order).
+         * (日) degenerate 判定は YENV2 直後必須 — dark refine が σ² を上書き
+         * する前でないと floor ペアが壊れる (CPU も dark refine 前に return)。 */
+        {
+            clFinish(queue);
+            float est2[2];
+            clEnqueueReadBuffer(queue, params_buf, CL_TRUE,
+                                P_ALPHA * sizeof(float), 2 * sizeof(float),
+                                est2, 0, NULL, NULL);
+            if(est2[0] == 1e-4f && est2[1] == 1e-6f)
+            {
+                yuv_env_degenerate = 1;
+                fprintf(stderr, "[YUV_GPU] envelope est degenerate -> MAD "
+                                "fallback\n");
+            }
+        }
+
+        /* Y-ENV.3: dark threshold (stride-3 hist + 10th-percentile scan) */
+        if(!yuv_env_degenerate)
+        {
+            const int gsx = (width + 2) / 3, gsy = (height + 2) / 3;
+            const int env_slot = P_ENV_DARK_THRESH;
+            clSetKernelArg(k_env_dark_th, 0, sizeof(cl_mem), &y_buf);
+            clSetKernelArg(k_env_dark_th, 1, sizeof(int), &width);
+            clSetKernelArg(k_env_dark_th, 2, sizeof(int), &height);
+            clSetKernelArg(k_env_dark_th, 3, sizeof(cl_mem), &env_dark_hist_buf);
+            dispatch_2d_named(queue, k_env_dark_th,
+                              align_up(gsx, 8), align_up(gsy, 8), 8, 8,
+                              "YENV3a dark_thresh_hist");
+            clSetKernelArg(k_env_dark_thf, 0, sizeof(cl_mem), &env_dark_hist_buf);
+            clSetKernelArg(k_env_dark_thf, 1, sizeof(cl_mem), &params_buf);
+            clSetKernelArg(k_env_dark_thf, 2, sizeof(int), &env_slot);
+            dispatch_1d_named(queue, k_env_dark_thf, 1, 0,
+                              "YENV3b dark_thresh_fin");
+
+            /* Y-ENV.4: dark |Lap| hist + finalize (σ² refinement) */
+            const int n_pos = height * (width - 4) + (height - 4) * width;
+            clSetKernelArg(k_env_dark_lap, 0, sizeof(cl_mem), &y_buf);
+            clSetKernelArg(k_env_dark_lap, 1, sizeof(int), &width);
+            clSetKernelArg(k_env_dark_lap, 2, sizeof(int), &height);
+            clSetKernelArg(k_env_dark_lap, 3, sizeof(cl_mem), &params_buf);
+            clSetKernelArg(k_env_dark_lap, 4, sizeof(int), &env_slot);
+            clSetKernelArg(k_env_dark_lap, 5, sizeof(cl_mem), &env_lap_hist_buf);
+            dispatch_1d_named(queue, k_env_dark_lap, align_up(n_pos, 64), 64,
+                              "YENV4a dark_lap_hist");
+            clSetKernelArg(k_env_dark_fin, 0, sizeof(cl_mem), &env_lap_hist_buf);
+            clSetKernelArg(k_env_dark_fin, 1, sizeof(cl_mem), &params_buf);
+            clSetKernelArg(k_env_dark_fin, 2, sizeof(int), &env_slot);
+            dispatch_1d_named(queue, k_env_dark_fin, 1, 0, "YENV4b dark_fin");
+
+            /* CPU blind_alpha_sigma clamps (α≥1e-5, σ²≥1e-8), written back
+             * so chroma_derive reads the final values. */
+            clFinish(queue);
+            float est2[2];
+            clEnqueueReadBuffer(queue, params_buf, CL_TRUE,
+                                P_ALPHA * sizeof(float), 2 * sizeof(float),
+                                est2, 0, NULL, NULL);
+            const float a_cl = fmaxf(est2[0], 1e-5f);
+            const float s_cl = fmaxf(est2[1], 1e-8f);
+            if(a_cl != est2[0] || s_cl != est2[1])
+            {
+                float wr[2] = { a_cl, s_cl };
+                clEnqueueWriteBuffer(queue, params_buf, CL_TRUE,
+                                     P_ALPHA * sizeof(float),
+                                     2 * sizeof(float), wr, 0, NULL, NULL);
+            }
+        }
+    }
+    if(yuv_env_use_mad || yuv_env_degenerate)
     {
         /* Q Stage 1: Laplacian-MAD on linear Y → σ_lin. */
         const int x_stride = 3;
@@ -478,7 +635,10 @@ static int run_yuv_gat_gpu_buf(float *srgb,
         clSetKernelArg(k_q_synth_alpha, 3, sizeof(int), &sigma_sq_idx);
         dispatch_1d_named(queue, k_q_synth_alpha, 1, 0, "YGQ2b synth_alpha");
     }
-    else
+    else if(0)   /* [DEPRECATED] legacy block-regression chain — UNREACHABLE.
+                  * Superseded twice: c5481e0 (broken on single-plane Y →
+                  * MAD) and 2026-07-19 (Y-ENV envelope = CPU canonical).
+                  * Kept per feedback_keep_deprecated_variants. */
     {
         const int ne_n_bx = width / 16;
         const int ne_n_by = height / 16;
@@ -554,8 +714,9 @@ static int run_yuv_gat_gpu_buf(float *srgb,
                             PARAMS_SIZE * sizeof(float), est, 0, NULL, NULL);
         alpha_y    = est[P_ALPHA];
         sigma_sq_y = est[P_SIGMA_SQ];
-        fprintf(stderr, "[YUV_%s] Blind est: alpha=%.6f sigma_sq=%.8f\n",
+        fprintf(stderr, "[YUV_%s] Blind est (%s): alpha=%.6f sigma_sq=%.8f\n",
                 g_galosh_yuv_q_gpu ? "Q" : "GAT",
+                (yuv_env_use_mad || yuv_env_degenerate) ? "MAD" : "envelope",
                 alpha_y, sigma_sq_y);
     }
 
@@ -1029,6 +1190,17 @@ static int run_yuv_gat_gpu_buf(float *srgb,
         /* GALOSH_YUV_O chroma: single-pass non-separable bilateral LOESS.
          * GUIDE = q_y_snap_f (normalized post-GAT NOISY Y, = CPU Y_stab guide),
          * NOT the denoised linear y_buf — see the 4a' snapshot bug-fix note. */
+        /* [2026-07-19 PARITY] radius: legacy sRGB route = 7 (unchanged);
+         * GALOSH-420 half-res chroma lane = the CPU reference's
+         * noise-adaptive R (146b5ab), computed from the SAME σ² the GAT
+         * used (sigma_sq_y — blind est or CLI, mirroring the CPU twin). */
+        int loess_R = 7;
+        if(g_yuv420_halfres_chroma)
+        {
+            loess_R = galosh_yuv420_chroma_radius_host(sqrtf(sigma_sq_y));
+            fprintf(stderr, "[yuv420_gpu] half-res chroma LOESS R=%d "
+                    "(adaptive, sigma_lin=%.5f)\n", loess_R, sqrtf(sigma_sq_y));
+        }
         clSetKernelArg(k_guided_loess, 0, sizeof(cl_mem), &q_y_snap_f);
         clSetKernelArg(k_guided_loess, 1, sizeof(cl_mem), &cb_buf);
         clSetKernelArg(k_guided_loess, 2, sizeof(cl_mem), &cr_buf);
@@ -1038,6 +1210,7 @@ static int run_yuv_gat_gpu_buf(float *srgb,
         clSetKernelArg(k_guided_loess, 6, sizeof(cl_mem), &cr_biv_buf);
         clSetKernelArg(k_guided_loess, 7, sizeof(int),    &width);
         clSetKernelArg(k_guided_loess, 8, sizeof(int),    &height);
+        clSetKernelArg(k_guided_loess, 9, sizeof(int),    &loess_R);
         dispatch_2d_named(queue, k_guided_loess,
                           align_up(width, 16), align_up(height, 16),
                           16, 16, "YG5 loess_bilateral");
@@ -1159,6 +1332,14 @@ yg_cleanup:
     if(k_o_smoothstep_3p) clReleaseKernel(k_o_smoothstep_3p);
     if(q_y_snap_f)        clReleaseMemObject(q_y_snap_f);
     if(ne_scratch)        clReleaseMemObject(ne_scratch);
+    if(env_dark_hist_buf) clReleaseMemObject(env_dark_hist_buf);
+    if(env_lap_hist_buf)  clReleaseMemObject(env_lap_hist_buf);
+    if(k_env_blk)         clReleaseKernel(k_env_blk);
+    if(k_env_fin)         clReleaseKernel(k_env_fin);
+    if(k_env_dark_th)     clReleaseKernel(k_env_dark_th);
+    if(k_env_dark_thf)    clReleaseKernel(k_env_dark_thf);
+    if(k_env_dark_lap)    clReleaseKernel(k_env_dark_lap);
+    if(k_env_dark_fin)    clReleaseKernel(k_env_dark_fin);
     if(q_y_h16)           clReleaseMemObject(q_y_h16);
     if(q_cb_h16)          clReleaseMemObject(q_cb_h16);
     if(q_cr_h16)          clReleaseMemObject(q_cr_h16);
@@ -1259,6 +1440,30 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
  *     不可能）。GPU コアは無改変で 2 格子再利用。sRGB 再エンコードは
  *     コア入口カーネル都合のアダプタ（float ~1e-7 で可逆）。
  * ================================================================ */
+/* [2026-07-19 PARITY FIX] Non-clipping linear→sRGB for the re-encode
+ * adapter — exact piecewise inverse of the GPU core entry kernel's
+ * srgb_to_lin (galosh.cl YG1), valid for ALL floats: negatives ride the
+ * 12.92 linear branch, super-white rides the power branch.
+ * EN: the previous adapter used galosh420_eotf_fwd_f(SRGB), which CLIPS
+ *     to [0,1] (legacy-compat by design).  The CPU 420 core receives the
+ *     reconstructed linear RGB unclipped ("excursions preserved" per
+ *     docs/yuv420_frontend_spec.md), so the clip silently destroyed
+ *     sub-black / super-white noise excursions on the GPU side only —
+ *     on a dark ISO6400 frame the chroma-lane blind σ dropped from
+ *     0.02661 (CPU) to 0.01425 (GPU) and the lane under-denoised.
+ *     Present since the v0.4.0 420 GPU port (predates the envelope
+ *     estimator); the "round trip float-exact ~1e-7" note above was only
+ *     true for in-gamut values.  With this helper the round trip is
+ *     float-exact for excursions too, restoring CPU↔GPU parity.
+ * JP: 旧アダプタの [0,1] クリップが GPU 側だけ excursion を潰し、暗部で
+ *     blind σ が過小 (0.0266→0.0142) → クロマ過小デノイズ。全域可逆な
+ *     非クリップ順変換に置換して CPU と一致させる (v0.4.0 以来の既存バグ)。 */
+static inline float yuv420_lin_to_srgb_noclip(float l)
+{
+  return (l <= 0.0031308f) ? 12.92f * l
+                           : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
 static int run_yuv420_gpu(const char *in_path, const char *out_path,
                           const int W, const int H,
                           const float strength_y, const float strength_c,
@@ -1317,12 +1522,13 @@ static int run_yuv420_gpu(const char *in_path, const char *out_path,
                                          : (float)raw[ysz + csz + i], depth, range);
     }
 
-    /* ---- LUMA (full res, gray image through the unchanged core) ----- */
+    /* ---- LUMA (full res, gray image through the unchanged core) -----
+     * [2026-07-19 PARITY FIX] no input clamp + non-clipping re-encode:
+     * the CPU reference feeds EOTF^-1(Y') to the core unclamped. */
     for(size_t i = 0; i < ysz; i++)
     {
-        const float v = galosh420_eotf_fwd_f(
-            fminf(fmaxf(galosh420_eotf_inv_f(Yp[i], eotf), 0.0f), 1.0f),
-            GALOSH420_EOTF_SRGB);
+        const float v = yuv420_lin_to_srgb_noclip(
+            galosh420_eotf_inv_f(Yp[i], eotf));
         gray[3 * i + 0] = v; gray[3 * i + 1] = v; gray[3 * i + 2] = v;
     }
     if(run_yuv_gat_gpu_buf(gray, W, H, strength_y, strength_c, cl_dev))
@@ -1374,14 +1580,24 @@ static int run_yuv420_gpu(const char *in_path, const char *out_path,
         {
             float R, G, B;
             galosh420_ncl_inv(Yg[i], Cbp[i], Crp[i], mat, &R, &G, &B);
+            /* [2026-07-19 PARITY FIX] non-clipping re-encode — see
+             * yuv420_lin_to_srgb_noclip above (excursions preserved). */
             const float rl = galosh420_eotf_inv_f(R, eotf);
             const float gl = galosh420_eotf_inv_f(G, eotf);
             const float bl = galosh420_eotf_inv_f(B, eotf);
-            rgb[3 * i + 0] = galosh420_eotf_fwd_f(rl, GALOSH420_EOTF_SRGB);
-            rgb[3 * i + 1] = galosh420_eotf_fwd_f(gl, GALOSH420_EOTF_SRGB);
-            rgb[3 * i + 2] = galosh420_eotf_fwd_f(bl, GALOSH420_EOTF_SRGB);
+            rgb[3 * i + 0] = yuv420_lin_to_srgb_noclip(rl);
+            rgb[3 * i + 1] = yuv420_lin_to_srgb_noclip(gl);
+            rgb[3 * i + 2] = yuv420_lin_to_srgb_noclip(bl);
         }
-        if(run_yuv_gat_gpu_buf(rgb, pw, ph, strength_y, strength_c, cl_dev))
+        /* adaptive half-res LOESS R ONLY on the native 4:2:0 lattice —
+         * 4:2:2/4:4:4 process chroma at full res where R=7 is already
+         * correct (mirrors the CPU driver's flag condition exactly). */
+        g_yuv420_halfres_chroma = (pix == GALOSH420_PIX_420) ? 1 : 0;
+        const int chroma_rc = run_yuv_gat_gpu_buf(rgb, pw, ph,
+                                                  strength_y, strength_c,
+                                                  cl_dev);
+        g_yuv420_halfres_chroma = 0;
+        if(chroma_rc)
         { fprintf(stderr, "[yuv420_gpu] chroma core failed\n"); return 1; }
         for(size_t i = 0; i < psz; i++)
         {
@@ -1455,8 +1671,9 @@ static int run_yuv420_gpu(const char *in_path, const char *out_path,
  *
  * Pipeline-variant flag g_galosh_yuv_q_gpu (= forward-declared near
  * top of file) selects:
- *   0 → [LATEST: GALOSH_YUV_O] = production (Foi-Alenius σ + single-
- *       scale chroma LOESS, current galosh_yuv_guided_loess kernel).
+ *   0 → [LATEST: GALOSH_YUV_O] = production (noise est = Laplacian-MAD
+ *       since c5481e0 — NOT Foi-Alenius despite the historical name;
+ *       single-scale chroma LOESS, galosh_yuv_guided_loess kernel).
  *   1 → [LATEST: GALOSH_YUV_Q] = production candidate (Laplacian MAD σ
  *       + unified_sigma normalize + 3-anchor multi-scale chroma pyramid
  *       via galosh_o_* kernels with YUV-specific full/half/quarter scale
@@ -1562,7 +1779,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "[YUV_GPU_%c] variant=%s\n",
             g_galosh_yuv_q_gpu ? 'Q' : 'O',
             g_galosh_yuv_q_gpu ? "Q (Laplacian-MAD σ + multi-scale chroma)" :
-                                 "O (Foi-Alenius σ + single-scale chroma)");
+                                 "O (Laplacian-MAD σ + single-scale chroma)");
     if(g420_planar)
         return run_yuv420_gpu(input_file, output_file, width, height, sy, sc,
                               dev, g420_pix, g420_siting, g420_eotf,

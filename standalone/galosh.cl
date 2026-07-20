@@ -3918,7 +3918,17 @@ kernel void galosh_yuv_guided_loess(
     global       float *restrict cb_out,
     global       float *restrict cr_out,
     const int width,
-    const int height)
+    const int height,
+    const int radius)
+    /* [2026-07-19] radius is now a RUNTIME arg (was compile-time
+     * YG_LOESS_RADIUS=7): the legacy sRGB route still passes 7 (output
+     * unchanged), while the GALOSH-420 half-res chroma lane passes the
+     * CPU reference's noise-adaptive half-res radius (2 or 3, see
+     * galosh_yuv420_chroma_radius in galosh_yuv_cpu.c — CPU gained it in
+     * 146b5ab 2026-07-14 and the GPU lane had been left at 7, breaking
+     * CPU↔GPU 420 chroma parity).
+     * (日) 半径を実行時引数化 — レガシーは 7 のまま、420 クロマレーンのみ
+     * CPU の noise-adaptive R (2/3) を渡す (146b5ab の GPU 未移植分)。 */
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
@@ -3935,11 +3945,11 @@ kernel void galosh_yuv_guided_loess(
    * overshoot (mirrors CPU galosh_loess_chroma_r; RAW chroma-clamp reflected to YUV). */
   float lo_cb = 1e30f, hi_cb = -1e30f, lo_cr = 1e30f, hi_cr = -1e30f;
 
-  for(int dy = -YG_LOESS_RADIUS; dy <= YG_LOESS_RADIUS; dy++){
+  for(int dy = -radius; dy <= radius; dy++){
     int yi = y + dy;
     if(yi < 0) yi = -yi;
     if(yi >= height) yi = 2 * height - yi - 2;
-    for(int dx = -YG_LOESS_RADIUS; dx <= YG_LOESS_RADIUS; dx++){
+    for(int dx = -radius; dx <= radius; dx++){
       int xi = x + dx;
       if(xi < 0) xi = -xi;
       if(xi >= width) xi = 2 * width - xi - 2;
@@ -7884,3 +7894,147 @@ kernel void galosh_o32_dark_sub_full(
 
 
 /* End of galosh.cl */
+
+
+/* ================================================================
+ * §Y-ENV — single-plane ENVELOPE noise estimation (CPU-canonical port)
+ * [2026-07-19]
+ *
+ * EN: Faithful GPU port of the CPU canonical blind estimator
+ * estimate_noise_plane_envelope (galosh_yuv_cpu.c, canonical since
+ * 2026-07-19; ablation vs the legacy global-MAD: +0.39 dB PSNR /
+ * −0.056 LPIPS over 54 cells x 8 lanes).  Chain:
+ *   Y-ENV.1  galosh_yuv_env_block_stats      (below, single-plane)
+ *   Y-ENV.2  galosh_o32_ne_finalize          (REUSED — plane-agnostic
+ *            32-bin x 128-var-hist p5-p20 lower envelope + Huber WLS)
+ *   Y-ENV.3  galosh_yuv_env_dark_thresh_hist (below, single-plane)
+ *            + galosh_o32_ne_dark_thresh_finalize (REUSED)
+ *   Y-ENV.4  galosh_yuv_env_dark_lap_hist    (below, single-plane)
+ *            + galosh_o32_ne_dark_finalize   (REUSED)
+ * Geometry matches the CPU exactly: 16x16 full-res blocks on linear Y,
+ * stride-2 Laplacians (p[x] − 2 p[x+2] + p[x+4]), exact per-block
+ * median via partial selection (rank n/2 = CPU quick_select_kth).
+ * Block mean is a float accumulation (CPU uses double) and the
+ * regression reduction order is parallel → bit-NEAR, not bit-exact
+ * (same acceptance as the o32 RAW port).
+ *
+ * JP: CPU canonical (envelope) の忠実 GPU 移植。ブロック統計と dark
+ * ヒストのみ single-plane 新設、回帰と finalize は o32 実績カーネルを
+ * 再利用。ジオメトリは CPU と同一 (16×16・stride-2 Laplacian・厳密
+ * rank-n/2 中央値)。block mean の float 積算と並列リダクション順のみ
+ * bit-near (o32 RAW と同じ受け入れ基準)。
+ * ================================================================ */
+#define YENV_BLOCK 16
+
+kernel void galosh_yuv_env_block_stats(
+    global const float *restrict yplane,
+    global float *restrict blk_mean,
+    global float *restrict blk_var,
+    const int width,
+    const int height,
+    const int n_bx,
+    const int n_by)
+{
+  const int gid = get_global_id(0);
+  if(gid >= n_bx * n_by) return;
+  const int by = gid / n_bx;
+  const int bx = gid % n_bx;
+  const int y0 = by * YENV_BLOCK;
+  const int x0 = bx * YENV_BLOCK;
+
+  /* Block mean (CPU: double accumulate — GPU float => bit-near). */
+  float sum = 0.0f;
+  for(int y = y0; y < y0 + YENV_BLOCK; y++)
+  {
+    global const float *row = yplane + (size_t)y * width;
+    for(int x = x0; x < x0 + YENV_BLOCK; x++) sum += row[x];
+  }
+  const float bm = sum / (float)(YENV_BLOCK * YENV_BLOCK);
+
+  /* |Laplacian| fill in CPU order: horizontal rows first, then vertical.
+   * 2 * 16 * 12 = 384 samples; exact rank-n/2 selection like the CPU. */
+  float laps[2 * YENV_BLOCK * (YENV_BLOCK - 4)];
+  int nl = 0;
+  for(int y = y0; y < y0 + YENV_BLOCK; y++)
+  {
+    global const float *row = yplane + (size_t)y * width;
+    for(int x = x0; x < x0 + YENV_BLOCK - 4; x++)
+      laps[nl++] = fabs(row[x] - 2.0f * row[x + 2] + row[x + 4]);
+  }
+  for(int y = y0; y < y0 + YENV_BLOCK - 4; y++)
+  {
+    global const float *r0 = yplane + (size_t) y      * width;
+    global const float *r1 = yplane + (size_t)(y + 2) * width;
+    global const float *r2 = yplane + (size_t)(y + 4) * width;
+    for(int x = x0; x < x0 + YENV_BLOCK; x++)
+      laps[nl++] = fabs(r0[x] - 2.0f * r1[x] + r2[x]);
+  }
+
+  if(nl > 10)
+  {
+    const float med = partial_select_median_o32_ne(laps, nl);
+    const float sigma_lap = med / 0.6745f;
+    blk_var[gid] = (sigma_lap * sigma_lap) / 6.0f;
+  }
+  else blk_var[gid] = 1e10f;
+  blk_mean[gid] = bm;
+}
+
+/* Y-ENV.3a: dark-threshold histogram, single-plane, stride-3 both axes
+ * (mirrors the CPU env dark pass: for(y+=3) for(x+=3)). Range [0,1). */
+kernel void galosh_yuv_env_dark_thresh_hist(
+    global const float *restrict yplane,
+    const int width,
+    const int height,
+    global int *restrict hist)
+{
+  const int gx = get_global_id(0);
+  const int gy = get_global_id(1);
+  const int x = gx * 3;
+  const int y = gy * 3;
+  if(x >= width || y >= height) return;
+  const float v = yplane[(size_t)y * width + x];
+  int b = (int)(v * (float)O32_DARK_HIST_BINS);
+  b = clamp(b, 0, O32_DARK_HIST_BINS - 1);
+  atomic_inc(&hist[b]);
+}
+
+/* Y-ENV.4a: dark |Laplacian| histogram, single-plane, stride-2 triplets
+ * (CPU env: horizontal all rows x<width-4; vertical stride-2 rows all x;
+ * skip any triplet with a sample above dark_max = dark_thresh + 0.02). */
+kernel void galosh_yuv_env_dark_lap_hist(
+    global const float *restrict yplane,
+    const int width,
+    const int height,
+    global const float *restrict params,
+    const int dark_thresh_slot,
+    global int *restrict hist)
+{
+  const int gid = get_global_id(0);
+  const int n_h = height * (width - 4);
+  const int n_v = (height - 4) * width;
+  if(gid >= n_h + n_v) return;
+  const float dark_max = params[dark_thresh_slot] + 0.02f;
+  const float scale = (float)O32_DARK_HIST_BINS / O32_DARK_LAP_MAX;
+  float v0, v1, v2;
+  if(gid < n_h)
+  {
+    const int y = gid / (width - 4);
+    const int x = gid % (width - 4);
+    global const float *row = yplane + (size_t)y * width;
+    v0 = row[x]; v1 = row[x + 2]; v2 = row[x + 4];
+  }
+  else
+  {
+    const int g = gid - n_h;
+    const int y = g / width;
+    const int x = g % width;
+    v0 = yplane[(size_t) y      * width + x];
+    v1 = yplane[(size_t)(y + 2) * width + x];
+    v2 = yplane[(size_t)(y + 4) * width + x];
+  }
+  if(v0 > dark_max || v1 > dark_max || v2 > dark_max) return;
+  int b = (int)(fabs(v0 - 2.0f * v1 + v2) * scale);
+  b = clamp(b, 0, O32_DARK_HIST_BINS - 1);
+  atomic_inc(&hist[b]);
+}

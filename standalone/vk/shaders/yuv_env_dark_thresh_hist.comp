@@ -1,0 +1,32 @@
+#version 450
+/* yuv_env_dark_thresh_hist.comp — [2026-07-19 Y-ENV Vulkan port]
+ * Transcribed from galosh.cl §Y-ENV galosh_yuv_env_dark_thresh_hist.
+ * Single-plane twin of o32_ne_dark_thresh_hist (no CFA offsets, full-res
+ * lattice): stride-3 subsample of the plane into a 4096-bin [0,1)
+ * histogram — feeds the REUSED o32_ne_dark_thresh_finalize (10th-pct
+ * scan → params[dark_thresh_slot]).  Mirrors CPU envelope Step 4
+ * (y += 3 / x += 3 from 0).  (日) 暗部しきい値ヒスト、単一プレーン版。 */
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Buf0 { float yplane[]; };
+layout(std430, binding = 1)          buffer Buf1 { int hist[]; };
+
+layout(push_constant) uniform PC {
+  int width;
+  int height;
+} pc;
+
+const int YENV_DARK_HIST_BINS = 4096;
+
+void main()
+{
+  const int px = int(gl_GlobalInvocationID.x) * 3;
+  const int py = int(gl_GlobalInvocationID.y) * 3;
+  if(px >= pc.width || py >= pc.height) return;
+
+  const float v = yplane[py * pc.width + px];
+  int b = int(v * float(YENV_DARK_HIST_BINS));
+  b = clamp(b, 0, YENV_DARK_HIST_BINS - 1);
+  atomicAdd(hist[b], 1);
+}

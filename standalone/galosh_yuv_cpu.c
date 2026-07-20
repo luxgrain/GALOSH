@@ -11,8 +11,14 @@
  *     Phase 0  sRGB → linear RGB (inverse gamma)
  *     Phase 1  Linear RGB → BT.709 Y / Cb / Cr  (linear domain)
  *     Phase 2  Y plane:
- *              ① Foi-Alenius blind α / σ² (estimate_sigma_plane MAD,
- *                 if alpha/sigma_sq <= 0)
+ *              ① blind α / σ² (if alpha/sigma_sq <= 0):
+ *                 CANONICAL [2026-07-19] = single-plane Foi-style
+ *                 lower-envelope fit (estimate_noise_plane_envelope;
+ *                 the YUV counterpart of RAW Phase 0).  Legacy =
+ *                 global Laplacian MAD + synthetic α, kept under
+ *                 GALOSH_YUV_NOISE_EST=mad.  Ablation 2026-07-19
+ *                 (54 cells, 8 lanes): envelope +0.39 dB PSNR /
+ *                 −0.056 LPIPS vs MAD, wins 44/54 & 49/54.
  *              ② GAT forward on Y  (gat_forward)
  *              ③ unit-variance normalise Y_stab via σ_GAT MAD
  *              ④ LOSH Pass1+Pass2 with use_robust_shrink=1
@@ -173,6 +179,359 @@ static float estimate_sigma_plane(const float *plane,
   dt_free_align(abs_laps);
   /* MAD → std: Var(lap) = 6·sigma² → sigma = MAD/(0.6745·sqrt(6)) */
   return mad / 1.6521f;
+}
+
+/* ================================================================
+ * [2026-07-17 NOISE-EST B] Single-plane Foi-style lower-envelope
+ * blind (α, σ²) estimator — the YUV counterpart of the RAW
+ * galosh_estimate_noise (galosh_cpu.h Phase 0), restoring the
+ * paper's "shared core" claim for the YUV pipeline:
+ *   1. 16×16 non-overlapping blocks on the linear-Y plane;
+ *      per-block mean + robust Laplacian variance (stride-2
+ *      second differences p[x]−2p[x+2]+p[x+4], the same operator
+ *      family as estimate_sigma_plane: Var(lap)=6σ², and stride 2
+ *      to step over post-ISP adjacent-pixel correlation).
+ *   2. 32 intensity bins over block means (0.003<m<0.97 gamut
+ *      filter), per-bin 128-bin variance histogram, lower envelope
+ *      = weighted mean of the p5–p20 percentile band (= flattest
+ *      patches = noise floor; ISP-streaming-friendly histogram
+ *      form, mirroring the RAW GPU §7.2 backport).
+ *   3. Robust WLS fit Var = α·mean + σ² with a 5-iteration Huber
+ *      M-estimator (k = 1.345·MAD(resid)/0.6745).
+ *   4. Dark-pixel σ² refinement: 10th-percentile dark threshold
+ *      (+0.02 window), |Laplacian| histogram median over dark
+ *      triplets → σ²_dark = MAD²/(0.6745²·6) − α·mean_dark.
+ * Provenance: audit 2026-07-17 — the block estimator was dropped
+ * from the YUV CPU in ff95bc0 without recorded rationale; this is
+ * the repaired single-plane port planned (and abandoned) in the
+ * c5481e0 root-cause notes.  Selection: env
+ * GALOSH_YUV_NOISE_EST=envelope (default remains the global-MAD +
+ * synthetic-α path until the A/B/D ablation decides canonical).
+ * Returns 1 on success, 0 → caller falls back to the MAD path.
+ * ================================================================ */
+static int estimate_noise_plane_envelope(const float *restrict plane,
+                                         const int width, const int height,
+                                         float *out_alpha,
+                                         float *out_sigma_sq)
+{
+#define NE2_NBINS    32
+#define NE2_BLOCK    16
+#define NE2_VAR_BINS 128
+#define NE2_DARK_HIST_BINS 4096
+#define NE2_DARK_LAP_MAX   0.1f
+  const int n_bx = width  / NE2_BLOCK;
+  const int n_by = height / NE2_BLOCK;
+  const int n_total_blocks = n_bx * n_by;
+  if(n_total_blocks < 100) return 0;
+
+  float *blk_mean = dt_alloc_align_float(n_total_blocks);
+  float *blk_var  = dt_alloc_align_float(n_total_blocks);
+  if(!blk_mean || !blk_var)
+  {
+    dt_free_align(blk_mean); dt_free_align(blk_var);
+    return 0;
+  }
+
+  /* Steps 1: per-block mean + robust Laplacian variance. */
+  DT_OMP_FOR()
+  for(int by = 0; by < n_by; by++)
+  {
+    for(int bx = 0; bx < n_bx; bx++)
+    {
+      const int y0 = by * NE2_BLOCK;
+      const int x0 = bx * NE2_BLOCK;
+      double sum = 0.0;
+      for(int y = y0; y < y0 + NE2_BLOCK; y++)
+      {
+        const float *row = plane + (size_t)y * width;
+        for(int x = x0; x < x0 + NE2_BLOCK; x++) sum += row[x];
+      }
+      const float bm = (float)(sum / (NE2_BLOCK * NE2_BLOCK));
+
+      float laps[2 * NE2_BLOCK * (NE2_BLOCK - 4)];
+      int nl = 0;
+      for(int y = y0; y < y0 + NE2_BLOCK; y++)          /* horizontal */
+      {
+        const float *row = plane + (size_t)y * width;
+        for(int x = x0; x < x0 + NE2_BLOCK - 4; x++)
+          laps[nl++] = fabsf(row[x] - 2.0f * row[x + 2] + row[x + 4]);
+      }
+      for(int y = y0; y < y0 + NE2_BLOCK - 4; y++)      /* vertical */
+      {
+        const float *r0 = plane + (size_t) y      * width;
+        const float *r1 = plane + (size_t)(y + 2) * width;
+        const float *r2 = plane + (size_t)(y + 4) * width;
+        for(int x = x0; x < x0 + NE2_BLOCK; x++)
+          laps[nl++] = fabsf(r0[x] - 2.0f * r1[x] + r2[x]);
+      }
+      const int bi = by * n_bx + bx;
+      if(nl > 10)
+      {
+        const float med = quick_select_median(laps, nl);
+        const float sigma_lap = med / 0.6745f;
+        blk_var[bi] = (sigma_lap * sigma_lap) / 6.0f;
+      }
+      else blk_var[bi] = 1e10f;
+      blk_mean[bi] = bm;
+    }
+  }
+
+  /* Step 2: intensity bins + variance-histogram lower envelope. */
+  float global_min = FLT_MAX, global_max = 0.0f;
+  for(int i = 0; i < n_total_blocks; i++)
+    if(blk_mean[i] > 0.003f && blk_mean[i] < 0.97f)
+    {
+      if(blk_mean[i] < global_min) global_min = blk_mean[i];
+      if(blk_mean[i] > global_max) global_max = blk_mean[i];
+    }
+  const float bw = (global_max - global_min) / NE2_NBINS;
+  if(bw < 1e-10f)
+  {
+    dt_free_align(blk_mean); dt_free_align(blk_var);
+    return 0;
+  }
+
+  float bin_mean_arr[NE2_NBINS], bin_var_arr[NE2_NBINS];
+  int bin_valid[NE2_NBINS], bin_cnt_arr[NE2_NBINS];
+  int n_valid = 0;
+  for(int b = 0; b < NE2_NBINS; b++)
+  {
+    const float bin_lo = global_min + b * bw;
+    const float bin_hi = bin_lo + bw;
+    bin_valid[b] = 0;
+    float msum = 0.0f, vmin = FLT_MAX, vmax = 0.0f;
+    int cnt = 0;
+    for(int i = 0; i < n_total_blocks; i++)
+    {
+      const float bm = blk_mean[i], bv = blk_var[i];
+      if(bm >= bin_lo && bm < bin_hi && bm > 0.003f && bm < 0.97f && bv < 1e9f)
+      {
+        msum += bm; cnt++;
+        if(bv < vmin) vmin = bv;
+        if(bv > vmax) vmax = bv;
+      }
+    }
+    if(cnt < 20) continue;
+    int vhist[NE2_VAR_BINS] = {0};
+    const float vrange = fmaxf(vmax - vmin, 1e-12f);
+    const float vscale = (float)NE2_VAR_BINS / vrange;
+    for(int i = 0; i < n_total_blocks; i++)
+    {
+      const float bm = blk_mean[i], bv = blk_var[i];
+      if(bm >= bin_lo && bm < bin_hi && bm > 0.003f && bm < 0.97f && bv < 1e9f)
+      {
+        int vb = (int)((bv - vmin) * vscale);
+        if(vb < 0) vb = 0;
+        if(vb >= NE2_VAR_BINS) vb = NE2_VAR_BINS - 1;
+        vhist[vb]++;
+      }
+    }
+    const int p5_target = cnt / 20, p20_target = cnt / 5;
+    int cum = 0, p5_bin = 0, p20_bin = NE2_VAR_BINS - 1, found_p5 = 0;
+    for(int i = 0; i < NE2_VAR_BINS; i++)
+    {
+      cum += vhist[i];
+      if(!found_p5 && cum >= p5_target) { p5_bin = i; found_p5 = 1; }
+      if(cum >= p20_target) { p20_bin = i; break; }
+    }
+    float vsum = 0.0f;
+    int vcnt = 0;
+    for(int i = p5_bin; i <= p20_bin; i++)
+    {
+      vsum += (vmin + ((float)i + 0.5f) / vscale) * (float)vhist[i];
+      vcnt += vhist[i];
+    }
+    bin_var_arr[b]  = (vcnt > 0) ? (vsum / (float)vcnt)
+                                 : (vmin + 0.5f / vscale);
+    bin_mean_arr[b] = msum / (float)cnt;
+    bin_cnt_arr[b]  = (vcnt > 0) ? vcnt : 1;
+    bin_valid[b]    = 1;
+    n_valid++;
+  }
+  dt_free_align(blk_mean);
+  dt_free_align(blk_var);
+  if(n_valid < 4) return 0;
+
+  /* Step 3: Huber-WLS fit Var = α·mean + σ². */
+  float alpha_est = 0.01f, sigma_sq_est = 0.0f;
+  for(int iter = 0; iter < 5; iter++)
+  {
+    double huber_k = 1e10;
+    if(iter > 0)
+    {
+      float resids[NE2_NBINS];
+      int nr = 0;
+      for(int b = 0; b < NE2_NBINS; b++)
+        if(bin_valid[b])
+          resids[nr++] = fabsf(bin_var_arr[b]
+                               - (alpha_est * bin_mean_arr[b] + sigma_sq_est));
+      const float resid_mad = quick_select_median(resids, nr) / 0.6745f;
+      huber_k = 1.345 * fmax(resid_mad, 1e-12);
+    }
+    double Sw = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+    for(int b = 0; b < NE2_NBINS; b++)
+    {
+      if(!bin_valid[b]) continue;
+      double w = (double)bin_cnt_arr[b];
+      if(iter > 0)
+      {
+        const double pred = (double)alpha_est * bin_mean_arr[b] + sigma_sq_est;
+        const double resid = fabs((double)bin_var_arr[b] - pred);
+        if(resid > huber_k) w *= huber_k / resid;
+      }
+      const double x = bin_mean_arr[b], y = bin_var_arr[b];
+      Sw += w; Sx += w * x; Sy += w * y; Sxx += w * x * x; Sxy += w * x * y;
+    }
+    const double det = Sw * Sxx - Sx * Sx;
+    if(fabs(det) > 1e-30)
+    {
+      const float na = (float)((Sw * Sxy - Sx * Sy) / det);
+      const float ns = (float)((Sxx * Sy - Sx * Sxy) / det);
+      if(na > 0) alpha_est = na;
+      if(ns >= 0) sigma_sq_est = ns;
+    }
+  }
+  alpha_est = fmaxf(alpha_est, 1e-8f);
+
+  /* Step 4: dark-pixel σ² refinement (histogram form). */
+  {
+    int thresh_hist[NE2_DARK_HIST_BINS];
+    memset(thresh_hist, 0, sizeof(thresh_hist));
+    const float bin_scale = (float)NE2_DARK_HIST_BINS;
+    int total_thresh = 0;
+    for(int y = 0; y < height; y += 3)
+    {
+      const float *row = plane + (size_t)y * width;
+      for(int x = 0; x < width; x += 3)
+      {
+        int b = (int)(row[x] * bin_scale);
+        if(b < 0) b = 0;
+        if(b >= NE2_DARK_HIST_BINS) b = NE2_DARK_HIST_BINS - 1;
+        thresh_hist[b]++;
+        total_thresh++;
+      }
+    }
+    if(total_thresh > 100)
+    {
+      const int target_thresh = total_thresh / 10;
+      int cum_t = 0, dark_bin = 0;
+      for(int i = 0; i < NE2_DARK_HIST_BINS; i++)
+      {
+        cum_t += thresh_hist[i];
+        if(cum_t >= target_thresh) { dark_bin = i; break; }
+      }
+      const float dark_thresh = ((float)dark_bin + 0.5f) / bin_scale;
+      const float dark_max = dark_thresh + 0.02f;
+
+      int lap_hist[NE2_DARK_HIST_BINS];
+      memset(lap_hist, 0, sizeof(lap_hist));
+      const float lap_scale = (float)NE2_DARK_HIST_BINS / NE2_DARK_LAP_MAX;
+      int total_lap = 0;
+      for(int y = 0; y < height; y++)               /* horizontal, stride-2 */
+      {
+        const float *row = plane + (size_t)y * width;
+        for(int x = 0; x < width - 4; x++)
+        {
+          const float v0 = row[x], v1 = row[x + 2], v2 = row[x + 4];
+          if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+          int b = (int)(fabsf(v0 - 2.0f * v1 + v2) * lap_scale);
+          if(b < 0) b = 0;
+          if(b >= NE2_DARK_HIST_BINS) b = NE2_DARK_HIST_BINS - 1;
+          lap_hist[b]++;
+          total_lap++;
+        }
+      }
+      for(int y = 0; y < height - 4; y++)           /* vertical, stride-2 */
+      {
+        const float *r0 = plane + (size_t) y      * width;
+        const float *r1 = plane + (size_t)(y + 2) * width;
+        const float *r2 = plane + (size_t)(y + 4) * width;
+        for(int x = 0; x < width; x++)
+        {
+          const float v0 = r0[x], v1 = r1[x], v2 = r2[x];
+          if(v0 > dark_max || v1 > dark_max || v2 > dark_max) continue;
+          int b = (int)(fabsf(v0 - 2.0f * v1 + v2) * lap_scale);
+          if(b < 0) b = 0;
+          if(b >= NE2_DARK_HIST_BINS) b = NE2_DARK_HIST_BINS - 1;
+          lap_hist[b]++;
+          total_lap++;
+        }
+      }
+      if(total_lap > 100)
+      {
+        const int target_med = total_lap / 2;
+        int cum_l = 0, med_bin = 0;
+        for(int i = 0; i < NE2_DARK_HIST_BINS; i++)
+        {
+          cum_l += lap_hist[i];
+          if(cum_l >= target_med) { med_bin = i; break; }
+        }
+        const float mad = ((float)med_bin + 0.5f) / lap_scale;
+        const float sigma_lap = mad / 0.6745f;
+        const float dark_var = (sigma_lap * sigma_lap) / 6.0f;
+        const float dark_mean = dark_thresh * 0.5f;
+        sigma_sq_est = fmaxf(dark_var - alpha_est * dark_mean, 0.0f);
+      }
+    }
+  }
+
+  fprintf(stderr, "[yuv_cpu] envelope noise_est: %d bins, alpha=%.6f "
+                  "sigma_sq=%.8f\n", n_valid, alpha_est, sigma_sq_est);
+  *out_alpha = alpha_est;
+  *out_sigma_sq = sigma_sq_est;
+  return 1;
+#undef NE2_NBINS
+#undef NE2_BLOCK
+#undef NE2_VAR_BINS
+#undef NE2_DARK_HIST_BINS
+#undef NE2_DARK_LAP_MAX
+}
+
+/* ================================================================
+ * [2026-07-17 NOISE-EST switch] Shared blind (α, σ²) entry used by
+ * ALL blind call sites (legacy sRGB path, 420-route core, 420-route
+ * luma-only) so the estimator selection is route-independent:
+ *   GALOSH_YUV_NOISE_EST unset / "mad" -> global Laplacian MAD +
+ *     synthetic α (canonical since ff95bc0; default, output-identical
+ *     to the pre-switch binaries)
+ *   "envelope" -> estimate_noise_plane_envelope above, with automatic
+ *     MAD fallback when the fit degenerates.
+ * ================================================================ */
+static void blind_alpha_sigma(const float *restrict plane,
+                              const int width, const int height,
+                              const char *tag,
+                              float *io_alpha, float *io_sigma_sq)
+{
+  /* [2026-07-19 CANONICAL = envelope] (user-approved switch).
+   * Ablation (54 cells x A/B/D, 8 lanes AWGN/PG-core/PG-cmp/CRVD x
+   * 420/444): envelope vs MAD = +0.39 dB PSNR / −0.056 LPIPS overall
+   * (wins 44/54, 49/54), beats even oracle var-fit injection (+0.10);
+   * alpha log-corr 0.981 vs oracle, ZERO degenerate fallbacks.
+   * results_noiseest_ablation/_metrics_ablation.json is the record.
+   * The single code path below serves every CPU variant (legacy sRGB
+   * float, 420/422/444 planar, and any FP16-storage oracle) — the
+   * estimator runs upstream of all storage-width choices.
+   * Legacy MAD kept as GALOSH_YUV_NOISE_EST=mad (deprecated). */
+  const char *est_mode = getenv("GALOSH_YUV_NOISE_EST");
+  const int force_mad = (est_mode && strcmp(est_mode, "mad") == 0);
+  if(!force_mad)
+  {
+    float a_env = 0.0f, s_env = 0.0f;
+    if(estimate_noise_plane_envelope(plane, width, height, &a_env, &s_env))
+    {
+      *io_alpha    = fmaxf(a_env, 1e-5f);
+      *io_sigma_sq = fmaxf(s_env, 1e-8f);
+      fprintf(stderr, "[%s] Blind est (envelope): α=%.6g σ²=%.6e\n",
+              tag, *io_alpha, *io_sigma_sq);
+      return;
+    }
+    fprintf(stderr, "[%s] envelope est degenerate -> MAD fallback\n", tag);
+  }
+  const float sigma_lin = estimate_sigma_plane(plane, width, height);
+  *io_sigma_sq = fmaxf(sigma_lin * sigma_lin, 1e-8f);
+  *io_alpha    = fmaxf(sigma_lin * 0.1f, 1e-5f);  /* tiny α — quasi-linear */
+  fprintf(stderr, "[%s] Blind σ (MAD) = %.5f, using α=%.6g σ²=%.6e\n",
+          tag, sigma_lin, *io_alpha, *io_sigma_sq);
 }
 
 /* ================================================================
@@ -526,11 +885,9 @@ static void galosh_yuv_denoise_srgb(const float *restrict in_srgb,
    * (matches "quasi-Gaussian" regime for low-ISO captures). */
   if(alpha <= 0.0f || sigma_sq <= 0.0f)
   {
-    const float sigma_lin = estimate_sigma_plane(Y_stab, width, height);
-    sigma_sq = fmaxf(sigma_lin * sigma_lin, 1e-8f);
-    alpha    = fmaxf(sigma_lin * 0.1f, 1e-5f);  /* tiny α — quasi-linear GAT */
-    fprintf(stderr, "[yuv_cpu] Blind σ (MAD) = %.5f, using α=%.6g σ²=%.6e\n",
-            sigma_lin, alpha, sigma_sq);
+    /* [2026-07-17] route-independent estimator switch — see
+     * blind_alpha_sigma (GALOSH_YUV_NOISE_EST=mad|envelope). */
+    blind_alpha_sigma(Y_stab, width, height, "yuv_cpu", &alpha, &sigma_sq);
   }
 
   /* ============================================================
@@ -743,15 +1100,11 @@ static void galosh_yuv_denoise_linear_rgb(const float *restrict in_lin,
     Cr_lin[i] = Cr;
   }
 
-  /* Phase 2 ① — blind α / σ² on the internal Y (if not supplied). */
+  /* Phase 2 ① — blind α / σ² on the internal Y (if not supplied).
+   * [2026-07-17] routed through the shared estimator switch. */
   if(alpha <= 0.0f || sigma_sq <= 0.0f)
-  {
-    const float sigma_lin = estimate_sigma_plane(Y_stab, width, height);
-    sigma_sq = fmaxf(sigma_lin * sigma_lin, 1e-8f);
-    alpha    = fmaxf(sigma_lin * 0.1f, 1e-5f);
-    fprintf(stderr, "[yuv420_core] Blind σ (MAD) = %.5f, α=%.6g σ²=%.6e\n",
-            sigma_lin, alpha, sigma_sq);
-  }
+    blind_alpha_sigma(Y_stab, width, height, "yuv420_core",
+                      &alpha, &sigma_sq);
 
   /* Phase 2 ②③ — GAT forward + unit-variance normalise. */
   gat_build_inverse_table(alpha, sigma_sq);
@@ -835,14 +1188,10 @@ static void galosh_yuv_denoise_luma_plane(const float *restrict y_lin,
     goto cleanup;
   }
 
+  /* [2026-07-17] routed through the shared estimator switch. */
   if(alpha <= 0.0f || sigma_sq <= 0.0f)
-  {
-    const float sigma_lin = estimate_sigma_plane(y_lin, width, height);
-    sigma_sq = fmaxf(sigma_lin * sigma_lin, 1e-8f);
-    alpha    = fmaxf(sigma_lin * 0.1f, 1e-5f);
-    fprintf(stderr, "[yuv420_luma] Blind σ (MAD) = %.5f, α=%.6g σ²=%.6e\n",
-            sigma_lin, alpha, sigma_sq);
-  }
+    blind_alpha_sigma(y_lin, width, height, "yuv420_luma",
+                      &alpha, &sigma_sq);
 
   gat_build_inverse_table(alpha, sigma_sq);
   DT_OMP_FOR()

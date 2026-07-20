@@ -150,7 +150,9 @@ per-image tuning.
 A Poisson--Gaussian model $\operatorname{Var}[x]=\alpha\,\mathbb{E}[x]+\sigma^2$
 is fitted from the noisy frame alone by robust regression of local
 Laplacian-variance against local mean over overlapping blocks (a
-Foi-style estimator~\cite{foi}), giving per-image $(\alpha,\sigma^2)$ with no
+Foi-style lower-envelope estimator~\cite{foi}; per-CFA-channel blocks in
+the raw pipeline, a single-plane variant on luminance in the YCbCr
+pipeline), giving per-image $(\alpha,\sigma^2)$ with no
 oracle and no calibration data.
 
 \paragraph{Variance stabilization (GAT).}

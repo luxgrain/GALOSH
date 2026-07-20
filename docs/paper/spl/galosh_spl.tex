@@ -99,7 +99,9 @@ computation graph is fixed for every pixel of every image.
 \paragraph{Blind noise estimation} The Poisson--Gaussian model
 $\mathrm{Var}[x]=\alpha\,\mathbb{E}[x]+\sigma^2$ is fitted from the noisy
 frame alone by a robust regression of local Laplacian variance against local
-mean over overlapping blocks (a Foi-style estimator~\cite{foi}), yielding
+mean over overlapping blocks (a Foi-style lower-envelope
+estimator~\cite{foi}; per-CFA-channel blocks in the raw pipeline, a
+single-plane variant on luminance in the YCbCr pipeline), yielding
 per-image $(\alpha,\sigma^2)$ without calibration data or oracles.
 
 \paragraph{Variance stabilization} The GAT

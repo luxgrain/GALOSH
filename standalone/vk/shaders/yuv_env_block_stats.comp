@@ -1,0 +1,95 @@
+#version 450
+/* yuv_env_block_stats.comp — [2026-07-19 Y-ENV Vulkan port]
+ * Transcribed from galosh.cl §Y-ENV galosh_yuv_env_block_stats, itself the
+ * OpenCL port of the CPU-canonical single-plane lower-envelope estimator
+ * (galosh_yuv_cpu.c estimate_noise_plane_envelope Steps 1, NE2_BLOCK=16):
+ * per 16x16 block on ONE full-res plane (linear Y): blk_mean = float mean
+ * of 256 pixels, blk_var = (MAD(|stride-2 Lap|)/0.6745)^2 / 6 over
+ * 384 Laplacians (192 H + 192 V), exact rank-n/2 partial selection.
+ * 1 WI = 1 block.  Differs from o32_ne_block_stats ONLY in being
+ * single-plane (no CFA offsets) and 16x16 (not 8x8-of-halfres).
+ * (日) CPU 正準 envelope の per-block 統計。単一プレーン・16x16・
+ * stride-2 ラプラシアン 384 本の厳密中央値。 */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer Buf0 { float yplane[]; };
+layout(std430, binding = 1) writeonly buffer Buf1 { float blk_mean[]; };
+layout(std430, binding = 2) writeonly buffer Buf2 { float blk_var[]; };
+
+layout(push_constant) uniform PC {
+  int width;
+  int height;          /* unused in body (parity with the OpenCL arg list) */
+  int n_bx;
+  int n_by;
+} pc;
+
+const int YENV_BLOCK = 16;
+const int YENV_NLAPS = 2 * YENV_BLOCK * (YENV_BLOCK - 4);   /* = 384 */
+
+/* Exact lower-median via partial selection sort (rank n/2), the same
+ * contract as partial_select_median_o32_ne / CPU quick_select_median. */
+float partial_select_median_384(inout float arr[YENV_NLAPS], int n)
+{
+  const int target = n / 2;
+  for(int k = 0; k <= target; k++)
+  {
+    int min_idx = k;
+    float min_val = arr[k];
+    for(int j = k + 1; j < n; j++)
+      if(arr[j] < min_val) { min_val = arr[j]; min_idx = j; }
+    arr[min_idx] = arr[k];
+    arr[k] = min_val;
+  }
+  return arr[target];
+}
+
+void main()
+{
+  const int bi = int(gl_GlobalInvocationID.x);
+  const int total = pc.n_bx * pc.n_by;
+  if(bi >= total) return;
+
+  const int by = bi / pc.n_bx;
+  const int bx = bi - by * pc.n_bx;
+  const int y0 = by * YENV_BLOCK;
+  const int x0 = bx * YENV_BLOCK;
+
+  /* Step 1a: block mean (float accumulation — bit-matches the OpenCL port;
+   * the CPU reference accumulates in double, hence "bit-near" not
+   * bit-exact: ~0.3% on alpha, the accepted o32-style reconciliation). */
+  float sum = 0.0;
+  for(int y = y0; y < y0 + YENV_BLOCK; y++)
+    for(int x = x0; x < x0 + YENV_BLOCK; x++)
+      sum += yplane[y * pc.width + x];
+  const float bm = sum / float(YENV_BLOCK * YENV_BLOCK);
+
+  /* Step 1b: 384 stride-2 Laplacians, CPU fill order (H rows then V). */
+  float laps[YENV_NLAPS];
+  int nl = 0;
+  for(int y = y0; y < y0 + YENV_BLOCK; y++)              /* horizontal */
+    for(int x = x0; x < x0 + YENV_BLOCK - 4; x++)
+    {
+      const int p = y * pc.width + x;
+      laps[nl++] = abs(yplane[p] - 2.0 * yplane[p + 2] + yplane[p + 4]);
+    }
+  for(int y = y0; y < y0 + YENV_BLOCK - 4; y++)          /* vertical */
+    for(int x = x0; x < x0 + YENV_BLOCK; x++)
+    {
+      const int p0 = y * pc.width + x;
+      laps[nl++] = abs(yplane[p0] - 2.0 * yplane[p0 + 2 * pc.width]
+                       + yplane[p0 + 4 * pc.width]);
+    }
+
+  float bv;
+  if(nl > 10)
+  {
+    const float med = partial_select_median_384(laps, nl);
+    const float sigma_lap = med / 0.6745;
+    bv = (sigma_lap * sigma_lap) / 6.0;
+  }
+  else bv = 1e10;
+
+  blk_mean[bi] = bm;
+  blk_var[bi]  = bv;
+}

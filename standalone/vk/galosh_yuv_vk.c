@@ -63,6 +63,13 @@ static void (*g_vk_fail_hook)(int) = NULL;
 #define P_SIGMA_SQ    14
 #define P_SIGMA_Y     20   /* blind sigma_lin (YGQ2a out) */
 #define P_SIGMA_GAT   21   /* repurposed slot: sigma_gat (YG4a' out) */
+/* [2026-07-19 Y-ENV] envelope-estimator slots (24-27; free in the shared
+ * galosh_gpu.h map).  DEGEN/MAD slots implement the on-device MAD fallback
+ * (yuv_env_select.comp) that preserves the zero-mid-frame-readback design. */
+#define P_ENV_DARK_THRESH 24   /* envelope dark threshold (temp) */
+#define P_ENV_DEGEN       25   /* 1.0 = ne_finalize hit its floor pair */
+#define P_ALPHA_MAD       26   /* fallback synth alpha (spare slot) */
+#define P_SIGMA_SQ_MAD    27   /* fallback synth sigma^2 (spare slot) */
 
 static int g_verbose = 0;
 
@@ -144,6 +151,10 @@ enum {
   K_SRGB2YCC, K_LAP_MAD, K_LAP_MAD_H16, K_SYNTH, K_GAT_FWD,
   K_NORM, K_DENORM, K_LUT_BUILD, K_LUT_FIN, K_PASS12, K_PASS12_SG,
   K_MAKITALO, K_LOESS, K_YCC2SRGB,
+  /* [2026-07-19 Y-ENV] CPU-canonical envelope estimator chain:
+   * 4 new single-plane shaders + 3 REUSED plane-agnostic o32 shaders. */
+  K_ENV_BLK, K_ENV_FIN, K_ENV_SEL, K_ENV_DTH, K_ENV_DTF, K_ENV_DLH,
+  K_ENV_DFN,
   K_COUNT
 };
 static Kern g_k[K_COUNT] = {
@@ -164,6 +175,17 @@ static Kern g_k[K_COUNT] = {
   [K_MAKITALO]   = { "yuv_makitalo",      5,  4 },
   [K_LOESS]      = { "yuv_loess",         6, 16 },
   [K_YCC2SRGB]   = { "yuv_ycc2srgb",      4,  4 },
+  /* [2026-07-19 Y-ENV] envelope chain (default estimator; legacy MAD via
+   * GALOSH_YUV_NOISE_EST=mad).  o32_ne_finalize / _dark_thresh_finalize /
+   * _dark_finalize are plane-agnostic and reused UNCHANGED (same as the
+   * OpenCL port). */
+  [K_ENV_BLK]    = { "yuv_env_block_stats",         3, 16 },
+  [K_ENV_FIN]    = { "o32_ne_finalize",             4, 12 },
+  [K_ENV_SEL]    = { "yuv_env_select",              1,  4 },
+  [K_ENV_DTH]    = { "yuv_env_dark_thresh_hist",    2,  8 },
+  [K_ENV_DTF]    = { "o32_ne_dark_thresh_finalize", 2,  4 },
+  [K_ENV_DLH]    = { "yuv_env_dark_lap_hist",       3, 12 },
+  [K_ENV_DFN]    = { "o32_ne_dark_finalize",        2,  4 },
 };
 
 static char g_exe_dir[1024];
@@ -640,7 +662,8 @@ typedef struct
 {
   int valid, W, H;
   Buf srgb_b, y_lin, y_stab, y_den, y_snap, cb_b, cr_b, cb_den, cr_den,
-      ne_scr, params, lut_d, lut_x, lut_p;
+      ne_scr, params, lut_d, lut_x, lut_p,
+      env_bm, env_bv, env_h1, env_h2;   /* [2026-07-19 Y-ENV] blk stats + hists */
 } RunBufs;
 static RunBufs g_rb[2];
 static int g_rb_next = 0;
@@ -659,6 +682,8 @@ static RunBufs *acquire_run_bufs(const int W, const int H)
     freebuf(&rb->cb_den); freebuf(&rb->cr_den);
     freebuf(&rb->ne_scr); freebuf(&rb->params);
     freebuf(&rb->lut_d); freebuf(&rb->lut_x); freebuf(&rb->lut_p);
+    freebuf(&rb->env_bm); freebuf(&rb->env_bv);
+    freebuf(&rb->env_h1); freebuf(&rb->env_h2);
   }
   const size_t npix = (size_t)W * H;
   const size_t fb = npix * 4, hb = npix * 2;
@@ -672,6 +697,16 @@ static RunBufs *acquire_run_bufs(const int W, const int H)
   rb->params = DEVBUF(PARAMS_SIZE * 4);
   rb->lut_d = DEVBUF(GAT_LUT_SIZE * 4); rb->lut_x = DEVBUF(GAT_LUT_SIZE * 4);
   rb->lut_p = DEVBUF(8 * 4);
+  /* [2026-07-19 Y-ENV] envelope blk stats ((W/16)*(H/16) floats each,
+   * min 1 to keep zero-size allocs out) + two 4096-int histograms. */
+  {
+    size_t n_blk = (size_t)(W / 16) * (size_t)(H / 16);
+    if(n_blk < 1) n_blk = 1;
+    rb->env_bm = DEVBUF(n_blk * 4);
+    rb->env_bv = DEVBUF(n_blk * 4);
+    rb->env_h1 = DEVBUF(4096 * 4);
+    rb->env_h2 = DEVBUF(4096 * 4);
+  }
   rb->valid = 1;
   return rb;
 }
@@ -752,6 +787,8 @@ static int run_core(float *srgb, const int W, const int H,
   Buf params = rb->params;
   Buf lut_d = rb->lut_d, lut_x = rb->lut_x;
   Buf lut_p = rb->lut_p;
+  Buf env_bm = rb->env_bm, env_bv = rb->env_bv;   /* [2026-07-19 Y-ENV] */
+  Buf env_h1 = rb->env_h1, env_h2 = rb->env_h2;
 
   /* [embed fast path] once the banding rates are learned and the frame is
    * cheap (fast GPU), record the ENTIRE frame as ONE submission with a
@@ -820,6 +857,18 @@ static int run_core(float *srgb, const int W, const int H,
   VkDescriptorSet s_mak   = SET(K_MAKITALO, &y_den, &y_lin, &lut_d, &lut_x, &lut_p);
   VkDescriptorSet s_lo    = SET(K_LOESS, &y_snap, &cb_b, &cr_b, &cb_den,
                                 &cr_den, &params);
+  /* [2026-07-19 Y-ENV] envelope chain sets.  o32_ne_finalize's binding 2
+   * ("raw") is declared-but-unused in its body — y_lin fills the slot for
+   * arg-order parity (same trick as the OpenCL host). */
+  const char *env_nem = getenv("GALOSH_YUV_NOISE_EST");
+  const int env_use_mad = (env_nem && strcmp(env_nem, "mad") == 0);
+  VkDescriptorSet s_envblk = SET(K_ENV_BLK, &y_lin, &env_bm, &env_bv);
+  VkDescriptorSet s_envfin = SET(K_ENV_FIN, &env_bm, &env_bv, &y_lin, &params);
+  VkDescriptorSet s_envsel = SET(K_ENV_SEL, &params);
+  VkDescriptorSet s_envdth = SET(K_ENV_DTH, &y_lin, &env_h1);
+  VkDescriptorSet s_envdtf = SET(K_ENV_DTF, &env_h1, &params);
+  VkDescriptorSet s_envdlh = SET(K_ENV_DLH, &y_lin, &params, &env_h2);
+  VkDescriptorSet s_envdfn = SET(K_ENV_DFN, &env_h2, &params);
   /* recompose: chroma = LOESS out, or the untouched noisy planes when
    * luma_only (420 gray pass — blueprint §7.2 rebind) */
   VkDescriptorSet s_rec   = luma_only
@@ -854,12 +903,57 @@ static int run_core(float *srgb, const int W, const int H,
   PCI(0, npix_i);
   dispatch_k(cb, K_SRGB2YCC, s_dec, pc, 1,
              (uint32_t)AUP(npix, 256), 1, 1, "YG1 srgb2ycc");
-  if(!hold_frame)   /* [video] held frames skip BOTH quickselects + synth */
+  if(!hold_frame)   /* [video] held frames skip the whole noise-est chain */
   {
-    PCI(0, W); PCI(1, H); PCI(2, 3); PCI(3, P_SIGMA_Y);
-    dispatch_k(cb, K_LAP_MAD, s_mad, pc, 4, 1, 1, 1, "YGQ2a lap_mad_lin");
-    PCI(0, P_SIGMA_Y); PCI(1, P_ALPHA); PCI(2, P_SIGMA_SQ);
-    dispatch_k(cb, K_SYNTH, s_syn, pc, 3, 1, 1, 1, "YGQ2b synth_alpha");
+    if(env_use_mad)
+    {
+      /* legacy Laplacian-MAD + synthetic α (GALOSH_YUV_NOISE_EST=mad;
+       * output-identical to the pre-envelope binaries). */
+      PCI(0, W); PCI(1, H); PCI(2, 3); PCI(3, P_SIGMA_Y);
+      dispatch_k(cb, K_LAP_MAD, s_mad, pc, 4, 1, 1, 1, "YGQ2a lap_mad_lin");
+      PCI(0, P_SIGMA_Y); PCI(1, P_ALPHA); PCI(2, P_SIGMA_SQ);
+      dispatch_k(cb, K_SYNTH, s_syn, pc, 3, 1, 1, 1, "YGQ2b synth_alpha");
+    }
+    else
+    {
+      /* [2026-07-19 Y-ENV] CPU-canonical single-plane lower-envelope
+       * estimator (ablation: +0.39 dB / −0.056 LPIPS vs MAD, 8 lanes).
+       * Degenerate → MAD fallback is resolved ON-DEVICE (yuv_env_select
+       * mode 0/1 + the fallback lap_mad/synth pair into spare slots) so
+       * the zero-mid-frame-readback design survives; see the select
+       * shader header for the exact CPU-order argument. */
+      vkCmdFillBuffer(cb, env_h1.buf, 0, 4096 * 4, 0);
+      vkCmdFillBuffer(cb, env_h2.buf, 0, 4096 * 4, 0);
+      barrier(cb);
+      const int env_n_bx = W / 16, env_n_by = H / 16;
+      const int env_n_blk = env_n_bx * env_n_by;
+      PCI(0, W); PCI(1, H); PCI(2, env_n_bx); PCI(3, env_n_by);
+      dispatch_k(cb, K_ENV_BLK, s_envblk, pc, 4,
+                 (uint32_t)AUP(env_n_blk, 64), 1, 1, "YENV1 blk_stats");
+      PCI(0, W); PCI(1, H); PCI(2, env_n_blk);
+      dispatch_k(cb, K_ENV_FIN, s_envfin, pc, 3, 1, 1, 1, "YENV2 ne_finalize");
+      PCI(0, 0);
+      dispatch_k(cb, K_ENV_SEL, s_envsel, pc, 1, 1, 1, 1, "YENVs degen_capture");
+      PCI(0, W); PCI(1, H);
+      dispatch_k(cb, K_ENV_DTH, s_envdth, pc, 2,
+                 (uint32_t)AUP((W + 2) / 3, 16), (uint32_t)AUP((H + 2) / 3, 16),
+                 1, "YENV3a dark_thresh_hist");
+      PCI(0, P_ENV_DARK_THRESH);
+      dispatch_k(cb, K_ENV_DTF, s_envdtf, pc, 1, 1, 1, 1, "YENV3b dark_thresh_fin");
+      const int env_n_pos = H * (W - 4) + (H - 4) * W;
+      PCI(0, W); PCI(1, H); PCI(2, P_ENV_DARK_THRESH);
+      dispatch_k(cb, K_ENV_DLH, s_envdlh, pc, 3,
+                 (uint32_t)AUP(env_n_pos, 64), 1, 1, "YENV4a dark_lap_hist");
+      PCI(0, P_ENV_DARK_THRESH);
+      dispatch_k(cb, K_ENV_DFN, s_envdfn, pc, 1, 1, 1, 1, "YENV4b dark_fin");
+      /* fallback MAD pair → spare slots (only adopted when degenerate) */
+      PCI(0, W); PCI(1, H); PCI(2, 3); PCI(3, P_SIGMA_Y);
+      dispatch_k(cb, K_LAP_MAD, s_mad, pc, 4, 1, 1, 1, "YENVf lap_mad_fb");
+      PCI(0, P_SIGMA_Y); PCI(1, P_ALPHA_MAD); PCI(2, P_SIGMA_SQ_MAD);
+      dispatch_k(cb, K_SYNTH, s_syn, pc, 3, 1, 1, 1, "YENVf synth_fb");
+      PCI(0, 1);
+      dispatch_k(cb, K_ENV_SEL, s_envsel, pc, 1, 1, 1, 1, "YENVs select");
+    }
   }
   PCI(0, npix_i);
   dispatch_k(cb, K_GAT_FWD, s_gat, pc, 1,
@@ -958,9 +1052,12 @@ static int run_core(float *srgb, const int W, const int H,
   }
   if(!g_vk_quiet)
     fprintf(stderr, "[yuv_vk] %dx%d blind sigma=%.5f alpha=%.6g sigma_sq=%.6e "
-                    "sigma_gat=%.4f s_y=%.2f s_c=%.2f%s%s\n",
+                    "sigma_gat=%.4f s_y=%.2f s_c=%.2f est=%s%s%s\n",
             W, H, h_params[P_SIGMA_Y], h_params[P_ALPHA], h_params[P_SIGMA_SQ],
             h_params[P_SIGMA_GAT], strength_y, strength_c,
+            env_use_mad ? "MAD"
+                        : (h_params[P_ENV_DEGEN] > 0.5f
+                               ? "envelope->MAD-fallback" : "envelope"),
             luma_only ? " (luma-only)" : "",
             hold_frame ? " [noise HOLD]" : "");
 
@@ -1022,6 +1119,27 @@ static int run_core(float *srgb, const int W, const int H,
   return 0;
 }
 
+/* [2026-07-19 PARITY FIX] Non-clipping linear→sRGB for the re-encode
+ * adapter — exact piecewise inverse of yuv_srgb2ycc.comp's srgb_to_lin,
+ * valid for ALL floats (negatives ride the 12.92 branch, super-white the
+ * power branch).  The previous adapter used galosh420_eotf_fwd_f(SRGB)
+ * which CLIPS to [0,1]: the CPU reference feeds the core UNclipped
+ * ("excursions preserved", docs/yuv420_frontend_spec.md), so the clip
+ * silently destroyed sub-black/super-white noise excursions on the GPU
+ * side only — measured on a dark ISO6400 frame the chroma-lane blind σ
+ * dropped 0.0266 (CPU) → 0.0142 and the lane under-denoised.  Present
+ * since the v0.4.0 420 port in BOTH the OpenCL and Vulkan drivers (the
+ * OpenCL twin got the same fix today).  Defined OUTSIDE the NOMAIN guard:
+ * embedders (galosh_fs_vk.c) build the same adapter and need it too.
+ * (日) [0,1] クリップが GPU 側だけ excursion を潰し blind σ 過小 →
+ * 非クリップ順変換に置換して CPU と一致 (v0.4.0 以来の既存バグ)。
+ * NOMAIN ガード外に置く (frameserver 埋め込み側も同アダプタを持つ)。 */
+static inline float vk420_lin_to_srgb_noclip(float l)
+{
+  return (l <= 0.0031308f) ? 12.92f * l
+                           : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
 #ifndef GALOSH_YUV_VK_NOMAIN
 /* ================= GALOSH-420 planar driver =================
  * Identical composition to the CPU / OpenCL drivers (galosh_yuv420.h is
@@ -1076,11 +1194,12 @@ static int run_420(const char *in_path, const char *out_path,
   /* ---- LUMA (full res, gray image, luma-only fast path) ---- */
   float *gray = (float *)malloc(ysz * 3 * 4);
   if(!gray) { fprintf(stderr, "alloc failed\n"); return 1; }
+  /* [2026-07-19 PARITY FIX] no input clamp + non-clipping re-encode:
+   * the CPU reference feeds EOTF^-1(Y') to the core unclamped. */
   for(size_t i = 0; i < ysz; i++)
   {
-    const float v = galosh420_eotf_fwd_f(
-        fminf(fmaxf(galosh420_eotf_inv_f(Yp[i], eotf), 0.0f), 1.0f),
-        GALOSH420_EOTF_SRGB);
+    const float v = vk420_lin_to_srgb_noclip(
+        galosh420_eotf_inv_f(Yp[i], eotf));
     gray[3 * i + 0] = v; gray[3 * i + 1] = v; gray[3 * i + 2] = v;
   }
   if(run_core(gray, W, H, sy, sc, /*luma_only=*/1, "_luma", NULL)) return 1;
@@ -1128,9 +1247,11 @@ static int run_420(const char *in_path, const char *out_path,
     {
       float R, G, B;
       galosh420_ncl_inv(Yg[i], Cbp[i], Crp[i], mat, &R, &G, &B);
-      rgb[3 * i + 0] = galosh420_eotf_fwd_f(galosh420_eotf_inv_f(R, eotf), GALOSH420_EOTF_SRGB);
-      rgb[3 * i + 1] = galosh420_eotf_fwd_f(galosh420_eotf_inv_f(G, eotf), GALOSH420_EOTF_SRGB);
-      rgb[3 * i + 2] = galosh420_eotf_fwd_f(galosh420_eotf_inv_f(B, eotf), GALOSH420_EOTF_SRGB);
+      /* [2026-07-19 PARITY FIX] non-clipping re-encode — see
+       * vk420_lin_to_srgb_noclip above (excursions preserved). */
+      rgb[3 * i + 0] = vk420_lin_to_srgb_noclip(galosh420_eotf_inv_f(R, eotf));
+      rgb[3 * i + 1] = vk420_lin_to_srgb_noclip(galosh420_eotf_inv_f(G, eotf));
+      rgb[3 * i + 2] = vk420_lin_to_srgb_noclip(galosh420_eotf_inv_f(B, eotf));
     }
     /* [GALOSH-420 2026-07-12] noise-adaptive chroma radius only on the native
      * half-res 4:2:0 lattice (422/444 chroma is full-res -> R=7 unchanged). */

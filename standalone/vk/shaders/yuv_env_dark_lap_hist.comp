@@ -1,0 +1,58 @@
+#version 450
+/* yuv_env_dark_lap_hist.comp — [2026-07-19 Y-ENV Vulkan port]
+ * Transcribed from galosh.cl §Y-ENV galosh_yuv_env_dark_lap_hist.
+ * Single-plane twin of o32_ne_dark_lap_hist: |stride-2 H/V Laplacian|
+ * histogram (4096 bins over [0, 0.1]) restricted to triplets whose 3
+ * samples are all <= dark_max = params[dark_thresh_slot] + 0.02.
+ * 1D over n_h = height*(width-4) horizontal + n_v = (height-4)*width
+ * vertical positions (CPU envelope Step 4 order).  Feeds the REUSED
+ * o32_ne_dark_finalize (median → σ² refine).
+ * (日) 暗部ラプラシアンヒスト、単一プレーン版。 */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Buf0 { float yplane[]; };
+layout(std430, binding = 1) readonly buffer Buf1 { float params[]; };
+layout(std430, binding = 2)          buffer Buf2 { int hist[]; };
+
+layout(push_constant) uniform PC {
+  int width;
+  int height;
+  int dark_thresh_slot;
+} pc;
+
+const int   YENV_DARK_HIST_BINS = 4096;
+const float YENV_DARK_LAP_MAX   = 0.1;
+
+void main()
+{
+  const int i = int(gl_GlobalInvocationID.x);
+  const int n_h = pc.height * (pc.width - 4);
+  const int n_v = (pc.height - 4) * pc.width;
+  if(i >= n_h + n_v) return;
+
+  const float dark_max = params[pc.dark_thresh_slot] + 0.02;
+
+  float v0, v1, v2;
+  if(i < n_h)                                   /* horizontal, stride-2 */
+  {
+    const int y = i / (pc.width - 4);
+    const int x = i - y * (pc.width - 4);
+    const int p = y * pc.width + x;
+    v0 = yplane[p]; v1 = yplane[p + 2]; v2 = yplane[p + 4];
+  }
+  else                                          /* vertical, stride-2 */
+  {
+    const int j = i - n_h;
+    const int y = j / pc.width;
+    const int x = j - y * pc.width;
+    const int p = y * pc.width + x;
+    v0 = yplane[p]; v1 = yplane[p + 2 * pc.width]; v2 = yplane[p + 4 * pc.width];
+  }
+  if(v0 > dark_max || v1 > dark_max || v2 > dark_max) return;
+
+  const float lap = abs(v0 - 2.0 * v1 + v2);
+  int b = int(lap * (float(YENV_DARK_HIST_BINS) / YENV_DARK_LAP_MAX));
+  b = clamp(b, 0, YENV_DARK_HIST_BINS - 1);
+  atomicAdd(hist[b], 1);
+}
