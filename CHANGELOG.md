@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.5.0 — YUV blind estimation fixed: the envelope estimator lands (2026-07-20)
+
+### The headline is a correction
+- The YUV pipeline's blind (α, σ²) fit had been a simplified
+  global-Laplacian-MAD + synthetic α (0.1·σ) since an early rewrite — NOT
+  the lower-envelope estimator the paper describes as shared with the RAW
+  pipeline. The simplification was never recorded or validated; it shipped
+  by mistake and under-modeled signal-dependent noise on every YUV lane.
+  v0.5.0 restores the canonical estimator — a single-plane variant of the
+  RAW lower-envelope fit (16×16 block stats with exact rank-n/2 Laplacian
+  medians, 32-bin p5–p20 lower envelope, Huber-WLS ×5, dark-pixel σ²
+  refinement) — across CPU, OpenCL and Vulkan, routed through one shared
+  switch used by every YUV route. The legacy MAD path remains as
+  `GALOSH_YUV_NOISE_EST=mad` and is output-identical to v0.4.0.
+- Ablation (54 cells × 8 lanes, AWGN / PG-core / PG-cmp / CRVD × 420/444):
+  envelope vs MAD **+0.39 dB PSNR / −0.056 LPIPS** overall (wins 44/54 and
+  49/54); it also beats oracle variance-fit injection by +0.10 dB.
+- Full benchmark rerun of the GALOSH rows (1,656 cells): AWGN-420
+  **+1.19 dB** (LPIPS −0.075, +1.59 dB at σ10); PG-noise +0.11–0.24 dB;
+  CRVD +0.32/+0.36 dB (+0.73 at ISO25600/444); LPIPS improves on **all 32
+  track × variant rows**. CRVD-444 ISO25600 vs σ-oracle BM3D: the gap
+  widens from +3.2 to **+3.9 dB**.
+
+### 420 GPU bug fixes (surfaced by the parity work)
+- The 420 re-encode adapter clipped to [0,1] (OpenCL **and** Vulkan, since
+  v0.4.0), destroying the sub-black / super-white noise excursions the CPU
+  path preserves — on dark frames the chroma-lane blind σ collapsed
+  (0.0266 → 0.0142 measured) and the lane under-denoised. Replaced with a
+  non-clipping linear→sRGB that is the exact inverse of the entry kernel.
+- The OpenCL 420 chroma lane never received the v0.4.x noise-adaptive
+  LOESS radius (CPU and Vulkan had it); the LOESS kernel now takes a
+  runtime radius (legacy routes unchanged at R=7).
+
+### GPU ports & parity
+- Three-engine parity verified on Intel Arc A310, RTX 4070 Ti and AMD
+  gfx1036: estimates bit-near (≤0.3 %, float-vs-double block means),
+  outputs at the established fp32 / fp16 reconciliation floors; the
+  degenerate→MAD fallback fires identically everywhere. OpenCL resolves
+  the fallback host-side; Vulkan resolves it **on-device**
+  (`yuv_env_select`) to preserve the zero-mid-frame-readback design.
+- 4K fit-frame cost: OpenCL **−6 ms** (the parallel envelope chain
+  replaces the serial quickselect), Vulkan +6 ms (the fallback lap_mad
+  still runs). Hold frames are untouched — every v0.4.0 video speed
+  number stands.
+- RAW pipelines are completely unchanged.
+
+### Distribution
+- `GALOSH_YUV_win64.zip` rebuilt with the envelope estimator. The README
+  now documents the measured luma-strength guidance: `-l 0.7` is the
+  perceptual sweet spot for light-to-moderate noise; keep the default 1.0
+  for high-ISO / heavy noise.
+
 ## v0.4.0 — GALOSH-420: planar YCbCr containers + Vulkan YUV engine (2026-07-11)
 
 ### GALOSH-420 planar front-end (all three backends)
