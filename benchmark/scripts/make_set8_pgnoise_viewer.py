@@ -18,10 +18,11 @@ ISOS = ["ISO400", "ISO800", "ISO1600", "ISO3200", "ISO6400", "ISO12800",
 # (condition-key, png subdir, merged-metrics file, method list)
 # expose EVERY saved method (persist-everything: all 15 for 420 / 10 for 444)
 GAL = ["galosh-cpu-fit", "galosh-cpu-hold", "galosh-vk-fit", "galosh-vk-hold"]
-M420 = ["gt_ref", "noisy"] + GAL + ["bm3d1", "bm3d1b", "bm3d1bg", "vbm3d",
-                                    "vbm3db", "vbm3dbg", "knl", "smdegrain",
-                                    "hqdn3d"]
-M444 = ["gt_ref", "noisy"] + GAL + ["bm3d1", "bm3d1b", "bm3d1bg", "knl"]
+# [2026-07-17] unguarded MAD twins + smdegrain fully archived; both lanes
+# share the fair set: oracle + guarded-estimate + knl + hqdn3d
+M420 = ["gt_ref", "noisy"] + GAL + ["bm3d1", "bm3d1bg", "vbm3d",
+                                    "vbm3dbg", "knl", "hqdn3d"]
+M444 = list(M420)
 CONDS = [
     ("core-420", "png420",        "_metrics_pg_420.json",     M420),
     ("cmp-420",  "png420_cmp23",  "_metrics_pg_420_cmp.json", M420),
@@ -31,13 +32,14 @@ CONDS = [
 LABEL = {"gt_ref": "clean (ref)", "noisy": "noisy (developed)",
          "galosh-cpu-fit": "GALOSH cpu-fit", "galosh-cpu-hold": "GALOSH cpu-hold",
          "galosh-vk-fit": "GALOSH vk-fit", "galosh-vk-hold": "GALOSH vk-hold",
-         "bm3d1": "BM3D (sigma-oracle)", "bm3d1b": "BM3D (sigma-blind MAD)",
-         "bm3d1bg": "BM3D (sigma-blind MAD, 0.5 floor)",
-         "vbm3d": "V-BM3D (sigma-oracle temporal)",
-         "vbm3db": "V-BM3D (sigma-blind MAD temporal)",
-         "vbm3dbg": "V-BM3D (sigma-blind MAD, 0.5 floor, temporal)",
-         "knl": "KNL d=1 (temporal)", "smdegrain": "SMDegrain (temporal)",
-         "hqdn3d": "hqdn3d (untuned default)"}
+         "bm3d1": "BM3D (sigma: measured oracle)",
+         "bm3d1b": "BM3D (sigma: MAD estimate)",
+         "bm3d1bg": "BM3D (sigma: MAD estimate + 0.5 floor guard)",
+         "vbm3d": "[T] V-BM3D (sigma: measured oracle)",
+         "vbm3db": "[T] V-BM3D (sigma: MAD estimate)",
+         "vbm3dbg": "[T] V-BM3D (sigma: MAD estimate + 0.5 floor guard)",
+         "knl": "[T] KNL d=1", "smdegrain": "[T] SMDegrain (dropped 07-16)",
+         "hqdn3d": "[T] hqdn3d (untuned default)"}
 
 
 def main():

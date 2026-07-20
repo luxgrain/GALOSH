@@ -23,10 +23,13 @@ DERF_CAP = 85
 SIGMAS = [10, 20, 30, 40, 50]
 # [2026-07-14] unified galosh- naming; galosh-fix/-old (420-fix A/B) archived.
 # PNG-backed methods only (GALOSH pngs exist for cpu-fit + vk-hold).
-M444 = ["gt", "noisy", "galosh-cpu-fit", "galosh-vk-hold", "bm3d1", "bm3d1b",
-        "knl"]
+# [2026-07-16 unification] 444 lane extended (vbm3d family + hqdn3d) and bg
+# guard-twin copies exposed on both lanes; smdegrain kept as saved artifact.
+# [2026-07-17] unguarded MAD twins + smdegrain fully archived
+M444 = ["gt", "noisy", "galosh-cpu-fit", "galosh-vk-hold", "bm3d1",
+        "bm3d1bg", "vbm3d", "vbm3dbg", "knl", "hqdn3d"]
 M420 = ["gt_ref", "noisy", "galosh-cpu-fit", "galosh-vk-hold", "bm3d1",
-        "bm3d1b", "vbm3d", "vbm3db", "knl", "smdegrain", "hqdn3d"]
+        "bm3d1bg", "vbm3d", "vbm3dbg", "knl", "hqdn3d"]
 # cross-track entries: same seq/sigma/frame viewed from the OTHER track
 X444 = ["444:gt", "444:noisy", "444:galosh-cpu-fit", "444:bm3d1", "444:knl"]
 X420 = ["420:gt_ref", "420:noisy", "420:galosh-cpu-fit", "420:bm3d1",

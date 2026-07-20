@@ -39,18 +39,26 @@ GALOSH_VARIANTS = ["galosh-cpu-fit", "galosh-cpu-hold",
                    "galosh-vk-fit", "galosh-vk-hold"]
 BASELINES = ["bm3d1", "bm3d1b", "vbm3d", "vbm3db", "hqdn3d", "knl",
              "smdegrain"]
+# [T] marks TEMPORAL (multi-frame) methods; unmarked = single-frame spatial.
+# Label policy (2026-07-16): say exactly where sigma comes from — no "blind"
+# shorthand ("MAD estimate" = Donoho MAD on the noisy input fed to a
+# sigma-required filter).  GALOSH takes no sigma input (built-in estimation).
 AXIS = {  # display name, axis label
-    "galosh-cpu-fit":  ("GALOSH cpu-fit",  "A blind single-frame"),
-    "galosh-cpu-hold": ("GALOSH cpu-hold", "A blind single-frame"),
-    "galosh-vk-fit":   ("GALOSH vk-fit",   "A blind single-frame"),
-    "galosh-vk-hold":  ("GALOSH vk-hold",  "A blind single-frame"),
-    "bm3d1":     ("BM3D",            "B sigma-ORACLE single-frame"),
-    "bm3d1b":    ("BM3D (MAD est.)", "B' sigma-BLIND single-frame"),
-    "vbm3d":     ("V-BM3D r=2",      "C sigma-ORACLE temporal"),
-    "vbm3db":    ("V-BM3D r=2 (MAD est.)", "C' sigma-BLIND temporal"),
-    "knl":       ("KNL d=1 (h cal.)", "C sigma-known temporal"),
-    "smdegrain": ("SMDegrain (cal.)", "C calibrated temporal"),
-    "hqdn3d":    ("hqdn3d default",  "untuned reference"),
+    "galosh-cpu-fit":  ("GALOSH cpu-fit",  "A no-sigma-input (built-in est.) single-frame"),
+    "galosh-cpu-hold": ("GALOSH cpu-hold", "A no-sigma-input (built-in est.) single-frame"),
+    "galosh-vk-fit":   ("GALOSH vk-fit",   "A no-sigma-input (built-in est.) single-frame"),
+    "galosh-vk-hold":  ("GALOSH vk-hold",  "A no-sigma-input (built-in est.) single-frame"),
+    "bm3d1":     ("BM3D (sigma: measured oracle)", "B sigma measured single-frame"),
+    "bm3d1b":    ("BM3D (sigma: MAD estimate)", "B' sigma MAD-estimated single-frame"),
+    "bm3d1bg":   ("BM3D (sigma: MAD estimate + 0.5 floor guard)",
+                  "B' sigma MAD-estimated single-frame"),
+    "vbm3d":     ("[T] V-BM3D r=2 (sigma: measured oracle)",  "C sigma measured temporal"),
+    "vbm3db":    ("[T] V-BM3D r=2 (sigma: MAD estimate)", "C' sigma MAD-estimated temporal"),
+    "vbm3dbg":   ("[T] V-BM3D r=2 (sigma: MAD estimate + 0.5 floor guard)",
+                  "C' sigma MAD-estimated temporal"),
+    "knl":       ("[T] KNL d=1 (h: frozen DAVIS table)", "C calibrated temporal"),
+    "smdegrain": ("[T] SMDegrain (thSAD: frozen DAVIS table)", "C calibrated temporal"),
+    "hqdn3d":    ("[T] hqdn3d default", "untuned reference"),
 }
 METRICS = ["psnr", "ssim", "lpips", "dists", "niqe"]
 
@@ -98,6 +106,14 @@ def main():
         return base
     mbl = merge_shard(mbl, OUT / "_metrics_420_baselines_blind.json")
     mbl4 = merge_shard(mbl4, OUT / "_metrics_444_baselines_blind.json")
+    # [2026-07-16 unification] add-on shards: vbm3d-family/hqdn3d on 444,
+    # bg guard-twin copies on both lanes (sharded -> glob)
+    for f in sorted(OUT.glob("_metrics_420_baselines_bg*.json")):
+        mbl = merge_shard(mbl, f)
+    for f in sorted(OUT.glob("_metrics_444_baselines_vb*.json")):
+        mbl4 = merge_shard(mbl4, f)
+    for f in sorted(OUT.glob("_metrics_444_baselines_bg*.json")):
+        mbl4 = merge_shard(mbl4, f)
     speed = None
     sp = OUT / "_speed_set8.json"
     if sp.exists():
@@ -120,10 +136,13 @@ def main():
     hdr = "| method (axis) | " + " | ".join(f"s{s}" for s in SIGMAS) + " |"
     L.append(hdr)
     L.append("|---|" + "---|" * len(SIGMAS))
+    # [2026-07-17 fairness policy] BM3D family shown as sigma-oracle (upper
+    # bound) + MAD-estimate-with-guard (realistic deployment).  Unguarded
+    # MAD twins + smdegrain fully archived (dropped_methods_20260717).
     order = ([(m420, v) for v in GALOSH_VARIANTS] +
-             [(mbl, "bm3d1"), (mbl, "bm3d1b"), (mbl, "vbm3d"),
-              (mbl, "vbm3db"), (mbl, "knl"), (mbl, "smdegrain"),
-              (mbl, "hqdn3d")])
+             [(mbl, "bm3d1"), (mbl, "bm3d1bg"),
+              (mbl, "vbm3d"), (mbl, "vbm3dbg"),
+              (mbl, "knl"), (mbl, "hqdn3d")])
     for d, v in order:
         name, ax = AXIS[v]
         cells = []
@@ -141,8 +160,9 @@ def main():
     # ---- panel 2: 444 track (+ measured baselines) + published ----
     L.append("## 444 track (YUV444P16 full; FastDVDnet-comparable protocol)"
              "\n")
-    L.append("PSNR / LPIPS, mean over 8 sequences.  bm3d1/knl are run "
-             "locally on the identical 444 inputs (sigma = measured "
+    L.append("PSNR / LPIPS, mean over 8 sequences.  The BM3D family, "
+             "V-BM3D family (2026-07-16 unification), knl and hqdn3d are "
+             "run locally on the identical 444 inputs (sigma = measured "
              "per-plane std on the 444P16 lattice; knl h = frozen table); "
              "axis D rows are quoted from the FastDVDnet paper "
              "(arXiv 1907.01361 Table 1), not re-run:\n")
@@ -150,11 +170,16 @@ def main():
     L.append("|---|" + "---|" * len(SIGMAS))
     order444 = [(m444, v) for v in GALOSH_VARIANTS]
     if mbl4:
-        order444 += [(mbl4, "bm3d1"), (mbl4, "bm3d1b"), (mbl4, "knl")]
+        order444 += [(mbl4, "bm3d1"), (mbl4, "bm3d1bg"),
+                     (mbl4, "vbm3d"), (mbl4, "vbm3dbg"),
+                     (mbl4, "knl"), (mbl4, "hqdn3d")]
     for d, v in order444:
         name, ax = AXIS[v]
-        cells = [f"{mean_of(d, v, s, 'psnr'):.2f} / "
-                 f"{mean_of(d, v, s, 'lpips'):.3f}" for s in SIGMAS]
+        cells = []
+        for s in SIGMAS:
+            p = mean_of(d, v, s, "psnr")
+            l = mean_of(d, v, s, "lpips")
+            cells.append("--" if p is None else f"{p:.2f} / {l:.3f}")
         L.append(f"| {name} ({ax}) | " + " | ".join(cells) + " |")
     for name, (tab, sub) in PUBLISHED.items():
         cells = [f"{tab[s]:.2f}" for s in SIGMAS]
@@ -198,7 +223,7 @@ def main():
             L.append(f"| GALOSH {v} (VapourSynth) | " + " | ".join(cells)
                      + " |")
         avsrows = ["galosh cpu-fit", "galosh vk-fit", "galosh vk-hold",
-                   "bm3d1", "vbm3d", "hqdn3d", "knl", "smdegrain"]
+                   "bm3d1", "vbm3d", "hqdn3d", "knl"]
         for v in avsrows:
             cells = []
             for res in ["540p", "1080p", "2160p"]:

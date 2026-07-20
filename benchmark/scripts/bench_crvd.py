@@ -132,23 +132,60 @@ def clip444p16(planes, w, h):
     return core.std.ModifyFrame(c, c, put)
 
 
-def avs_method(method, y4m, sig, tables):
+# ---- 444 lane helpers (2026-07-16 unification; protocol mirrors the Set8
+# PG-noise 444 track exactly: GALOSH on YUV444P16 full via the DLL,
+# baselines on an 8-bit 4:4:4 y4m) ----
+
+def clip444p8(planes, w, h):
+    fmt = core.query_video_format(vs.YUV, vs.INTEGER, 8, 0, 0)
+    c = core.std.BlankClip(width=w, height=h, format=fmt, length=len(planes))
+
+    def put(n, f, pl=planes):
+        fo = f.copy()
+        for p in range(3):
+            np.asarray(fo[p])[:] = pl[n][p]
+        return fo
+    return core.std.ModifyFrame(c, c, put)
+
+
+def to444(frames_f64, depth):
+    fmt = vs.YUV444P16 if depth == 16 else vs.YUV444P8
+    return core.resize.Bicubic(rgb_clip_from(frames_f64, raw_rgb48=True),
+                               format=fmt, matrix_s="709",
+                               range_s="full", range_in_s="full")
+
+
+def write_y4m_444(path, planes_list, w, h):
+    with open(path, "wb") as f:
+        f.write(f"YUV4MPEG2 W{w} H{h} F25:1 Ip A1:1 C444\n".encode())
+        for pl in planes_list:
+            f.write(b"FRAME\n")
+            for p in pl:
+                f.write(np.ascontiguousarray(p).tobytes())
+
+
+def avs_method(method, y4m, sig, tables, mode="420"):
     method = BLIND.get(method, method)   # bm3d1b/vbm3db -> same chain,
     src = f'FFVideoSource("{Path(y4m).as_posix()}")\n'   # blind sig via caller
     sy, su, sv = (round(s, 2) for s in sig)
+    # 420 y4m -> 444 for BM3D/KNL then back; a 444 y4m needs no resample
+    to44 = "" if mode == "444" else "ConvertToYUV444()\n"
+    back = "" if mode == "444" else "ConvertToYUV420()\n"
     if method == "bm3d1":
-        return (src + 'ConvertBits(32)\nConvertToYUV444()\n'
+        return (src + f'ConvertBits(32)\n{to44}'
                 f'BM3D_CPU(sigma=[{sy},{su},{sv}])\n'
-                'ConvertToYUV420()\nConvertBits(8)\n')
+                f'{back}ConvertBits(8)\n')
     if method == "vbm3d":
-        return (src + 'ConvertBits(32)\nConvertToYUV444()\n'
+        return (src + f'ConvertBits(32)\n{to44}'
                 f'BM3D_CPU(sigma=[{sy},{su},{sv}], radius=2)\n'
-                'BM3D_VAggregate(radius=2)\nConvertToYUV420()\nConvertBits(8)\n')
+                f'BM3D_VAggregate(radius=2)\n{back}ConvertBits(8)\n')
     if method == "knl":
-        return (src + 'ConvertToYUV444()\n'
+        return (src + to44 +
                 f'KNLMeansCL(d=1, a=2, h={tables["knl"]}, channels="YUV")\n'
-                'ConvertToYUV420()\n')
+                + back)
     if method == "smdegrain":
+        # [DEPRECATED 2026-07-16] dropped from the unified set (frozen thSAD
+        # pass-through defect at CRVD/high-ISO); kept for legacy shards only.
         return (f'Import("{EXTOOLS}")\n' + src +
                 f'SMDegrain(tr=3, thSAD={tables["smdegrain"]}, prefilter=2, '
                 'contrasharp=false)\n')
@@ -159,18 +196,51 @@ def avs_method(method, y4m, sig, tables):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="420", choices=["420", "444"])
     ap.add_argument("--scenes", default=",".join(str(i) for i in range(1, 12)))
     ap.add_argument("--isos", default=",".join(ISOS))
+    # [2026-07-16 unification] galosh444 side-check + smdegrain dropped from
+    # the default set (galosh444 archived; smdegrain thSAD pass-through).
     ap.add_argument("--methods",
                     default="galosh-cpu-fit,galosh-cpu-hold,galosh-vk-fit,"
-                            "galosh-vk-hold,galosh444,bm3d1,bm3d1b,vbm3d,"
-                            "vbm3db,knl,smdegrain,hqdn3d")
+                            "galosh-vk-hold,bm3d1,bm3d1b,vbm3d,"
+                            "vbm3db,knl,hqdn3d")
     ap.add_argument("--tag", default="")
+    # [2026-07-17 generator-fidelity track] inject SYNTHETIC noise on the
+    # developed clean instead of loading the real noisy frames:
+    #   --synth imx385  -> CRVD-measured per-ISO (a,b) (sensor_pg_library),
+    #                      injected via tools/pgnoise v2 (measured banding)
+    #   --synth phone   -> phone trimmed-median curve at the same ISO label
+    # Everything downstream (sigma measurement, methods, metrics) is
+    # IDENTICAL to the real-noise track, so real-vs-synth tables compare
+    # generator fidelity method-by-method.  GT stays the developed clean.
+    #   --synth phone-match -> GENERIC phone curve, sigma-matched per ISO
+    #                      (equiv-ISO from _synth_phone_match.json; the
+    #                      generality test: no target-sensor measurement)
+    ap.add_argument("--synth", default="",
+                    choices=["", "imx385", "phone", "phone-match"])
     # PNG persistence ON BY DEFAULT (persist-everything); --no-png is
     # user-explicit only.
     ap.add_argument("--no-png", action="store_true")
     args = ap.parse_args()
     methods = args.methods.split(",")
+    mode = args.mode
+    if args.synth:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import pgnoise as pgn
+        pg_tab = json.loads((ROOT / "benchmark" / "results_set8_pgnoise" /
+                             "sensor_pg_library.json").read_text())
+        pm_tab = None
+        if args.synth == "phone-match":
+            pm_tab = json.loads((OUT / "_synth_phone_match.json").read_text())
+
+        def synth_ab(iso):
+            if args.synth == "imx385":
+                e = pg_tab["CRVD_IMX385"][iso]
+                return e["a"], e["b"]
+            if args.synth == "phone-match":
+                return pm_tab[iso]["a"], pm_tab[iso]["b"]
+            return pgn.iso_to_pg(float(iso.replace("ISO", "")))
     if any(m in GVAR for m in methods):
         core.std.LoadPlugin(path=str(DLL))
     OUT.mkdir(parents=True, exist_ok=True)
@@ -182,35 +252,83 @@ def main():
     def keyclamp(s):     # measured sigma -> nearest calibrated table key
         return str(min([10, 20, 30, 40, 50], key=lambda k: abs(k - s)))
 
-    results = {}
-    pngroot = OUT / "png"
+    def run_env():
+        """Provenance for the shard JSONs (mirrors bench_set8_pgnoise)."""
+        import hashlib
+
+        def sha(p):
+            try:
+                return hashlib.sha256(Path(p).read_bytes()).hexdigest()[:16]
+            except OSError:
+                return None
+        return {"dll_sha256_16": sha(DLL), "exe_sha256_16": sha(EXE),
+                "vapoursynth": getattr(vs.core, "version_number",
+                                       lambda: None)(),
+                "numpy": np.__version__, "python": sys.version.split()[0]}
+
+    results = {"_env": run_env()}
+    synth_sfx = ("" if not args.synth else
+                 ("_synth" if args.synth == "imx385" else "_synth_phone"))
+    pngroot = OUT / (("png" if mode == "420" else "png444") + synth_sfx)
     for scene in args.scenes.split(","):
         results[f"scene{scene}"] = {}
         for iso in args.isos.split(","):
             noisy_f, clean_f = load_seq(scene, iso)
+            if args.synth:
+                # generator-fidelity: same developed clean, synthetic noise
+                # via tools/pgnoise v2 (measured banding, split seeds)
+                a_s, b_s = synth_ab(iso)
+                cu8 = [np.clip(np.round(c), 0, 255).astype(np.uint8)
+                       for c in clean_f]
+                noisy_f = [pgn.add_pg_noise(
+                               f, a_s, b_s, seed_shot=311, seed_read=313,
+                               frame_idx=t).astype(np.float64)
+                           for t, f in enumerate(cu8)]
             h_, w_ = noisy_f[0].shape[:2]
-            gt420 = to_420(rgb_clip_from([c for c in clean_f], raw_rgb48=True))
-            gt_planes = list(frames_planes(gt420))
-            gt_ref = list(frames_rgb(from_420(gt420)))
-            noisy420 = to_420(rgb_clip_from(noisy_f, raw_rgb48=True))
-            noisy_planes = list(frames_planes(noisy420))
-            noisy_rec = list(frames_rgb(from_420(noisy420)))
-            meas = [float(np.mean([np.std(a[p].astype(np.float64)
-                                          - b[p].astype(np.float64))
-                                   for a, b in zip(noisy_planes, gt_planes)]))
-                    for p in range(3)]
-            bsig = mad_sigma(noisy_planes)     # blind (no GT), for *b twins
+            AVS_WORK.mkdir(parents=True, exist_ok=True)
+            if mode == "420":
+                gt420 = to_420(rgb_clip_from([c for c in clean_f],
+                                             raw_rgb48=True))
+                gt_planes = list(frames_planes(gt420))
+                gt_ref = list(frames_rgb(from_420(gt420)))
+                nzclip = to_420(rgb_clip_from(noisy_f, raw_rgb48=True))
+                noisy_planes = list(frames_planes(nzclip))
+                noisy_rec = list(frames_rgb(from_420(nzclip)))
+                meas = [float(np.mean([np.std(a[p].astype(np.float64)
+                                              - b[p].astype(np.float64))
+                                       for a, b in zip(noisy_planes,
+                                                       gt_planes)]))
+                        for p in range(3)]
+                bsig = mad_sigma(noisy_planes)   # blind (no GT), for *b twins
+                y4m = AVS_WORK / f"crvd_{args.tag}_s{scene}_{iso}.y4m"
+                write_y4m(y4m, noisy_planes, w_, h_)
+            else:
+                # 444 lane (unification): GALOSH on YUV444P16 full via DLL,
+                # baselines on 8-bit 4:4:4 y4m — the Set8 PG-444 protocol.
+                gtc = to444(clean_f, 16)
+                gt_planes = list(frames_planes(gtc))
+                gt_ref = list(frames_rgb(to_rgb24(gtc)))
+                nzclip = to444(noisy_f, 16)
+                noisy_rec = list(frames_rgb(to_rgb24(nzclip)))
+                np8 = list(frames_planes(to444(noisy_f, 8)))
+                gp8 = list(frames_planes(to444(clean_f, 8)))
+                meas = [float(np.mean([np.std(a[p].astype(np.float64)
+                                              - b[p].astype(np.float64))
+                                       for a, b in zip(np8, gp8)]))
+                        for p in range(3)]
+                bsig = mad_sigma(np8)
+                y4m = AVS_WORK / f"crvd444_{args.tag}_s{scene}_{iso}.y4m"
+                write_y4m_444(y4m, np8, w_, h_)
             ent = {"measured_sigma_yuv": [round(m, 2) for m in meas],
                    "blind_sigma_yuv": [round(s, 2) for s in bsig]}
+            if args.synth:
+                ent["synth_pg"] = [args.synth, round(a_s, 8), round(b_s, 8)]
             ent["noisy"] = agg([metrics5(nn, rr)
                                 for nn, rr in zip(noisy_rec, gt_ref)])
-            ent["noisy"]["cr_psnr"] = float(np.mean(
-                [plane_psnr(a[2], b[2], 255)
-                 for a, b in zip(noisy_planes, gt_planes)]))
-
-            y4m = AVS_WORK / f"crvd_{args.tag}_s{scene}_{iso}.y4m"
-            AVS_WORK.mkdir(parents=True, exist_ok=True)
-            write_y4m(y4m, noisy_planes, w_, h_)
+            if mode == "420":
+                ent["noisy"]["cr_psnr"] = float(np.mean(
+                    [plane_psnr(a[2], b[2], 255)
+                     for a, b in zip(noisy_planes, gt_planes)]))
             if not args.no_png:     # viewer refs: noisy + GT, once per cell
                 for i, o in enumerate(noisy_rec):
                     save_png(o, pngroot / f"scene{scene}" / iso / "noisy"
@@ -222,13 +340,21 @@ def main():
             for m in methods:
                 try:
                     if m in GVAR:
-                        den_c = core.galosh.Denoise(
-                            noisy420, luma=1.0, chroma=1.0, matrix="bt709",
-                            eotf="srgb", range="limited", siting="left",
-                            **GVAR[m])
-                        drgb = list(frames_rgb(from_420(den_c)))
+                        if mode == "420":
+                            den_c = core.galosh.Denoise(
+                                nzclip, luma=1.0, chroma=1.0, matrix="bt709",
+                                eotf="srgb", range="limited", siting="left",
+                                **GVAR[m])
+                            drgb = list(frames_rgb(from_420(den_c)))
+                        else:
+                            den_c = core.galosh.Denoise(
+                                nzclip, luma=1.0, chroma=1.0, matrix="bt709",
+                                eotf="srgb", range="full", **GVAR[m])
+                            drgb = list(frames_rgb(to_rgb24(den_c)))
                         dp = list(frames_planes(den_c))
                     elif m == "galosh444":
+                        # [ARCHIVED 2026-07-16] legacy EXE side-check; kept
+                        # runnable for reproducing the archived row only.
                         n444 = list(frames_planes(core.resize.Bicubic(
                             rgb_clip_from(noisy_f, raw_rgb48=True),
                             format=vs.YUV444P16, matrix_s="709",
@@ -245,13 +371,17 @@ def main():
                             tb["knl"] = knl[keyclamp(meas[0])]
                         # blind twins: raw / guarded MAD; others oracle
                         sig_in = blind_sig(m, bsig, meas)
-                        sc = avs_method(m, y4m.as_posix(), sig_in, tb)
-                        dp = run_avs(sc, f"crvd_{args.tag}_s{scene}_{iso}_{m}",
-                                     NFR)
-                        drgb = list(frames_rgb(from_420(
-                            planes_to_420clip(dp, w_, h_))))
+                        sc = avs_method(m, y4m.as_posix(), sig_in, tb, mode)
+                        dp = run_avs(sc, f"crvd{mode}_{args.tag}_s{scene}"
+                                     f"_{iso}_{m}", NFR)
+                        if mode == "420":
+                            drgb = list(frames_rgb(from_420(
+                                planes_to_420clip(dp, w_, h_))))
+                        else:
+                            drgb = list(frames_rgb(to_rgb24(
+                                clip444p8(dp, w_, h_))))
                     e = agg([metrics5(o, r) for o, r in zip(drgb, gt_ref)])
-                    if dp is not None:
+                    if dp is not None and (mode == "420" or m in GVAR):
                         e["cr_psnr"] = float(np.mean(
                             [plane_psnr(a[2], b[2], 255)
                              for a, b in zip(dp, gt_planes)]))
@@ -269,7 +399,11 @@ def main():
                           f"{str(ex)[-160:]}", flush=True)
             y4m.unlink()
             results[f"scene{scene}"][iso] = ent
-            outf = OUT / (f"_metrics_crvd{('_' + args.tag) if args.tag else ''}"
+            stem = ("_metrics_crvd"
+                    + ("" if not args.synth else
+                       ("synth" if args.synth == "imx385" else "synthphone"))
+                    + ("444" if mode == "444" else ""))
+            outf = OUT / (f"{stem}{('_' + args.tag) if args.tag else ''}"
                           ".json")
             outf.write_text(json.dumps(results, indent=1))
     print("saved:", outf)

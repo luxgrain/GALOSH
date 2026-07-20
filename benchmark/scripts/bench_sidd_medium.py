@@ -119,7 +119,7 @@ def compute_lpips_patched(a, b, tile=1024):
     """Patch-based LPIPS to avoid OOM on full images."""
     global _lpips_fn
     import torch
-    dev = torch.device('cuda')
+    dev = torch.device(os.environ.get('GALOSH_METRICS_DEVICE', 'cuda'))
     if _lpips_fn is None:
         import lpips
         _lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(dev)
@@ -144,10 +144,11 @@ def compute_dists_patched(a, b, tile=1024):
     """Patch-based DISTS to avoid OOM."""
     global _dists_fn
     import torch
-    dev = torch.device('cuda')
+    dev = torch.device(os.environ.get('GALOSH_METRICS_DEVICE', 'cuda'))
     if _dists_fn is None:
         import pyiqa
-        _dists_fn = pyiqa.create_metric('dists', device='cuda')
+        _dists_fn = pyiqa.create_metric('dists',
+            device=os.environ.get('GALOSH_METRICS_DEVICE', 'cuda'))
     H, W = a.shape[:2]
     vals, weights = [], []
     for y0 in range(0, H, tile):
@@ -171,7 +172,8 @@ def compute_niqe(srgb):
     import torch
     if _niqe_fn is None:
         import pyiqa
-        _niqe_fn = pyiqa.create_metric('niqe', device='cuda')
+        _niqe_fn = pyiqa.create_metric('niqe',
+            device=os.environ.get('GALOSH_METRICS_DEVICE', 'cuda'))
     H, W = srgb.shape[:2]
     tile = 1024
     vals, weights = [], []
@@ -181,7 +183,8 @@ def compute_niqe(srgb):
             if (y1-y0) < 96 or (x1-x0) < 96:
                 continue  # skip tiny edge tiles
             patch = srgb[y0:y1, x0:x1]
-            t = torch.from_numpy(patch.transpose(2,0,1)).unsqueeze(0).float().cuda()
+            t = torch.from_numpy(patch.transpose(2,0,1)).unsqueeze(0).float().to(
+                torch.device(os.environ.get('GALOSH_METRICS_DEVICE', 'cuda')))
             with torch.no_grad():
                 v = float(_niqe_fn(t).item())
             npix = (y1-y0) * (x1-x0)
@@ -263,7 +266,7 @@ def run_galosh_yuv_gat_gpu(noisy_srgb, uid, strength_y=1.0, strength_c=1.0, cl_d
     """GALOSH-YUV (new): sRGB -> OpenCL linear Y-GAT + chroma VST -> sRGB.
 
     EN: Calls galosh_gpu.exe with yuv_gat mode. All processing on GPU:
-        sRGB -> linear YCbCr, Y blind noise estimation (Foi+Alenius),
+        sRGB -> linear YCbCr, Y blind noise estimation (Laplacian MAD on the GPU path),
         Y-GAT + LOSH + Makitalo inverse, Cb/Cr linear VST + LOSH + inverse,
         bivariate Wiener coupling, YCbCr -> sRGB.
     JP: yuv_gat モードで galosh_gpu.exe を呼び出す。全処理 GPU 上。
@@ -344,7 +347,7 @@ def get_nafnet():
         sys.path.insert(0, nafnet_str)
     from basicsr.models.archs.NAFNet_arch import NAFNet
     import torch
-    dev = torch.device('cuda')
+    dev = torch.device(os.environ.get('GALOSH_METRICS_DEVICE', 'cuda'))
     model = NAFNet(img_channel=3, width=64, middle_blk_num=12,
                    enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 2])
     ckpt = NAFNET_DIR / "experiments" / "pretrained_models" / "NAFNet-SIDD-width64.pth"
@@ -397,7 +400,7 @@ def get_dncnn():
     sys.path.insert(0, str(KAIR_DIR))
     from models.network_dncnn import DnCNN
     import torch
-    dev = torch.device('cuda')
+    dev = torch.device(os.environ.get('GALOSH_METRICS_DEVICE', 'cuda'))
     model = DnCNN(in_nc=1, out_nc=1, nc=64, nb=20, act_mode='R')
     state = torch.load(str(KAIR_DIR / "model_zoo" / "dncnn_gray_blind.pth"),
                        map_location=dev, weights_only=True)
@@ -431,7 +434,7 @@ def get_drunet():
     sys.path.insert(0, str(KAIR_DIR))
     from models.network_unet import UNetRes
     import torch
-    dev = torch.device('cuda')
+    dev = torch.device(os.environ.get('GALOSH_METRICS_DEVICE', 'cuda'))
     model = UNetRes(in_nc=2, out_nc=1, nc=[64,128,256,512],
                     nb=4, act_mode='R', downsample_mode='strideconv',
                     upsample_mode='convtranspose', bias=False)

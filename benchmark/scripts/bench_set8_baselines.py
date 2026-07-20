@@ -143,6 +143,13 @@ def method_script_444(method, y4m_path, meas_sigma, tables):
         return (src + 'ConvertBits(32)\n'
                 f'BM3D_CPU(sigma=[{sy},{su},{sv}])\n'
                 'ConvertBits(16)\n')
+    if method == "vbm3d":     # [2026-07-16 unification] temporal on 444P16
+        return (src + 'ConvertBits(32)\n'
+                f'BM3D_CPU(sigma=[{sy},{su},{sv}], radius=2)\n'
+                'BM3D_VAggregate(radius=2)\n'
+                'ConvertBits(16)\n')
+    if method == "hqdn3d":    # AVS hqdn3d is 8-bit; wrap (documented)
+        return src + 'ConvertBits(8)\nhqdn3d()\nConvertBits(16)\n'
     if method == "knl":
         h = tables["knl"]
         return src + f'KNLMeansCL(d=1, a=2, h={h}, channels="YUV")\n'
@@ -189,8 +196,11 @@ def main():
     args = ap.parse_args()
 
     if not args.methods:
-        args.methods = ("bm3d1,vbm3d,hqdn3d,knl,smdegrain"
-                        if args.mode == "420" else "bm3d1,knl")
+        # [2026-07-16 unification] smdegrain dropped (frozen-thSAD
+        # pass-through defect — kept in method_script for legacy shards);
+        # 444 default = same family as 420.
+        args.methods = ("bm3d1,vbm3d,hqdn3d,knl" if args.mode == "420"
+                        else "bm3d1,vbm3d,hqdn3d,knl")
     methods = args.methods.split(",")
     sigmas = [int(s) for s in args.sigmas.split(",")]
     WORK.mkdir(parents=True, exist_ok=True)

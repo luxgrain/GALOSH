@@ -237,11 +237,10 @@ def main():
     SEQ_ORDER = DERF + GOPRO   # stable index for reproducible per-seq gain
     if not args.methods:
         gal = "galosh-cpu-fit,galosh-cpu-hold,galosh-vk-fit,galosh-vk-hold"
-        # 420: GALOSH(4) + oracle & BLIND BM3D family + temporals + hqdn3d;
-        # 444: GALOSH(4) + BM3D (oracle & blind) + KNL.
-        args.methods = (f"{gal},bm3d1,bm3d1b,vbm3d,vbm3db,knl,smdegrain,"
-                        f"hqdn3d" if mode == "420"
-                        else f"{gal},bm3d1,bm3d1b,knl")
+        # [2026-07-16 unification] identical default set on 420 and 444;
+        # smdegrain dropped (frozen-thSAD pass-through defect — the
+        # avs_method branch is kept for legacy-shard reproduction only).
+        args.methods = f"{gal},bm3d1,bm3d1b,vbm3d,vbm3db,knl,hqdn3d"
     core.std.LoadPlugin(path=str(DLL))
     methods = args.methods.split(",")
     thsad = json.loads((ROOT / "benchmark" / "results_set8_awgn" /
