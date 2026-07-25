@@ -52,6 +52,32 @@
 /* ================================================================
  * Enums / parameters
  * ================================================================ */
+
+/* [2026-07-25 CANONICAL, user-approved] Half-res chroma noise handling is
+ * driven by the BLIND chroma sigma (sigma_C = mean Laplacian-MAD of the
+ * native half-res Cb/Cr planes, linear units) — shared by CPU / OpenCL
+ * host / Vulkan host so every engine takes identical decisions.
+ * Evidence: benchmark/results_noisemodel_v2_oracle/_sigc_rule_report.md
+ * (39-cell radius A/B: CRVD +0.165 dB / LPIPS ~flat) + 27-cell eps A/B
+ * (+0.055 dB / LPIPS -0.001, one-sided).
+ *
+ * 1) LOESS radius: R = (sigma_C < GALOSH_YUV420_SIGC_T) ? 2 : 3.
+ *    T recalibrated from the ORIGINAL 2026-07-12 Set8 crossover material in
+ *    blind sigma_C units (R=2 side max 0.0179 < T < R=3 side min 0.0226).
+ *    Replaces the v0.5.0 sqrt(sigma_sq) rule whose input collapsed to the
+ *    read-floor clamp after the envelope canonicalization (semantic drift,
+ *    R=2 always).  Env GALOSH_YUV420_RADIUS_SRC=lin keeps the dead rule for
+ *    regression only.
+ * 2) MAP-ridge eps (ONE-SIDED): strength_eff = strength_c *
+ *    clamp(sigma_C / GALOSH_YUV420_EPS_ANCHOR, 1, GALOSH_YUV420_EPS_HI).
+ *    Anchor = median blind sigma_C of the eps=1 tuning material (Set8 s20)
+ *    -> calibration-preserving; floor 1.0 = never weaker than the shipped
+ *    ridge (not a tuned constant).  Env GALOSH_YUV420_EPS_SRC=const keeps
+ *    the constant ridge for regression only. */
+#define GALOSH_YUV420_SIGC_T     0.020f
+#define GALOSH_YUV420_EPS_ANCHOR 0.012f
+#define GALOSH_YUV420_EPS_HI     4.0f
+
 typedef enum
 {
   GALOSH420_PIX_444 = 0,   /* legacy sRGB float path (not planar) */

@@ -29,7 +29,17 @@ layout(std430, binding = 2) restrict readonly  buffer B2 { float16_t cr_in[]; };
 layout(std430, binding = 3) restrict writeonly buffer B3 { float16_t cb_out[]; };
 layout(std430, binding = 4) restrict writeonly buffer B4 { float16_t cr_out[]; };
 layout(std430, binding = 5) restrict readonly  buffer B5 { float params[]; };
-layout(push_constant) uniform PC { int width; int height; float strength_c; int halfres420; } pc;
+/* [2026-07-25 CANONICAL sigc/eps] chroma_r > 0 = HOST-decided radius (the
+ * canonical sigma_C rule computed on the CPU from the half-res Cb/Cr lane —
+ * see galosh_yuv420.h GALOSH_YUV420_SIGC_T); chroma_r == 0 = the DEPRECATED
+ * in-shader sigma_lin rule below (GALOSH_YUV420_RADIUS_SRC=lin regression
+ * path — VK has zero mid-frame readback, so the legacy rule must stay on
+ * device to reproduce v0.5.0 byte-exactly).  strength_c now carries the
+ * host-computed one-sided MAP-ridge eps strength (strength_eff); with
+ * GALOSH_YUV420_EPS_SRC=const the host passes plain strength_c through.
+ * (日) R はホスト決定が正、0 のみ旧シェーダ内則(回帰用)。eps はホスト計算の
+ * strength_eff が同じフィールドで届く。 */
+layout(push_constant) uniform PC { int width; int height; float strength_c; int halfres420; int chroma_r; } pc;
 
 const int   YG_LOESS_RADIUS = 7;    /* full-res (444) default */
 const float YG_LOESS_BW     = 3.0f;
@@ -41,17 +51,22 @@ void main()
   const int y = int(gl_GlobalInvocationID.y);
   if(x >= pc.width || y >= pc.height) return;
 
-  /* [GALOSH-420 2026-07-12] noise-adaptive chroma radius on the NATIVE
-   * half-res 4:2:0 lattice — port of the CPU galosh_yuv420_chroma_radius:
-   * the full-res R=7 window covers ~4x area at half-res and over-smooths
-   * iso-luminant chroma (Cr fell below noisy on Set8 sigma20).  sigma_lin =
-   * sqrt(sigma_sq) (uniform across the image so R is uniform): <0.027 -> R=2,
-   * else R=3.  444 (full-res chroma) keeps R=7.  JP: 半解像度420クロマのみ
-   * σ_lin から半径可変(2/3)、444はR=7据置。*/
+  /* [GALOSH-420 2026-07-12, rev 2026-07-25] noise-adaptive chroma radius on
+   * the NATIVE half-res 4:2:0 lattice.  Canonical: pc.chroma_r > 0 = the
+   * host-computed sigma_C rule (R uniform across the image).  [DEPRECATED
+   * =lin] chroma_r == 0 falls back to the original in-shader sigma_lin =
+   * sqrt(sigma_sq) rule — kept verbatim for v0.5.0 regression; note this
+   * input semantically DIED after envelope canonicalization (sigma_sq
+   * collapses to the read-floor clamp -> R stuck at 2, the v0.5.0 bug this
+   * revision fixes).  444 (full-res chroma) keeps R=7.  JP: 正= ホスト σ_C
+   * 則。0 は旧 σ_lin 則(回帰専用・意味死)。444 は R=7 据置。*/
   int R = YG_LOESS_RADIUS;
   if(pc.halfres420 != 0) {
-    const float sigma_lin = sqrt(max(params[P_SIGMA_SQ], 0.0f));
-    R = (sigma_lin < 0.027f) ? 2 : 3;
+    if(pc.chroma_r > 0) R = pc.chroma_r;
+    else {
+      const float sigma_lin = sqrt(max(params[P_SIGMA_SQ], 0.0f));
+      R = (sigma_lin < 0.027f) ? 2 : 3;
+    }
   }
 
   const int cx = y * pc.width + x;

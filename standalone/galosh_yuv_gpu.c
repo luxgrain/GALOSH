@@ -78,7 +78,77 @@ static int galosh_yuv420_chroma_radius_host(float sigma_lin)
 {
     const char *e = getenv("GALOSH_YUV420_CHROMA_R");
     if(e && e[0]) { const int v = atoi(e); if(v >= 1 && v <= 7) return v; }
-    return (sigma_lin < 0.027f) ? 2 : 3;
+    return (sigma_lin < 0.027f) ? 2 : 3;   /* [DEPRECATED =lin] dead rule */
+}
+
+/* [2026-07-25 CANONICAL sigc/eps HOST MIRROR — CPU twin in galosh_yuv_cpu.c]
+ * sigma_C = mean Laplacian-MAD of the half-res Cb/Cr planes, computed
+ * HOST-side from the SAME linear interleaved lane buffer the CPU core
+ * receives (shared 420 front-end) with the SAME sampling loop and the SAME
+ * MAD constant -> bit-identical sigma_C, hence identical R / eps decisions
+ * across engines.  Median via qsort (median value is algorithm-independent).
+ * Constants + rationale: galosh_yuv420.h. */
+static int cmp_float_asc(const void *a, const void *b)
+{
+    const float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+static float host_sigma_plane(const float *plane, int width, int height)
+{
+    const int n_samples_max = width * height / 6 < 200000
+                            ? width * height / 6 : 200000;
+    float *abs_laps = (float *)malloc(sizeof(float) * (n_samples_max + 1));
+    if(!abs_laps) return 1.0f;
+    int count = 0;
+    for(int y = 0; y < height && count < n_samples_max; y++)
+    {
+        const float *row = plane + (size_t)y * width;
+        for(int x = 0; x < width - 4 && count < n_samples_max; x += 3)
+        {
+            const float lap = row[x] - 2.0f * row[x + 2] + row[x + 4];
+            abs_laps[count++] = fabsf(lap);
+        }
+    }
+    if(count < 100) { free(abs_laps); return 1.0f; }
+    qsort(abs_laps, count, sizeof(float), cmp_float_asc);
+    /* CPU quick_select_median(arr,n) = quick_select_kth(arr,n,n/2), i.e. the
+     * single element at ascending index n/2 (no even-count averaging) —
+     * replicate exactly for bit-identical sigma_C. */
+    const float mad = abs_laps[count / 2];
+    free(abs_laps);
+    return mad / 1.6521f;
+}
+
+/* exact inverse of yuv420_lin_to_srgb_noclip (below): the 420 lane buffer
+ * is sRGB-ENCODED (device re-linearizes in-kernel), so the host must decode
+ * back to linear before measuring sigma_C — the CPU reference measures on
+ * the linear Cb/Cr planes. */
+static inline float host_srgb_to_lin_noclip(float s)
+{
+    return (s <= 0.04045f) ? s / 12.92f
+                           : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+static float host_sigma_c_from_lane(const float *lane_srgb, int width,
+                                    int height)
+{
+    const size_t npx = (size_t)width * height;
+    float *cb = (float *)malloc(sizeof(float) * npx);
+    float *cr = (float *)malloc(sizeof(float) * npx);
+    if(!cb || !cr) { free(cb); free(cr); return -1.0f; }
+    for(size_t i = 0; i < npx; i++)
+    {
+        const float R = host_srgb_to_lin_noclip(lane_srgb[3 * i + 0]);
+        const float G = host_srgb_to_lin_noclip(lane_srgb[3 * i + 1]);
+        const float B = host_srgb_to_lin_noclip(lane_srgb[3 * i + 2]);
+        cb[i] = -0.1146f * R - 0.3854f * G + 0.5000f * B;
+        cr[i] =  0.5000f * R - 0.4542f * G - 0.0458f * B;
+    }
+    const float sc = 0.5f * (host_sigma_plane(cb, width, height) +
+                             host_sigma_plane(cr, width, height));
+    free(cb); free(cr);
+    return sc;
 }
 
 static int run_yuv_gat_gpu_buf(float *srgb,
@@ -1190,22 +1260,44 @@ static int run_yuv_gat_gpu_buf(float *srgb,
         /* GALOSH_YUV_O chroma: single-pass non-separable bilateral LOESS.
          * GUIDE = q_y_snap_f (normalized post-GAT NOISY Y, = CPU Y_stab guide),
          * NOT the denoised linear y_buf — see the 4a' snapshot bug-fix note. */
-        /* [2026-07-19 PARITY] radius: legacy sRGB route = 7 (unchanged);
-         * GALOSH-420 half-res chroma lane = the CPU reference's
-         * noise-adaptive R (146b5ab), computed from the SAME σ² the GAT
-         * used (sigma_sq_y — blind est or CLI, mirroring the CPU twin). */
+        /* [2026-07-25 CANONICAL sigc/eps — CPU twin galosh_yuv_cpu.c]
+         * radius: legacy sRGB route = 7 (unchanged); GALOSH-420 half-res
+         * chroma lane = sigma_C-driven R (default) with the DEPRECATED
+         * sigma_lin rule behind GALOSH_YUV420_RADIUS_SRC=lin, and the
+         * ONE-SIDED MAP-ridge eps (default) behind
+         * GALOSH_YUV420_EPS_SRC=const.  sigma_C is host-computed from the
+         * same lane buffer with CPU-identical math -> identical decisions. */
         int loess_R = 7;
+        float strength_pass = strength_c;
         if(g_yuv420_halfres_chroma)
         {
-            loess_R = galosh_yuv420_chroma_radius_host(sqrtf(sigma_sq_y));
+            const float sigma_c = host_sigma_c_from_lane(srgb, width, height);
+            const char *rsrc = getenv("GALOSH_YUV420_RADIUS_SRC");
+            if(rsrc && strcmp(rsrc, "lin") == 0)
+                loess_R = galosh_yuv420_chroma_radius_host(sqrtf(sigma_sq_y));
+            else
+            {
+                const char *e = getenv("GALOSH_YUV420_CHROMA_R");
+                loess_R = (e && e[0]) ? atoi(e)
+                        : ((sigma_c < GALOSH_YUV420_SIGC_T) ? 2 : 3);
+            }
+            const char *esrc = getenv("GALOSH_YUV420_EPS_SRC");
+            if(!(esrc && strcmp(esrc, "const") == 0) && sigma_c >= 0.0f)
+            {
+                float r_ = sigma_c / GALOSH_YUV420_EPS_ANCHOR;
+                if(r_ < 1.0f) r_ = 1.0f;
+                if(r_ > GALOSH_YUV420_EPS_HI) r_ = GALOSH_YUV420_EPS_HI;
+                strength_pass = strength_c * r_;
+            }
             fprintf(stderr, "[yuv420_gpu] half-res chroma LOESS R=%d "
-                    "(adaptive, sigma_lin=%.5f)\n", loess_R, sqrtf(sigma_sq_y));
+                    "(sigma_lin=%.5f sigma_c=%.5f eps_strength=%.3f)\n",
+                    loess_R, sqrtf(sigma_sq_y), sigma_c, strength_pass);
         }
         clSetKernelArg(k_guided_loess, 0, sizeof(cl_mem), &q_y_snap_f);
         clSetKernelArg(k_guided_loess, 1, sizeof(cl_mem), &cb_buf);
         clSetKernelArg(k_guided_loess, 2, sizeof(cl_mem), &cr_buf);
         clSetKernelArg(k_guided_loess, 3, sizeof(cl_mem), &params_buf);
-        clSetKernelArg(k_guided_loess, 4, sizeof(float),  &strength_c);
+        clSetKernelArg(k_guided_loess, 4, sizeof(float),  &strength_pass);
         clSetKernelArg(k_guided_loess, 5, sizeof(cl_mem), &cb_biv_buf);
         clSetKernelArg(k_guided_loess, 6, sizeof(cl_mem), &cr_biv_buf);
         clSetKernelArg(k_guided_loess, 7, sizeof(int),    &width);

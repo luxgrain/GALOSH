@@ -173,7 +173,7 @@ static Kern g_k[K_COUNT] = {
   [K_PASS12]     = { "o32_pass12",        2, 16 },
   [K_PASS12_SG]  = { "o32_pass12_sg",     2, 16, .sg32 = 1 },
   [K_MAKITALO]   = { "yuv_makitalo",      5,  4 },
-  [K_LOESS]      = { "yuv_loess",         6, 16 },
+  [K_LOESS]      = { "yuv_loess",         6, 20 },   /* [2026-07-25] +chroma_r */
   [K_YCC2SRGB]   = { "yuv_ycc2srgb",      4,  4 },
   /* [2026-07-19 Y-ENV] envelope chain (default estimator; legacy MAD via
    * GALOSH_YUV_NOISE_EST=mad).  o32_ne_finalize / _dark_thresh_finalize /
@@ -417,6 +417,98 @@ static float g_rate_p12 = 0.0f, g_rate_loess = 0.0f;
  * NATIVE half-res chroma run_core pass so the LOESS shader uses the noise-
  * adaptive radius (R=2/3) instead of the full-res R=7.  0 = full-res (444). */
 static int g_vk_yuv420_halfres = 0;
+
+/* [2026-07-25 CANONICAL sigc/eps HOST MIRROR — CPU twin galosh_yuv_cpu.c,
+ * OpenCL twin galosh_yuv_gpu.c host_sigma_c_from_lane]
+ * sigma_C = mean Laplacian-MAD of the half-res Cb/Cr planes, computed
+ * HOST-side from the SAME lane buffer the core receives, with the SAME
+ * sampling loop and MAD constant as the CPU estimate_sigma_plane ->
+ * bit-identical sigma_C, hence identical R / eps decisions across engines.
+ * The lane buffer is sRGB-ENCODED (vk420_lin_to_srgb_noclip below; device
+ * re-linearizes in-kernel), so decode with the exact inverse first — the
+ * CPU reference measures on the LINEAR Cb/Cr planes.  Median via serial
+ * quickselect, NOT qsort: this runs per frame on the frameserver hot path
+ * (the OpenCL twin is CLI-only and may qsort; the k-th order statistic is
+ * algorithm-independent, so parity is unaffected).  Constants + rationale:
+ * galosh_yuv420.h.  (日) σ_C はホスト計算(CPU と同一サンプリング・同一
+ * median 語義)。レーンは sRGB 符号化なので厳密逆変換で線形へ戻してから測る。
+ * フレーム毎に走るため O(n) quickselect。 */
+static float vk_sigc_select_kth(float *a, int n, int k)
+{
+  int lo = 0, hi = n - 1;
+  while(lo < hi)
+  {
+    const float pivot = a[k];
+    int i = lo, j = hi;
+    do
+    {
+      while(a[i] < pivot) i++;
+      while(a[j] > pivot) j--;
+      if(i <= j) { const float t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+    } while(i <= j);
+    if(j < k) lo = i;
+    if(k < i) hi = j;
+  }
+  return a[k];
+}
+
+static float vk_host_sigma_plane(const float *plane, int width, int height)
+{
+  const int n_samples_max = width * height / 6 < 200000
+                          ? width * height / 6 : 200000;
+  float *abs_laps = (float *)malloc(sizeof(float) * (n_samples_max + 1));
+  if(!abs_laps) return 1.0f;
+  int count = 0;
+  for(int y = 0; y < height && count < n_samples_max; y++)
+  {
+    const float *row = plane + (size_t)y * width;
+    for(int x = 0; x < width - 4 && count < n_samples_max; x += 3)
+    {
+      const float lap = row[x] - 2.0f * row[x + 2] + row[x + 4];
+      abs_laps[count++] = fabsf(lap);
+    }
+  }
+  if(count < 100) { free(abs_laps); return 1.0f; }
+  /* CPU quick_select_median(arr,n) = the single element at ascending index
+   * n/2 (no even-count averaging) — replicate exactly. */
+  const float mad = vk_sigc_select_kth(abs_laps, count, count / 2);
+  free(abs_laps);
+  return mad / 1.6521f;
+}
+
+/* exact inverse of vk420_lin_to_srgb_noclip (defined below with the 420
+ * driver adapters) */
+static inline float vk_sigc_srgb_to_lin_noclip(float s)
+{
+  return (s <= 0.04045f) ? s / 12.92f
+                         : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+static float vk_host_sigma_c_from_lane(const float *lane_srgb, int width,
+                                       int height)
+{
+  const size_t npx = (size_t)width * height;
+  float *cb = (float *)malloc(sizeof(float) * npx);
+  float *cr = (float *)malloc(sizeof(float) * npx);
+  if(!cb || !cr) { free(cb); free(cr); return -1.0f; }
+  /* powf x3/px is the only heavy part and runs per FRAME on the frameserver
+   * hot path — omp when the embedder builds with -fopenmp (build_vk.sh does
+   * not; the pragma is then a no-op).  Iterations independent -> results
+   * unchanged.  (日) 逆変換のみ重い(毎フレーム)。fs ビルドでだけ並列化。 */
+  #pragma omp parallel for schedule(static)
+  for(long long i = 0; i < (long long)npx; i++)
+  {
+    const float R = vk_sigc_srgb_to_lin_noclip(lane_srgb[3 * i + 0]);
+    const float G = vk_sigc_srgb_to_lin_noclip(lane_srgb[3 * i + 1]);
+    const float B = vk_sigc_srgb_to_lin_noclip(lane_srgb[3 * i + 2]);
+    cb[i] = -0.1146f * R - 0.3854f * G + 0.5000f * B;
+    cr[i] =  0.5000f * R - 0.4542f * G - 0.0458f * B;
+  }
+  const float sc = 0.5f * (vk_host_sigma_plane(cb, width, height) +
+                           vk_host_sigma_plane(cr, width, height));
+  free(cb); free(cr);
+  return sc;
+}
 
 /* [video] --noise=fit|hold|every:N + --noise-state=FILE — same semantics
  * as the RAW Vulkan host (galosh_vk.c B5).  YUV holds THREE scalars
@@ -875,7 +967,7 @@ static int run_core(float *srgb, const int W, const int H,
       ? SET(K_YCC2SRGB, &y_lin, &cb_b, &cr_b, &srgb_b)
       : SET(K_YCC2SRGB, &y_lin, &cb_den, &cr_den, &srgb_b);
 
-  PcW pc[4];
+  PcW pc[5];
 #define PCI(k, v) pc[k].i = (v)
 #define PCF(k, v) pc[k].f = (v)
 
@@ -1007,16 +1099,55 @@ static int run_core(float *srgb, const int W, const int H,
   /* ---- chroma LOESS (banded when not fast, heavy) ---- */
   if(!luma_only)
   {
-    /* [GALOSH-420 2026-07-12] halfres420 flag -> shader picks the noise-
-     * adaptive chroma radius (R=2/3) instead of the full-res R=7. */
-    PCI(0, W); PCI(1, H); PCF(2, strength_c); PCI(3, g_vk_yuv420_halfres);
+    /* [GALOSH-420 2026-07-12, rev 2026-07-25 CANONICAL sigc/eps] half-res
+     * chroma lane: radius + MAP-ridge eps strength are HOST-decided from
+     * sigma_C (CPU-identical math on the same input lane -> identical
+     * decisions across engines; constants + rationale galosh_yuv420.h).
+     * chroma_r = 0 sends the shader to the DEPRECATED in-shader sigma_lin
+     * rule (GALOSH_YUV420_RADIUS_SRC=lin regression only — VK has zero
+     * mid-frame readback, so the legacy rule must stay on device; note a
+     * garbage GALOSH_YUV420_CHROMA_R <= 0 also lands there, VK-only).
+     * strength_c passes through unchanged with GALOSH_YUV420_EPS_SRC=const.
+     * (日) 正= ホスト σ_C 決定を PC で渡す。=lin のみ旧シェーダ内則。 */
+    int chroma_r = 0;
+    float strength_pass = strength_c;
+    if(g_vk_yuv420_halfres)
+    {
+      const char *rsrc = getenv("GALOSH_YUV420_RADIUS_SRC");
+      const int legacy_lin = (rsrc && strcmp(rsrc, "lin") == 0);
+      const char *esrc = getenv("GALOSH_YUV420_EPS_SRC");
+      const int eps_const = (esrc && strcmp(esrc, "const") == 0);
+      float sigma_c = -1.0f;
+      if(!legacy_lin || !eps_const)
+        sigma_c = vk_host_sigma_c_from_lane(srgb, W, H);
+      if(!legacy_lin)
+      {
+        const char *e = getenv("GALOSH_YUV420_CHROMA_R");
+        chroma_r = (e && e[0]) ? atoi(e)
+                 : ((sigma_c < GALOSH_YUV420_SIGC_T) ? 2 : 3);
+      }
+      if(!eps_const && sigma_c >= 0.0f)
+      {
+        float r_ = sigma_c / GALOSH_YUV420_EPS_ANCHOR;
+        if(r_ < 1.0f) r_ = 1.0f;
+        if(r_ > GALOSH_YUV420_EPS_HI) r_ = GALOSH_YUV420_EPS_HI;
+        strength_pass = strength_c * r_;
+      }
+      if(!g_vk_quiet)
+        fprintf(stderr, "[yuv420_vk] half-res chroma LOESS R=%d "
+                "(sigma_c=%.5f eps_strength=%.3f)%s\n",
+                chroma_r, sigma_c, strength_pass,
+                legacy_lin ? " [=lin: shader-side legacy radius]" : "");
+    }
+    PCI(0, W); PCI(1, H); PCF(2, strength_pass); PCI(3, g_vk_yuv420_halfres);
+    PCI(4, chroma_r);
     if(fast)
-      dispatch_k(cb, K_LOESS, s_lo, pc, 4,
+      dispatch_k(cb, K_LOESS, s_lo, pc, 5,
                  (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "YG5 loess");
     else
     {
       cb_submit_wait(cb);
-      dispatch_k_banded(K_LOESS, s_lo, pc, 4,
+      dispatch_k_banded(K_LOESS, s_lo, pc, 5,
                  (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16),
                  "YG5 loess", &g_rate_loess);
       cb = cb_begin();

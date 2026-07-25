@@ -1130,13 +1130,59 @@ static void galosh_yuv_denoise_linear_rgb(const float *restrict in_lin,
   else if(g_yuv420_halfres_chroma)
   {
     /* [GALOSH-420 2026-07-12] noise-adaptive half-res radius; see
-     * galosh_yuv420_chroma_radius above.  sigma_lin = sqrt(sigma_sq). */
+     * galosh_yuv420_chroma_radius above.  sigma_lin = sqrt(sigma_sq).
+     *
+     * [2026-07-20 SEMANTIC-DRIFT FINDING + env-gated fix, default OFF]
+     * EN: The 0.027 threshold was calibrated (2026-07-12) against the MAD-era
+     * sigma_sq = TOTAL plane variance.  The envelope canonicalization
+     * (2026-07-19, v0.5.0) changed sigma_sq at this site to the PG fit's
+     * READ-NOISE FLOOR term, which collapses to the 1e-8 clamp on typical
+     * sources -> sigma_lin ~ 1e-4 and the rule is stuck at R=2 (probe:
+     * AWGN s20/s50 & PG ISO25600 all log sigma_lin=0.0001).  Experimental
+     * replacement (GALOSH_YUV420_RADIUS_SRC=sigc): measure the CHROMA noise
+     * directly on the native half-res Cb/Cr planes (Laplacian MAD;
+     * AB-6 blind-vs-oracle corr 0.984-0.992 across 69 cells) and switch at
+     * T_C = 0.020, recalibrated from the ORIGINAL Set8 crossover material in
+     * blind sigma_C units (R=2 side max 0.0179 < T_C < R=3 side min 0.0226).
+     * sigma_C is always measured and logged (behaviour-neutral measurement
+     * output); pixels are unchanged unless the env gate is set.
+     * JP: envelope 化で sigma_sq の意味が総分散→読み出し床に変わり 0.027 則が
+     * 実質 R=2 固定化 (意味論ドリフト)。sigc ゲートでクロマ面直接測定に置換。 */
     const float sigma_lin = sqrtf(sigma_sq);
-    const int R = galosh_yuv420_chroma_radius(sigma_lin);
+    const float sigma_c = 0.5f * (estimate_sigma_plane(Cb_lin, width, height) +
+                                  estimate_sigma_plane(Cr_lin, width, height));
+    /* [2026-07-25 CANONICAL, user-approved] sigma_C-driven radius is the
+     * DEFAULT (constants + rationale: galosh_yuv420.h).  =lin keeps the
+     * DEPRECATED v0.5.0 rule (dead semantics, R=2 always) for regression. */
+    const char *rsrc = getenv("GALOSH_YUV420_RADIUS_SRC");
+    const int use_sigc = !(rsrc && strcmp(rsrc, "lin") == 0);
+    int R;
+    if(use_sigc)
+    {
+      const char *e = getenv("GALOSH_YUV420_CHROMA_R");  /* debug override */
+      R = e ? atoi(e) : ((sigma_c < GALOSH_YUV420_SIGC_T) ? 2 : 3);
+    }
+    else
+      R = galosh_yuv420_chroma_radius(sigma_lin);   /* [DEPRECATED] */
+    /* [2026-07-25 CANONICAL, user-approved] ONE-SIDED MAP-ridge eps is the
+     * DEFAULT: ridge follows the measured chroma noise power, floored at
+     * the shipped behavior (never weaker).  =const keeps the constant
+     * ridge for regression.  Constants + A/B: galosh_yuv420.h. */
+    float strength_pass = strength_c;
+    const char *esrc = getenv("GALOSH_YUV420_EPS_SRC");
+    const int use_epsc = !(esrc && strcmp(esrc, "const") == 0);
+    if(use_epsc)
+    {
+      float r_ = sigma_c / GALOSH_YUV420_EPS_ANCHOR;
+      if(r_ < 1.0f) r_ = 1.0f;
+      if(r_ > GALOSH_YUV420_EPS_HI) r_ = GALOSH_YUV420_EPS_HI;
+      strength_pass = strength_c * r_;
+    }
     fprintf(stderr, "[yuv420_core] half-res chroma LOESS R=%d "
-            "(adaptive, sigma_lin=%.5f)\n", R, sigma_lin);
+            "(src=%s sigma_lin=%.5f sigma_c=%.5f eps_strength=%.3f)\n",
+            R, use_sigc ? "sigc" : "lin", sigma_lin, sigma_c, strength_pass);
     galosh_loess_chroma_r(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
-                          width, height, strength_c, R);
+                          width, height, strength_pass, R);
   }
   else
     galosh_loess_chroma(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
