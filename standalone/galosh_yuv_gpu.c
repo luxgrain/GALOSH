@@ -1495,6 +1495,11 @@ static int run_yuv_gat_gpu(const char *input_file, const char *output_file,
         fclose(f);
         if(nrd != 3 * npix) {
             fprintf(stderr, "[YUV_GAT] Read %zu floats, expected %zu\n", nrd, 3 * npix);
+            fprintf(stderr, "hint: this input mode reads interleaved sRGB float32\n"
+                            "      (exactly W*H*3*4 bytes) — image containers (PNG etc.)\n"
+                            "      cannot be passed directly; decode first (the bundled\n"
+                            "      wrapper is tools/dist/galosh_png.py), or use --pix\n"
+                            "      for planar integer YUV.\n");
             free_aligned(srgb); return 1;
         }
     }

@@ -73,6 +73,25 @@ alpha/sigma to estimate. On Windows/MSYS2, run with `C:\msys64\ucrt64\bin` on
 `PATH` (the OpenMP runtime `libgomp-1.dll` lives there). Set `GALOSH_VERBOSE=1`
 for per-phase diagnostics (all exes are quiet by default).
 
+**The CLI does not read image containers** — a DNG (or PNG/TIFF) passed
+directly fails with `Read N floats, expected M`: the container's compressed
+bytes are not a float plane. Convert first.
+
+### Linux quick start (DNG → denoise), verified on Ubuntu 24.04 / gcc 13
+
+```sh
+bash build.sh raw                      # exec bit may be absent on old checkouts
+pip install rawpy numpy                # in a venv on PEP-668 distros
+python3 ../tools/dng_to_bin.py photo.dng photo.bin   # prints the exact "W H"
+./galosh_raw_cpu.exe photo.bin out.bin W H galosh 1.0 1.0 1.0 0 0
+```
+
+The `W H` printed by the converter is LibRaw's active sensor area and may
+differ from the size shown by EXIF viewers — always use the printed values
+(`W*H*4` = the .bin byte size). For a full DNG→denoised-DNG roundtrip with
+metadata copy, use `tools/dist/galosh_dng.py` (needs rawpy, tifffile and
+exiftool on PATH; this is the wrapper the Windows zip bundles).
+
 ## V2.0 options (CPU FP32 exe + Vulkan exe) — independent, freely combinable
 
 All flags default to the canonical published pipeline (flags-off output is

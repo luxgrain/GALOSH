@@ -2373,6 +2373,10 @@ int main(int argc, char **argv) {
   fclose(fin);
   if(nread != npixels) {
     fprintf(stderr, "Read %zu floats, expected %zu\n", nread, npixels);
+    fprintf(stderr, "hint: the CLI reads a raw float32 plane (exactly W*H*4 bytes,\n"
+                    "      [0,1] Bayer) — image containers (DNG/TIFF/PNG) cannot be\n"
+                    "      passed directly. Convert first: tools/dng_to_bin.py prints\n"
+                    "      the exact W H to use.\n");
     return 1;
   }
 

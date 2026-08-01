@@ -36,16 +36,23 @@ def _base_dir() -> Path:
 
 def _find_tool(name: str) -> Path:
     base = _base_dir()
-    cands = [base / "bin" / name, base / name]
-    if not getattr(sys, "frozen", False):
-        cands.append(Path(__file__).resolve().parents[2] / "standalone" / name)
+    # Cross-platform: accept the name both with and without the ".exe"
+    # suffix — Linux binaries and a PATH-installed exiftool carry none,
+    # while the repo's build scripts emit ".exe" even on Linux.
+    alt = name[:-4] if name.lower().endswith(".exe") else name + ".exe"
+    cands = []
+    for n in (name, alt):
+        cands += [base / "bin" / n, base / n]
+        if not getattr(sys, "frozen", False):
+            cands.append(Path(__file__).resolve().parents[2] / "standalone" / n)
     for c in cands:
         if c.is_file():
             return c
     import shutil
-    hit = shutil.which(name)
-    if hit:
-        return Path(hit)
+    for n in (name, alt):
+        hit = shutil.which(n)
+        if hit:
+            return Path(hit)
     raise SystemExit(f"[GALOSH] required tool not found: {name} "
                      f"(looked in {', '.join(str(c) for c in cands)})")
 

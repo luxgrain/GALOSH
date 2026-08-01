@@ -98,6 +98,10 @@ static int run_galosh_raw_gpu(const char *input_file, const char *output_file,
         fclose(f);
         if(nrd != npix) {
             fprintf(stderr, "Read %zu floats, expected %zu\n", nrd, npix);
+            fprintf(stderr, "hint: the CLI reads a raw float32 plane (exactly W*H*4\n"
+                            "      bytes, [0,1] Bayer) — image containers (DNG/TIFF/PNG)\n"
+                            "      cannot be passed directly. Convert first:\n"
+                            "      tools/dng_to_bin.py prints the exact W H to use.\n");
             free_aligned(raw); return 1;
         }
     }

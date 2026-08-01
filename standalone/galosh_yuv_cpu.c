@@ -1661,6 +1661,11 @@ int main(int argc, char **argv)
   if(rd != nbytes)
   {
     fprintf(stderr, "short read (%zu of %zu)\n", rd, nbytes);
+    fprintf(stderr, "hint: this input mode reads interleaved sRGB float32\n"
+                    "      (exactly W*H*3*4 bytes) — image containers (PNG etc.)\n"
+                    "      cannot be passed directly; decode first (the bundled\n"
+                    "      wrapper is tools/dist/galosh_png.py), or use --pix\n"
+                    "      for planar integer YUV.\n");
     return 1;
   }
 
