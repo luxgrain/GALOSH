@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.5.1 — 4:2:0 adaptive chroma radius revived: sigma_C-driven + one-sided ridge (2026-08-01)
+
+### Bugfix: the adaptive radius had silently died in v0.5.0
+- The 4:2:0 half-res chroma LOESS radius was keyed to sqrt(sigma_sq) of
+  the blind fit. When v0.5.0 switched to the envelope estimator, that
+  readout collapsed to the PG-fit read floor (1e-8 clamp) on most
+  content — the "noise-adaptive" radius was in practice stuck at R=2 on
+  every engine. v0.5.1 re-keys the decision to sigma_C, a blind
+  Laplacian-MAD measured directly on the native half-res Cb/Cr planes
+  (blind-vs-oracle correlation 0.984–0.992 across all noise tracks),
+  with the threshold recalibrated on the original crossover material
+  (T_C = 0.020; A/B on 39 cells: CRVD real noise +0.165 dB, LPIPS flat).
+- New, default ON: a one-sided MAP-ridge scale on the chroma LOESS —
+  `strength_eff = strength_c * clamp(sigma_C / 0.012, 1, 4)`. One-sided
+  by design: never weaker than the shipped ridge, it only stiffens the
+  regression on noisy chroma (27-cell A/B: +0.055 dB / −0.001 LPIPS;
+  the symmetric variant loses on busy content and was rejected).
+- All three engines (CPU / OpenCL / Vulkan) compute sigma_C host-side
+  with identical arithmetic on the same lane buffer, so radius and eps
+  decisions agree exactly everywhere. The Vulkan LOESS push constant
+  grows 16 → 20 B (host-decided radius; the legacy in-shader rule
+  remains, reachable only via the regression env, preserving the
+  zero-mid-frame-readback design).
+- Legacy behavior is preserved behind `GALOSH_YUV420_RADIUS_SRC=lin` +
+  `GALOSH_YUV420_EPS_SRC=const` — with both set, output is
+  byte-identical to v0.5.0 (verified against v0.5.0 reference builds on
+  CPU and Vulkan).
+- 420 GALOSH bench rows rerun (AWGN / PG-core / PG-cmp / CRVD): PSNR,
+  SSIM and LPIPS improve on essentially every track × variant; gains
+  concentrate at high noise (CRVD ISO25600 +0.26 dB, PG-core ISO12800
+  +0.14 dB); low-noise cells are unchanged by design (one-sided floor).
+  Delta report: `benchmark/_sigc_delta_20260726.md`. The 444 lanes and
+  the RAW pipelines are completely untouched.
+
+### Distribution
+- `GALOSH_YUV_win64.zip` rebuilt: the bundled CLI
+  (`bin/galosh_yuv_cpu.exe`) carries the 4:2:0 fix. The PNG drag & drop
+  path (full-res sRGB route) is byte-identical to v0.5.0.
+  `GALOSH_RAW_win64.zip` unchanged.
+
 ## v0.5.0 — YUV blind estimation fixed: the envelope estimator lands (2026-07-20)
 
 ### The headline is a correction
