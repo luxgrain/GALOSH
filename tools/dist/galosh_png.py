@@ -125,6 +125,8 @@ def process_png(src: Path, l_str: float, c_str: float,
     out_im.save(dst, "PNG", **save_kw)
 
     # eXIf / XMP / tEXt をオリジナルから複写 / copy metadata chunks
+    if exiftool is None:
+        return dst          # overlay skipped — the PNG is complete
     r = subprocess.run(
         [str(exiftool), "-TagsFromFile", str(src), "-all:all", "-unsafe",
          "-icc_profile", "-F",
@@ -149,10 +151,24 @@ def main(argv=None):
                     help="luminance strength s_L (default 1.0)")
     ap.add_argument("-c", "--chroma", type=float, default=1.0,
                     help="chrominance strength s_C (default 1.0)")
+    ap.add_argument("--no-exiftool", action="store_true",
+                    help="skip the exiftool metadata overlay; the output PNG "
+                         "is complete without it (pixels + ICC profile)")
     args = ap.parse_args(argv)
 
     exe_cpu = _find_tool("galosh_yuv_cpu.exe")
-    exiftool = _find_tool("exiftool.exe")
+    # exiftool is an OVERLAY, not a requirement (twin policy of
+    # galosh_dng.py, issue #1): the saved PNG already carries the pixels
+    # and ICC profile — missing exiftool must not kill the run.
+    exiftool = None
+    if not args.no_exiftool:
+        try:
+            exiftool = _find_tool("exiftool.exe")
+        except SystemExit:
+            print("[GALOSH] exiftool not found — continuing WITHOUT the "
+                  "metadata overlay\n"
+                  "         (the output PNG is complete; eXIf/XMP text "
+                  "chunks are not copied).")
 
     ok = 0
     for f in args.files:

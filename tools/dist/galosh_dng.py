@@ -233,6 +233,8 @@ def process_dng(src: Path, l_str: float, c_str: float, use_gpu: bool,
     # already linearized), BlackLevel/WhiteLevel (ours match the data),
     # strip/geometry tags (protected). NoiseProfile describes noise that
     # no longer exists; ExifTool drops it, which is semantically correct.
+    if exiftool is None:
+        return dst          # overlay skipped — skeleton DNG is complete
     calib = ["-ColorMatrix1", "-ColorMatrix2", "-CalibrationIlluminant1",
              "-CalibrationIlluminant2", "-ForwardMatrix1", "-ForwardMatrix2",
              "-CameraCalibration1", "-CameraCalibration2", "-AnalogBalance",
@@ -277,6 +279,10 @@ def main(argv=None):
     ap.add_argument("--upsample", choices=("jinc", "fast"), default="jinc",
                     help="chroma upsample: jinc = canonical K16 (default), "
                          "fast = guided bilinear (ring-free, slightly softer)")
+    ap.add_argument("--no-exiftool", action="store_true",
+                    help="skip the exiftool metadata overlay; the output DNG "
+                         "still renders (calibration is written directly) — "
+                         "copy EXIF/MakerNotes yourself (e.g. exiv2) if wanted")
     args = ap.parse_args(argv)
 
     exe_cpu = _find_tool("galosh_raw_cpu.exe")
@@ -286,7 +292,22 @@ def main(argv=None):
             exe_gpu = _find_tool("galosh_raw_gpu.exe")
         except SystemExit:
             print("[GALOSH] GPU exe not found — falling back to CPU.")
-    exiftool = _find_tool("exiftool.exe")
+    # exiftool is an OVERLAY, not a requirement: write_dng_skeleton already
+    # writes everything needed to render (CFA, black/white, ColorMatrix1,
+    # AsShotNeutral). Missing exiftool must not kill the run — warn and go.
+    # (日) exiftool は上乗せコピー専用。無くても DNG は単体で現像可能なので
+    # 即死させない (issue #1)。
+    exiftool = None
+    if not args.no_exiftool:
+        try:
+            exiftool = _find_tool("exiftool.exe")
+        except SystemExit:
+            print("[GALOSH] exiftool not found — continuing WITHOUT the "
+                  "metadata overlay.\n"
+                  "         The output DNG renders fine on its own; "
+                  "EXIF/GPS/MakerNotes are\n"
+                  "         not copied (install exiftool, or copy tags "
+                  "yourself, e.g. exiv2).")
 
     ok = 0
     for f in args.files:
