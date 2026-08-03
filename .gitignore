@@ -159,3 +159,8 @@ _backup/
 
 # script stdout logs (may embed absolute local paths — never commit)
 *.log
+
+# install_linux.sh artifacts (per-machine venv + generated launchers)
+.venv/
+/galosh-dng
+/galosh-png

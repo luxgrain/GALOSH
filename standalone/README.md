@@ -79,6 +79,11 @@ bytes are not a float plane. Convert first.
 
 ### Linux quick start (DNG → denoise), verified on Ubuntu 24.04 / gcc 13
 
+> Easiest path: `./install_linux.sh` at the repo root sets up everything
+> (build + Python env + `./galosh-dng` / `./galosh-png` launchers) —
+> see [docs/QUICKSTART_LINUX.md](../docs/QUICKSTART_LINUX.md). The steps
+> below are the manual equivalent.
+
 ```sh
 bash build.sh raw                      # exec bit may be absent on old checkouts
 pip install rawpy numpy                # in a venv on PEP-668 distros
