@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.6.0 — the chroma knob means what you think it means + Linux one-command setup (2026-08-07)
+
+### Hybrid chroma strength (semantics change, default unchanged)
+- The chroma strength used to tune only the MAP-ridge stiffness of the
+  Y-guided regression — and since the estimator has no fidelity term, the
+  regression always replaced the chroma plane entirely. On content where
+  the projection saturates the knob was nearly inert, and `0` didn't mean
+  "off" at all: an un-ridged regression, measured BELOW noisy on Set8 s20
+  (Cb 31.2 vs 32.2 dB). Reported through GALOSH-frameserver #1.
+- New semantics — one monotone dial, all engines (CPU / OpenCL / Vulkan),
+  both O routes (legacy sRGB + planar/420):
+  - `0` — **true bypass**: the planar drivers skip the chroma lane and the
+    output chroma planes are the input bytes verbatim;
+  - `0–1` — **dry/wet mix**: the regression runs at canonical ridge
+    strength, output = c·estimate + (1−c)·input (the interior optimum from
+    the July variant-Q experiments reappears: Set8 s20 Cr, c=0.5 beats
+    c=1 by +0.30 dB);
+  - `1` — canonical, joined by branch: **byte-identical to v0.5.1**;
+  - `>1` — unchanged legacy ridge scaling (real gains on heavy noise:
+    CRVD ISO25600 +0.22 dB at c=2).
+- Vulkan LOESS push constant grows 20→24 B; the OpenCL kernel gains a
+  blend argument. Cross-engine parity at c=0.5/2.0 in the established
+  fp32/fp16 bands. Default outputs (c=1) are bit-unchanged everywhere.
+
+### Linux
+- `./install_linux.sh` — one-command setup: builds the CLI denoisers,
+  creates a private `.venv`, and generates `./galosh-dng` / `./galosh-png`
+  launchers. `docs/QUICKSTART_LINUX.md` walks through it assuming zero
+  Python knowledge (requested in #1).
+- `exiftool` is now an optional overlay in the DNG/PNG wrappers: missing
+  exiftool warns and continues (the DNG skeleton renders on its own), and
+  `--no-exiftool` skips the copy on purpose (e.g. for exiv2 workflows).
+  The wrappers also accept suffix-less tool names, raw sources beyond DNG
+  (CR3/CR2/NEF/ARW — anything Bayer that LibRaw reads) always worked and
+  are now documented.
+- Size-mismatch errors in every CLI now explain the raw float32 contract
+  and point at the converter; build scripts carry their exec bits.
+
+### Distribution
+- `GALOSH_YUV_win64.zip` rebuilt (bundled CLI carries the new chroma
+  semantics). `GALOSH_RAW_win64.zip` unchanged.
+
 ## v0.5.1 — 4:2:0 adaptive chroma radius revived: sigma_C-driven + one-sided ridge (2026-08-01)
 
 ### Bugfix: the adaptive radius had silently died in v0.5.0
