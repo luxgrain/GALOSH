@@ -173,7 +173,7 @@ static Kern g_k[K_COUNT] = {
   [K_PASS12]     = { "o32_pass12",        2, 16 },
   [K_PASS12_SG]  = { "o32_pass12_sg",     2, 16, .sg32 = 1 },
   [K_MAKITALO]   = { "yuv_makitalo",      5,  4 },
-  [K_LOESS]      = { "yuv_loess",         6, 20 },   /* [2026-07-25] +chroma_r */
+  [K_LOESS]      = { "yuv_loess",         6, 24 },   /* [2026-07-25] +chroma_r, [2026-08-06] +blend_w */
   [K_YCC2SRGB]   = { "yuv_ycc2srgb",      4,  4 },
   /* [2026-07-19 Y-ENV] envelope chain (default estimator; legacy MAD via
    * GALOSH_YUV_NOISE_EST=mad).  o32_ne_finalize / _dark_thresh_finalize /
@@ -967,7 +967,7 @@ static int run_core(float *srgb, const int W, const int H,
       ? SET(K_YCC2SRGB, &y_lin, &cb_b, &cr_b, &srgb_b)
       : SET(K_YCC2SRGB, &y_lin, &cb_den, &cr_den, &srgb_b);
 
-  PcW pc[5];
+  PcW pc[6];
 #define PCI(k, v) pc[k].i = (v)
 #define PCF(k, v) pc[k].f = (v)
 
@@ -1109,8 +1109,13 @@ static int run_core(float *srgb, const int W, const int H,
      * garbage GALOSH_YUV420_CHROMA_R <= 0 also lands there, VK-only).
      * strength_c passes through unchanged with GALOSH_YUV420_EPS_SRC=const.
      * (日) 正= ホスト σ_C 決定を PC で渡す。=lin のみ旧シェーダ内則。 */
+    /* [2026-08-06 HYBRID CHROMA KNOB — CPU twin galosh_yuv_cpu.c] ridge
+     * input = max(c, 1); c < 1 rides the shader's dry/wet blend
+     * (pc.blend_w) instead.  c=1 joins bit-exactly by branch. */
+    const float strength_reg = fmaxf(strength_c, 1.0f);
+    const float blend_w = fminf(strength_c, 1.0f);
     int chroma_r = 0;
-    float strength_pass = strength_c;
+    float strength_pass = strength_reg;
     if(g_vk_yuv420_halfres)
     {
       const char *rsrc = getenv("GALOSH_YUV420_RADIUS_SRC");
@@ -1131,23 +1136,24 @@ static int run_core(float *srgb, const int W, const int H,
         float r_ = sigma_c / GALOSH_YUV420_EPS_ANCHOR;
         if(r_ < 1.0f) r_ = 1.0f;
         if(r_ > GALOSH_YUV420_EPS_HI) r_ = GALOSH_YUV420_EPS_HI;
-        strength_pass = strength_c * r_;
+        strength_pass = strength_reg * r_;
       }
       if(!g_vk_quiet)
         fprintf(stderr, "[yuv420_vk] half-res chroma LOESS R=%d "
-                "(sigma_c=%.5f eps_strength=%.3f)%s\n",
+                "(sigma_c=%.5f eps_strength=%.3f blend=%.2f)%s\n",
                 chroma_r, sigma_c, strength_pass,
+                blend_w < 1.0f ? fmaxf(blend_w, 0.0f) : 1.0f,
                 legacy_lin ? " [=lin: shader-side legacy radius]" : "");
     }
     PCI(0, W); PCI(1, H); PCF(2, strength_pass); PCI(3, g_vk_yuv420_halfres);
-    PCI(4, chroma_r);
+    PCI(4, chroma_r); PCF(5, blend_w);
     if(fast)
-      dispatch_k(cb, K_LOESS, s_lo, pc, 5,
+      dispatch_k(cb, K_LOESS, s_lo, pc, 6,
                  (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16), 1, "YG5 loess");
     else
     {
       cb_submit_wait(cb);
-      dispatch_k_banded(K_LOESS, s_lo, pc, 5,
+      dispatch_k_banded(K_LOESS, s_lo, pc, 6,
                  (uint32_t)AUP(W, 16), (uint32_t)AUP(H, 16),
                  "YG5 loess", &g_rate_loess);
       cb = cb_begin();
@@ -1345,7 +1351,13 @@ static int run_420(const char *in_path, const char *out_path,
 
   /* ---- CHROMA (native lattice) ---- */
   float *CbD = NULL, *CrD = NULL;
-  if(pix != GALOSH420_PIX_400)
+  /* [2026-08-06 HYBRID CHROMA KNOB] c <= 0 = TRUE bypass: chroma lane not
+   * run, requant skipped (CbD NULL) -> input chroma bytes verbatim.
+   * Rationale: CPU twin comment in galosh_yuv_cpu.c run_420. */
+  if(pix != GALOSH420_PIX_400 && sc <= 0.0f)
+    fprintf(stderr, "[yuv420_vk] chroma BYPASS (strength_c<=0): planes "
+                    "pass through untouched\n");
+  else if(pix != GALOSH420_PIX_400)
   {
     const int pw = (pix == GALOSH420_PIX_420) ? cw : W;
     const int ph = (pix == GALOSH420_PIX_420) ? ch : H;
@@ -1423,6 +1435,7 @@ static int run_420(const char *in_path, const char *out_path,
     if(wide) ((uint16_t *)raw)[i] = (uint16_t)c;
     else     raw[i] = (uint8_t)c;
   }
+  if(CbD)   /* NULL = 4:0:0 or chroma bypass -> input chroma bytes kept */
   for(size_t i = 0; i < csz; i++)
   {
     const int cb2 = galosh420_requant_c(CbD[i], depth, range);

@@ -968,10 +968,36 @@ static void galosh_yuv_denoise_srgb(const float *restrict in_srgb,
   }
   else
   {
+    /* [2026-08-06 HYBRID CHROMA KNOB — user-approved semantics change]
+     * EN: strength_c is one monotone axis, two regimes joined BIT-EXACTLY
+     * at 1.0 (both joins by branch, not by trusting float identities):
+     *   c < 1  DRY/WET MIX — the regression runs at CANONICAL ridge
+     *          strength (1.0) and the output is c*estimate + (1-c)*input,
+     *          so c=0 leaves chroma untouched.  The old meaning (ridge
+     *          scale) made c<1 nearly inert and c=0 actively harmful
+     *          (un-ridged regression, measured BELOW noisy on Set8 s20:
+     *          Cb 31.21 vs 32.16 dB).  Fixes GALOSH-frameserver #1.
+     *   c = 1  canonical (blend skipped).
+     *   c > 1  MAP-RIDGE SCALE — unchanged legacy meaning; measured real
+     *          gains on heavy noise (CRVD ISO25600 Cb +0.22 dB at c=2).
+     * JP: c<1=原画とのブレンド (回帰は canonical 強度)、c=1=従来、
+     * c>1=リッジ強化 (従来意味)。接合点は分岐でバイト一致。 */
+    const float strength_reg = fmaxf(strength_c, 1.0f);
     galosh_loess_chroma(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
-                        width, height, strength_c);
-    fprintf(stderr, "[yuv_cpu_O] Cb/Cr LOESS done (R=%d BW=%.1f)\n",
-            GALOSH_LOESS_RADIUS, GALOSH_LOESS_BW);
+                        width, height, strength_reg);
+    if(strength_c < 1.0f)
+    {
+      const float w_ = fmaxf(strength_c, 0.0f);
+      DT_OMP_FOR()
+      for(size_t i = 0; i < npx; i++)
+      {
+        Cb_den[i] = w_ * Cb_den[i] + (1.0f - w_) * Cb_lin[i];
+        Cr_den[i] = w_ * Cr_den[i] + (1.0f - w_) * Cr_lin[i];
+      }
+    }
+    fprintf(stderr, "[yuv_cpu_O] Cb/Cr LOESS done (R=%d BW=%.1f blend=%.2f)\n",
+            GALOSH_LOESS_RADIUS, GALOSH_LOESS_BW,
+            strength_c < 1.0f ? fmaxf(strength_c, 0.0f) : 1.0f);
   }
 
   /* ============================================================
@@ -1167,8 +1193,13 @@ static void galosh_yuv_denoise_linear_rgb(const float *restrict in_lin,
     /* [2026-07-25 CANONICAL, user-approved] ONE-SIDED MAP-ridge eps is the
      * DEFAULT: ridge follows the measured chroma noise power, floored at
      * the shipped behavior (never weaker).  =const keeps the constant
-     * ridge for regression.  Constants + A/B: galosh_yuv420.h. */
-    float strength_pass = strength_c;
+     * ridge for regression.  Constants + A/B: galosh_yuv420.h.
+     * [2026-08-06 HYBRID CHROMA KNOB] the ridge input is max(c, 1) — for
+     * c < 1 the regression stays at canonical strength and c becomes the
+     * dry/wet blend applied below (semantics doc: the legacy-route twin
+     * of this comment in galosh_yuv_denoise_srgb). */
+    const float strength_reg = fmaxf(strength_c, 1.0f);
+    float strength_pass = strength_reg;
     const char *esrc = getenv("GALOSH_YUV420_EPS_SRC");
     const int use_epsc = !(esrc && strcmp(esrc, "const") == 0);
     if(use_epsc)
@@ -1176,17 +1207,36 @@ static void galosh_yuv_denoise_linear_rgb(const float *restrict in_lin,
       float r_ = sigma_c / GALOSH_YUV420_EPS_ANCHOR;
       if(r_ < 1.0f) r_ = 1.0f;
       if(r_ > GALOSH_YUV420_EPS_HI) r_ = GALOSH_YUV420_EPS_HI;
-      strength_pass = strength_c * r_;
+      strength_pass = strength_reg * r_;
     }
     fprintf(stderr, "[yuv420_core] half-res chroma LOESS R=%d "
-            "(src=%s sigma_lin=%.5f sigma_c=%.5f eps_strength=%.3f)\n",
-            R, use_sigc ? "sigc" : "lin", sigma_lin, sigma_c, strength_pass);
+            "(src=%s sigma_lin=%.5f sigma_c=%.5f eps_strength=%.3f "
+            "blend=%.2f)\n",
+            R, use_sigc ? "sigc" : "lin", sigma_lin, sigma_c, strength_pass,
+            strength_c < 1.0f ? fmaxf(strength_c, 0.0f) : 1.0f);
     galosh_loess_chroma_r(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
                           width, height, strength_pass, R);
   }
   else
+  {
+    /* [2026-08-06 HYBRID CHROMA KNOB] 444/planar twin — same max(c,1)
+     * ridge input; c < 1 becomes the dry/wet blend below. */
     galosh_loess_chroma(Y_stab, Cb_lin, Cr_lin, Cb_den, Cr_den,
-                        width, height, strength_c);
+                        width, height, fmaxf(strength_c, 1.0f));
+  }
+  /* [2026-08-06 HYBRID CHROMA KNOB] dry/wet stage for the O paths (Q/P
+   * keep their own anchor-selector semantics).  Branch keeps c >= 1
+   * bit-identical. */
+  if(!(g_galosh_yuv_use_q || g_galosh_yuv_use_p) && strength_c < 1.0f)
+  {
+    const float w_ = fmaxf(strength_c, 0.0f);
+    DT_OMP_FOR()
+    for(size_t i = 0; i < npx; i++)
+    {
+      Cb_den[i] = w_ * Cb_den[i] + (1.0f - w_) * Cb_lin[i];
+      Cr_den[i] = w_ * Cr_den[i] + (1.0f - w_) * Cr_lin[i];
+    }
+  }
 
   /* Phase 2 ⑤ + linear re-assembly.  Clip linear RGB to [0,1] exactly as
    * the legacy path does before its OETF (validated A/B chain). */
@@ -1355,7 +1405,18 @@ static int galosh_yuv420_main(const char *in_path, const char *out_path,
 
   /* ---- CHROMA path ------------------------------------------------ */
   float *CbD = NULL, *CrD = NULL;    /* denoised chroma at native lattice */
-  if(pix != GALOSH420_PIX_400)
+  /* [2026-08-06 HYBRID CHROMA KNOB] strength_c <= 0 = TRUE chroma bypass:
+   * the chroma lane is not composed at all and the requant stage below is
+   * skipped (CbD stays NULL), so the output chroma planes are the INPUT
+   * BYTES verbatim.  A core-level blend alone cannot deliver this — the
+   * linear-RGB [0,1] re-assembly clip couples untouched noisy chroma with
+   * the denoised luma (measured on Set8 s20: lane-roundtripped c=0 lands
+   * BELOW noisy, Cb 29.3 vs 32.2 dB).  (日) c<=0 はレーン自体を走らせず
+   * 入力バイトを素通し (ブレンドだけではクリップ結合で劣化する)。 */
+  if(pix != GALOSH420_PIX_400 && strength_c <= 0.0f)
+    fprintf(stderr, "[yuv420] chroma BYPASS (strength_c<=0): planes pass "
+                    "through untouched\n");
+  else if(pix != GALOSH420_PIX_400)
   {
     const int pw = (pix == GALOSH420_PIX_420) ? cw : W;   /* processing dims */
     const int ph = (pix == GALOSH420_PIX_420) ? ch : H;
@@ -1447,20 +1508,23 @@ static int galosh_yuv420_main(const char *in_path, const char *out_path,
     if(wide) ((uint16_t *)raw)[i] = (uint16_t)c;
     else     raw[i] = (uint8_t)c;
   }
-  DT_OMP_FOR()
-  for(size_t i = 0; i < csz; i++)
+  if(CbD)   /* NULL = 4:0:0 or chroma bypass -> input chroma bytes kept */
   {
-    const int cb = galosh420_requant_c(CbD[i], depth, range);
-    const int cr = galosh420_requant_c(CrD[i], depth, range);
-    if(wide)
+    DT_OMP_FOR()
+    for(size_t i = 0; i < csz; i++)
     {
-      ((uint16_t *)raw)[ysz + i]       = (uint16_t)cb;
-      ((uint16_t *)raw)[ysz + csz + i] = (uint16_t)cr;
-    }
-    else
-    {
-      raw[ysz + i]       = (uint8_t)cb;
-      raw[ysz + csz + i] = (uint8_t)cr;
+      const int cb = galosh420_requant_c(CbD[i], depth, range);
+      const int cr = galosh420_requant_c(CrD[i], depth, range);
+      if(wide)
+      {
+        ((uint16_t *)raw)[ysz + i]       = (uint16_t)cb;
+        ((uint16_t *)raw)[ysz + csz + i] = (uint16_t)cr;
+      }
+      else
+      {
+        raw[ysz + i]       = (uint8_t)cb;
+        raw[ysz + csz + i] = (uint8_t)cr;
+      }
     }
   }
 

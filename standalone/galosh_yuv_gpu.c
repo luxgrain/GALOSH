@@ -1267,8 +1267,13 @@ static int run_yuv_gat_gpu_buf(float *srgb,
          * ONE-SIDED MAP-ridge eps (default) behind
          * GALOSH_YUV420_EPS_SRC=const.  sigma_C is host-computed from the
          * same lane buffer with CPU-identical math -> identical decisions. */
+        /* [2026-08-06 HYBRID CHROMA KNOB — CPU twin galosh_yuv_cpu.c]
+         * ridge input = max(c, 1); c < 1 rides the kernel's dry/wet
+         * blend instead (blend_w).  c=1 joins bit-exactly by branch. */
+        const float strength_reg = fmaxf(strength_c, 1.0f);
+        const float blend_w = fminf(strength_c, 1.0f);
         int loess_R = 7;
-        float strength_pass = strength_c;
+        float strength_pass = strength_reg;
         if(g_yuv420_halfres_chroma)
         {
             const float sigma_c = host_sigma_c_from_lane(srgb, width, height);
@@ -1287,11 +1292,13 @@ static int run_yuv_gat_gpu_buf(float *srgb,
                 float r_ = sigma_c / GALOSH_YUV420_EPS_ANCHOR;
                 if(r_ < 1.0f) r_ = 1.0f;
                 if(r_ > GALOSH_YUV420_EPS_HI) r_ = GALOSH_YUV420_EPS_HI;
-                strength_pass = strength_c * r_;
+                strength_pass = strength_reg * r_;
             }
             fprintf(stderr, "[yuv420_gpu] half-res chroma LOESS R=%d "
-                    "(sigma_lin=%.5f sigma_c=%.5f eps_strength=%.3f)\n",
-                    loess_R, sqrtf(sigma_sq_y), sigma_c, strength_pass);
+                    "(sigma_lin=%.5f sigma_c=%.5f eps_strength=%.3f "
+                    "blend=%.2f)\n",
+                    loess_R, sqrtf(sigma_sq_y), sigma_c, strength_pass,
+                    blend_w < 1.0f ? fmaxf(blend_w, 0.0f) : 1.0f);
         }
         clSetKernelArg(k_guided_loess, 0, sizeof(cl_mem), &q_y_snap_f);
         clSetKernelArg(k_guided_loess, 1, sizeof(cl_mem), &cb_buf);
@@ -1303,6 +1310,7 @@ static int run_yuv_gat_gpu_buf(float *srgb,
         clSetKernelArg(k_guided_loess, 7, sizeof(int),    &width);
         clSetKernelArg(k_guided_loess, 8, sizeof(int),    &height);
         clSetKernelArg(k_guided_loess, 9, sizeof(int),    &loess_R);
+        clSetKernelArg(k_guided_loess, 10, sizeof(float), &blend_w);
         dispatch_2d_named(queue, k_guided_loess,
                           align_up(width, 16), align_up(height, 16),
                           16, 16, "YG5 loess_bilateral");
@@ -1642,7 +1650,13 @@ static int run_yuv420_gpu(const char *in_path, const char *out_path,
 
     /* ---- CHROMA (native lattice) ------------------------------------ */
     float *CbD = NULL, *CrD = NULL;
-    if(pix != GALOSH420_PIX_400)
+    /* [2026-08-06 HYBRID CHROMA KNOB] c <= 0 = TRUE bypass: chroma lane
+     * not run, requant skipped (CbD NULL) -> input chroma bytes verbatim.
+     * Rationale: CPU twin comment in galosh_yuv_cpu.c run_420. */
+    if(pix != GALOSH420_PIX_400 && strength_c <= 0.0f)
+        fprintf(stderr, "[yuv420_gpu] chroma BYPASS (strength_c<=0): planes "
+                        "pass through untouched\n");
+    else if(pix != GALOSH420_PIX_400)
     {
         const int pw = (pix == GALOSH420_PIX_420) ? cw : W;
         const int ph = (pix == GALOSH420_PIX_420) ? ch : H;
@@ -1732,6 +1746,7 @@ static int run_yuv420_gpu(const char *in_path, const char *out_path,
         if(wide) ((uint16_t *)raw)[i] = (uint16_t)c;
         else     raw[i] = (uint8_t)c;
     }
+    if(CbD)   /* NULL = 4:0:0 or chroma bypass -> input chroma bytes kept */
     for(size_t i = 0; i < csz; i++)
     {
         const int cb = galosh420_requant_c(CbD[i], depth, range);

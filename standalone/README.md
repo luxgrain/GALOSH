@@ -31,7 +31,12 @@ YCbCr containers via the shared GALOSH-420 front-end (`galosh_yuv420.h`):
 format-preserving in/out. Chroma is denoised at its native subsampled
 lattice with a siting-phased luma guide (spec:
 `../docs/yuv420_frontend_spec.md`; `--selftest-phase` machine-verifies the
-guide phase on any backend). The Vulkan YUV engine adds
+guide phase on any backend). The chroma strength `s_c` is one monotone
+dial (2026-08 semantics, all engines): `0` = true bypass (chroma planes
+pass through bit-exactly), `0–1` = dry/wet mix of the denoised estimate
+with the input, `1` = the calibrated estimate (unchanged canonical
+output), `>1` = stiffer chroma regression (legacy meaning, flattens
+harder). The Vulkan YUV engine adds
 `--noise=hold|every:N --noise-state=F` video amortization (held frames are
 byte-identical to fit for a fixed model; port blueprint
 `vk/YUV_BLUEPRINT.md`).

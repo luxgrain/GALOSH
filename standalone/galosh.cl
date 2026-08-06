@@ -3919,7 +3919,12 @@ kernel void galosh_yuv_guided_loess(
     global       float *restrict cr_out,
     const int width,
     const int height,
-    const int radius)
+    const int radius,
+    const float blend_w)
+    /* [2026-08-06 HYBRID CHROMA KNOB] blend_w = min(strength_c, 1): < 1
+     * mixes the estimate with the center input chroma (dry/wet, c<1
+     * semantics — CPU twin in galosh_yuv_cpu.c); >= 1 is skipped by
+     * branch so the canonical output stays bit-identical. */
     /* [2026-07-19] radius is now a RUNTIME arg (was compile-time
      * YG_LOESS_RADIUS=7): the legacy sRGB route still passes 7 (output
      * unchanged), while the GALOSH-420 half-res chroma lane passes the
@@ -4000,6 +4005,12 @@ kernel void galosh_yuv_guided_loess(
    * -> kills chroma overshoot at luma edges (= RAW chroma-clamp reflected to YUV). */
   if(hi_cb >= lo_cb) ocb = clamp(ocb, lo_cb, hi_cb);
   if(hi_cr >= lo_cr) ocr = clamp(ocr, lo_cr, hi_cr);
+  if(blend_w < 1.0f)   /* [2026-08-06 HYBRID CHROMA KNOB] dry/wet stage */
+  {
+    const float w_ = fmax(blend_w, 0.0f);
+    ocb = w_ * ocb + (1.0f - w_) * cb_in[cx];
+    ocr = w_ * ocr + (1.0f - w_) * cr_in[cx];
+  }
   cb_out[cx] = ocb;
   cr_out[cx] = ocr;
 }

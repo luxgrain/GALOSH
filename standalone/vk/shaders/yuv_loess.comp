@@ -39,7 +39,12 @@ layout(std430, binding = 5) restrict readonly  buffer B5 { float params[]; };
  * GALOSH_YUV420_EPS_SRC=const the host passes plain strength_c through.
  * (日) R はホスト決定が正、0 のみ旧シェーダ内則(回帰用)。eps はホスト計算の
  * strength_eff が同じフィールドで届く。 */
-layout(push_constant) uniform PC { int width; int height; float strength_c; int halfres420; int chroma_r; } pc;
+/* [2026-08-06 HYBRID CHROMA KNOB] blend_w = min(user c, 1): < 1 mixes the
+ * estimate with the center input chroma (dry/wet); >= 1 is skipped by
+ * branch (canonical output bit-identical).  strength_c carries
+ * max(user c, 1) * sigma_C scale (ridge regime).  CPU twin:
+ * galosh_yuv_cpu.c. */
+layout(push_constant) uniform PC { int width; int height; float strength_c; int halfres420; int chroma_r; float blend_w; } pc;
 
 const int   YG_LOESS_RADIUS = 7;    /* full-res (444) default */
 const float YG_LOESS_BW     = 3.0f;
@@ -127,6 +132,11 @@ void main()
   float ocr = a_cr * Y_c + b_cr;
   if(hi_cb >= lo_cb) ocb = clamp(ocb, lo_cb, hi_cb);
   if(hi_cr >= lo_cr) ocr = clamp(ocr, lo_cr, hi_cr);
+  if(pc.blend_w < 1.0f) {  /* [2026-08-06 HYBRID CHROMA KNOB] dry/wet */
+    const float w_ = max(pc.blend_w, 0.0f);
+    ocb = w_ * ocb + (1.0f - w_) * float(cb_in[cx]);
+    ocr = w_ * ocr + (1.0f - w_) * float(cr_in[cx]);
+  }
   cb_out[cx] = float16_t(galosh_f16_rne(ocb));
   cr_out[cx] = float16_t(galosh_f16_rne(ocr));
 }
